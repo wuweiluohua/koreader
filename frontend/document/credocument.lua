@@ -2,15 +2,17 @@ local Blitbuffer = require("ffi/blitbuffer")
 local CanvasContext = require("document/canvascontext")
 local DataStorage = require("datastorage")
 local Document = require("document/document")
-local FFIUtil = require("ffi/util")
 local FontList = require("fontlist")
 local Geom = require("ui/geometry")
 local RenderImage = require("ui/renderimage")
 local Screen = require("device").screen
+local TimeVal = require("ui/timeval")
+local buffer = require("string.buffer")
 local ffi = require("ffi")
 local C = ffi.C
 local lfs = require("libs/libkoreader-lfs")
 local logger = require("logger")
+local lru = require("ffi/lru")
 
 -- engine can be initialized only once, on first document opened
 local engine_initialized = false
@@ -118,6 +120,14 @@ function CreDocument:engineInit()
                 end
             end
         end
+        -- Make sure registered fonts have a proper entry at weight 400 and 700 when
+        -- possible, to avoid having synthesized fonts for these normal and bold weights.
+        -- This allows restoring a bit of the previous behaviour of crengine when it
+        -- wasn't handling font styles, and associated for each typeface one single
+        -- font to regular (400) and one to bold (700).
+        -- It should ensure we use real fonts (and not synthesized ones) for normal text
+        -- and bold text with the font_base_weight setting set to its default value of 0 (=400).
+        cre.regularizeRegisteredFontsWeights(true) -- true to print what modifications were made
 
         engine_initialized = true
     end
@@ -295,10 +305,19 @@ function CreDocument:_readMetadata()
 end
 
 function CreDocument:close()
-    Document.close(self)
-    if self.buffer then
-        self.buffer:free()
-        self.buffer = nil
+    -- Let Document do the refcount check, and tell us if we actually need to tear down the instance.
+    if Document.close(self) then
+        -- Yup, final Document instance, we can safely destroy internal data.
+        -- (Document already took care of our self._document userdata).
+        if self.buffer then
+            self.buffer:free()
+            self.buffer = nil
+        end
+
+        -- Only exists if the call cache is enabled
+        if self._callCacheDestroy then
+            self._callCacheDestroy()
+        end
     end
 end
 
@@ -682,16 +701,16 @@ function CreDocument:drawCurrentView(target, x, y, rect, pos)
     -- We also honor the current smooth scaling setting,
     -- as well as the global SW dithering setting.
 
-    --local start_ts = FFIUtil.getTimestamp()
+    --local start_tv = TimeVal:now()
     self._drawn_images_count, self._drawn_images_surface_ratio =
         self._document:drawCurrentPage(self.buffer, self.render_color, Screen.night_mode and self._nightmode_images, self._smooth_scaling, Screen.sw_dithering)
-    --local end_ts = FFIUtil.getTimestamp()
-    --print(string.format("CreDocument:drawCurrentView: Rendering took %9.3f ms", (end_ts - start_ts) * 1000))
+    --local end_tv = TimeVal:now()
+    --print(string.format("CreDocument:drawCurrentView: Rendering took %9.3f ms", (end_tv - start_tv):tomsecs()))
 
-    --start_ts = FFIUtil.getTimestamp()
+    --start_tv = TimeVal:now()
     target:blitFrom(self.buffer, x, y, 0, 0, rect.w, rect.h)
-    --end_ts = FFIUtil.getTimestamp()
-    --print(string.format("CreDocument:drawCurrentView: Blitting took  %9.3f ms", (end_ts - start_ts) * 1000))
+    --end_tv = TimeVal:now()
+    --print(string.format("CreDocument:drawCurrentView: Blitting took  %9.3f ms", (end_tv - start_tv):tomsecs()))
 end
 
 function CreDocument:drawCurrentViewByPos(target, x, y, rect, pos)
@@ -1067,9 +1086,12 @@ function CreDocument:setInterlineSpacePercent(percent)
     self._document:setDefaultInterlineSpace(percent)
 end
 
-function CreDocument:toggleFontBolder(toggle)
-    logger.dbg("CreDocument: toggle font bolder", toggle)
-    self._document:setIntProperty("font.face.weight.embolden", toggle)
+function CreDocument:setFontBaseWeight(weight)
+    -- In frontend, we use: 0, 1, -0.5, a delta from the regular weight of 400.
+    -- crengine expects for these: 400, 500, 350
+    local cre_weight = math.floor(400 + weight*100)
+    logger.dbg("CreDocument: set font base weight", weight, "=", cre_weight)
+    self._document:setIntProperty("font.face.base.weight", cre_weight)
 end
 
 function CreDocument:getGammaLevel()
@@ -1201,10 +1223,21 @@ function CreDocument:setBackgroundImage(img_path) -- use nil to unset
     self._document:setBackgroundImage(img_path)
 end
 
-function CreDocument:findText(pattern, origin, reverse, caseInsensitive)
-    logger.dbg("CreDocument: find text", pattern, origin, reverse, caseInsensitive)
+function CreDocument:checkRegex(pattern)
+    logger.dbg("CreDocument: check regex ", pattern)
+    return self._document:checkRegex(pattern)
+end
+
+function CreDocument:getAndClearRegexSearchError()
+    local retval = self._document:getAndClearRegexSearchError()
+    logger.dbg("CreDocument: getAndClearRegexSearchError", retval)
+    return retval
+end
+
+function CreDocument:findText(pattern, origin, reverse, caseInsensitive, page, regex, max_hits)
+    logger.dbg("CreDocument: find text", pattern, origin, reverse, caseInsensitive, regex, max_hits)
     return self._document:findText(
-        pattern, origin, reverse, caseInsensitive and 1 or 0)
+        pattern, origin, reverse, caseInsensitive and 1 or 0, regex and 1 or 0, max_hits or 200)
 end
 
 function CreDocument:enableInternalHistory(toggle)
@@ -1301,6 +1334,7 @@ function CreDocument:register(registry)
     registry:addProvider("epub", "application/epub+zip", self, 100)
     registry:addProvider("epub3", "application/epub+zip", self, 100)
     registry:addProvider("fb2", "application/fb2", self, 90)
+    registry:addProvider("fb2", "text/fb2+xml", self, 90) -- Alternative mimetype for OPDS.
     registry:addProvider("fb2.zip", "application/zip", self, 90)
     registry:addProvider("fb2.zip", "application/fb2+zip", self, 90) -- Alternative mimetype for OPDS.
     registry:addProvider("fb3", "application/fb3", self, 90)
@@ -1359,84 +1393,77 @@ function CreDocument:setupCallCache()
 
     -- reset full cache
     self._callCacheReset = function()
-        self._call_cache = {}
-        self._call_cache_tags_lru = {}
+        -- "Global" cache, a simple key, value store for *this* document
+        self._global_call_cache = {}
+        -- "Tags" cache, an LRU cache of per-tag simple key, value stores. 10 slots.
+        if self._tag_list_call_cache then
+            self._tag_list_call_cache:clear()
+        else
+            self._tag_list_call_cache = lru.new(10, nil, false)
+        end
+        -- i.e., the only thing that follows any sort of LRU eviction logic is the *list* of tag caches.
+        -- Each individual cache itself is just a simple key, value store (i.e., a hash map).
+        -- Points to said per-tag cache for the current tag.
+        self._tag_call_cache = nil
+        -- Stores the key for said current tag
+        self._current_call_cache_tag = nil
+    end
+    self._callCacheDestroy = function()
+        --- @note: Explicitly destroying the references to the caches is apparently necessary to get their content collected by the GC...
+        ---        c.f., https://github.com/koreader/koreader/pull/7634#discussion_r627820424
+        self._global_call_cache = nil
+        self._tag_list_call_cache = nil
+        self._tag_call_cache = nil
+        self._current_call_cache_tag = nil
     end
     -- global cache
     self._callCacheGet = function(key)
-        return self._call_cache[key]
+        return self._global_call_cache[key]
     end
     self._callCacheSet = function(key, value)
-        self._call_cache[key] = value
+        self._global_call_cache[key] = value
     end
 
-    -- nb of by-tag sub-caches to keep
-    self._call_cache_keep_tags_nb = 10
     -- current tag (page, pos) sub-cache
     self._callCacheSetCurrentTag = function(tag)
-        if not self._call_cache[tag] then
-            self._call_cache[tag] = {}
+        -- If it already exists, return it and make it the MRU
+        self._tag_call_cache = self._tag_list_call_cache:get(tag)
+        if not self._tag_call_cache then
+            -- Otherwise, create it and insert it in the list cache, evicting the LRU tag cache if necessary.
+            self._tag_call_cache = {}
+            self._tag_list_call_cache:set(tag, self._tag_call_cache)
         end
-        self._call_cache_current_tag = tag
-        -- clean up LRU tag list
-        if self._call_cache_tags_lru[1] ~= tag then
-            for i = #self._call_cache_tags_lru, 1, -1 do
-                if self._call_cache_tags_lru[i] == tag then
-                    table.remove(self._call_cache_tags_lru, i)
-                elseif i > self._call_cache_keep_tags_nb then
-                    self._call_cache[self._call_cache_tags_lru[i]] = nil
-                    table.remove(self._call_cache_tags_lru, i)
-                end
-            end
-            table.insert(self._call_cache_tags_lru, 1, tag)
-        end
+        self._current_call_cache_tag = tag
     end
     self._callCacheGetCurrentTag = function(tag)
-        return self._call_cache_current_tag
+        return self._current_call_cache_tag
     end
     -- per current tag cache
     self._callCacheTagGet = function(key)
-        if self._call_cache_current_tag and self._call_cache[self._call_cache_current_tag] then
-            return self._call_cache[self._call_cache_current_tag][key]
+        if self._tag_call_cache then
+            return self._tag_call_cache[key]
         end
     end
     self._callCacheTagSet = function(key, value)
-        if self._call_cache_current_tag and self._call_cache[self._call_cache_current_tag] then
-            self._call_cache[self._call_cache_current_tag][key] = value
+        if self._tag_call_cache then
+            self._tag_call_cache[key] = value
         end
     end
     self._callCacheReset()
-
-    -- serialize function arguments as a single string, to be used as a table key
-    local asString = function(...)
-        local sargs = {} -- args as string
-        for i, arg in ipairs({...}) do
-            local sarg
-            if type(arg) == "table" then
-                -- We currently don't get nested tables, and only keyword tables
-                local items = {}
-                for k, v in pairs(arg) do
-                    table.insert(items, tostring(k)..tostring(v))
-                end
-                table.sort(items)
-                sarg = table.concat(items, "|")
-            else
-                sarg = tostring(arg)
-            end
-            table.insert(sargs, sarg)
-        end
-        return table.concat(sargs, "|")
-    end
 
     local no_op = function() end
     local addStatMiss = no_op
     local addStatHit = no_op
     local dumpStats = no_op
+    local now = no_op
     if do_stats then
         -- cache statistics
         self._call_cache_stats = {}
+        now = function()
+            return TimeVal:now()
+        end
         addStatMiss = function(name, starttime, not_cached)
-            local duration = FFIUtil.getTimestamp() - starttime
+            local duration = TimeVal:getDuration(starttime)
             if not self._call_cache_stats[name] then
                 self._call_cache_stats[name] = {0, 0.0, 1, duration, not_cached}
             else
@@ -1446,8 +1473,7 @@ function CreDocument:setupCallCache()
             end
         end
         addStatHit = function(name, starttime)
-            local duration = FFIUtil.getTimestamp() - starttime
-            if not duration then duration = 0.0 end
+            local duration = TimeVal:getDuration(starttime)
             if not self._call_cache_stats[name] then
                 self._call_cache_stats[name] = {1, duration, 0, 0.0}
             else
@@ -1464,12 +1490,12 @@ function CreDocument:setupCallCache()
             local util = require("util")
             local res = {}
             table.insert(res, "CRE call cache content:")
-            table.insert(res, string.format("     all: %d items", util.tableSize(self._call_cache)))
-            table.insert(res, string.format("  global: %d items", util.tableSize(self._call_cache) - #self._call_cache_tags_lru))
-            table.insert(res, string.format("    tags: %d items", #self._call_cache_tags_lru))
-            for i=1, #self._call_cache_tags_lru do
-                table.insert(res, string.format("          '%s': %d items", self._call_cache_tags_lru[i],
-                        util.tableSize(self._call_cache[self._call_cache_tags_lru[i]])))
+            table.insert(res, string.format("     all: %d items", util.tableSize(self._global_call_cache) + self._tag_list_call_cache:used_slots()))
+            table.insert(res, string.format("  global: %d items", util.tableSize(self._global_call_cache)))
+            table.insert(res, string.format("    tags: %d items", self._tag_list_call_cache:used_slots()))
+            for tag, tag_cache in self._tag_list_call_cache:pairs() do
+                table.insert(res, string.format("          '%s': %d items", tag,
+                        util.tableSize(tag_cache)))
             end
             local hit_keys = {}
             local nohit_keys = {}
@@ -1527,7 +1553,7 @@ function CreDocument:setupCallCache()
                     total_duration = total_duration + missed_duration + hits_duration
                 end
             end
-            local pct_duration_saved = 100.0 * total_duration_saved / (total_duration+total_duration_saved)
+            local pct_duration_saved = 100.0 * total_duration_saved / (total_duration + total_duration_saved)
             table.insert(res, string.format("  cpu time used: %.3fs, saved: %.3fs (%d%% saved)", total_duration, total_duration_saved, pct_duration_saved))
             return table.concat(res, "\n")
         end
@@ -1657,8 +1683,8 @@ function CreDocument:setupCallCache()
             elseif cache_by_tag then
                 is_cached = true
                 self[name] = function(...)
-                    local starttime = FFIUtil.getTimestamp()
-                    local cache_key = name .. asString(select(2, ...))
+                    local starttime = now()
+                    local cache_key = name .. buffer.encode({select(2, ...)})
                     local results = self._callCacheTagGet(cache_key)
                     if results then
                         if do_log then logger.dbg("callCache:", name, "cache hit:", cache_key) end
@@ -1678,8 +1704,8 @@ function CreDocument:setupCallCache()
             elseif cache_global then
                 is_cached = true
                 self[name] = function(...)
-                    local starttime = FFIUtil.getTimestamp()
-                    local cache_key = name .. asString(select(2, ...))
+                    local starttime = now()
+                    local cache_key = name .. buffer.encode({select(2, ...)})
                     local results = self._callCacheGet(cache_key)
                     if results then
                         if do_log then logger.dbg("callCache:", name, "cache hit:", cache_key) end
@@ -1698,7 +1724,7 @@ function CreDocument:setupCallCache()
             if do_stats_include_not_cached and not is_cached then
                 local func2 = self[name] -- might already be wrapped
                 self[name] = function(...)
-                    local starttime = FFIUtil.getTimestamp()
+                    local starttime = now()
                     local results = { func2(...) }
                     addStatMiss(name, starttime, true) -- not_cached = true
                     return unpack(results)
@@ -1709,8 +1735,8 @@ function CreDocument:setupCallCache()
     -- We override a bit more specifically the one responsible for drawing page
     self.drawCurrentView = function(_self, target, x, y, rect, pos)
         local do_draw = false
-        local current_tag = self._callCacheGetCurrentTag()
-        local current_buffer_tag = self._callCacheGet("current_buffer_tag")
+        local current_tag = _self._callCacheGetCurrentTag()
+        local current_buffer_tag = _self._callCacheGet("current_buffer_tag")
         if _self.buffer and (_self.buffer.w ~= rect.w or _self.buffer.h ~= rect.h) then
             do_draw = true
         elseif not _self.buffer then
@@ -1720,12 +1746,12 @@ function CreDocument:setupCallCache()
         elseif current_buffer_tag ~= current_tag then
             do_draw = true
         end
-        local starttime = FFIUtil.getTimestamp()
+        local starttime = now()
         if do_draw then
             if do_log then logger.dbg("callCache: ########## drawCurrentView: full draw") end
             CreDocument.drawCurrentView(_self, target, x, y, rect, pos)
             addStatMiss("drawCurrentView", starttime)
-            self._callCacheSet("current_buffer_tag", current_tag)
+            _self._callCacheSet("current_buffer_tag", current_tag)
         else
             if do_log then logger.dbg("callCache: ---------- drawCurrentView: light draw") end
             target:blitFrom(_self.buffer, x, y, 0, 0, rect.w, rect.h)
@@ -1735,8 +1761,8 @@ function CreDocument:setupCallCache()
     -- Dump statistics on close
     if do_stats then
         self.close = function(_self)
-            CreDocument.close(_self)
             dumpStats()
+            CreDocument.close(_self)
         end
     end
 end

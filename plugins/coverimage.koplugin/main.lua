@@ -1,4 +1,8 @@
--- plugin for saving a cover image to a file and scale it to fit the screen
+--[[--
+@module koplugin.coverimage
+
+Plugin for saving a cover image to a file and scaling it to fit the screen.
+]]
 
 local Device = require("device")
 
@@ -75,7 +79,7 @@ function CoverImage:init()
     self.cover_image_fallback_path = G_reader_settings:readSetting("cover_image_fallback_path") or default_fallback_path
     self.cover_image_cache_path = G_reader_settings:readSetting("cover_image_cache_path") or default_cache_path
     self.cover_image_cache_maxfiles = G_reader_settings:readSetting("cover_image_cache_maxfiles") or 36
-    self.cover_image_cache_maxsize = G_reader_settings:readSetting("cover_image_cache_maxsize") or 5 -- MiB
+    self.cover_image_cache_maxsize = G_reader_settings:readSetting("cover_image_cache_maxsize") or 5 -- MB
     self.cover_image_cache_prefix = "cover_"
     self.cover = G_reader_settings:isTrue("cover_image_enabled")
     self.fallback = G_reader_settings:isTrue("cover_image_fallback")
@@ -225,7 +229,7 @@ end
 
 function CoverImage:getCacheFiles(cache_path, cache_prefix)
     local cache_count = 0
-    local cache_size_KiB = 0
+    local cache_size = 0
     local files = {}
     for entry in lfs.dir(self.cover_image_cache_path) do
         if entry ~= "." and entry ~= ".." then
@@ -233,17 +237,18 @@ function CoverImage:getCacheFiles(cache_path, cache_prefix)
             if entry:sub(1, self.cover_image_cache_prefix:len()) == cache_prefix
                 and lfs.attributes(file, "mode") == "file" then
                 cache_count = cache_count + 1
+                local blocksize = lfs.attributes(file).blksize or 4096
                 files[cache_count] = {
                     name = file,
-                    size = math.floor((lfs.attributes(file).size + 1023) / 1024), -- round up to KiB
+                    size = math.floor(((lfs.attributes(file).size) + blocksize - 1)/ blocksize) * blocksize,
                     mod = lfs.attributes(file).modification,
                 }
-                cache_size_KiB = cache_size_KiB + files[cache_count].size -- size in KiB
+                cache_size = cache_size + files[cache_count].size
             end
         end
     end
-    logger.dbg("CoverImage: start - cache size: ".. cache_size_KiB .. " KiB, cached files: " .. cache_count)
-    return cache_count, cache_size_KiB, files
+    logger.dbg("CoverImage: start - cache size: ".. cache_size .. " Bytes, cached files: " .. cache_count)
+    return cache_count, cache_size, files
 end
 
 function CoverImage:cleanCache()
@@ -252,20 +257,20 @@ function CoverImage:cleanCache()
         return
     end
 
-    local cache_count, cache_size_KiB, files = self:getCacheFiles(self.cover_image_cache_path, self.cover_image_cache_prefix)
+    local cache_count, cache_size, files = self:getCacheFiles(self.cover_image_cache_path, self.cover_image_cache_prefix)
 
     -- delete the oldest files first
     table.sort(files, function(a, b) return a.mod < b.mod end)
     local index = 1
     while (cache_count > self.cover_image_cache_maxfiles and self.cover_image_cache_maxfiles ~= 0)
-        or (cache_size_KiB > self.cover_image_cache_maxsize * 1024 and self.cover_image_cache_maxsize ~= 0)
+        or (cache_size > self.cover_image_cache_maxsize * 1000 * 1000 and self.cover_image_cache_maxsize ~= 0)
         and index <= #files do
         os.remove(files[index].name)
         cache_count = cache_count - 1
-        cache_size_KiB = cache_size_KiB - files[index].size
+        cache_size = cache_size - files[index].size
         index = index + 1
     end
-    logger.dbg("CoverImage: clean - cache size: ".. cache_size_KiB .. " KiB, cached files: " .. cache_count)
+    logger.dbg("CoverImage: clean - cache size: ".. cache_size .. " Bytes, cached files: " .. cache_count)
 end
 
 function CoverImage:isCacheEnabled(path)
@@ -433,15 +438,15 @@ You can either choose an existing file:
 - Select a file
 
 or specify a new file:
-- First select a directory
+- First select a folder
 - Then add the name of the new file
 
 or delete the path:
-- First select a directory
+- First select a folder
 - Clear the name of the file]])
 
 -- menu entry: Cache settings
-function CoverImage:menu_entry_cache()
+function CoverImage:menuEntryCache()
     return {
         text = _("Cache settings"),
         checked_func = function()
@@ -472,13 +477,13 @@ function CoverImage:menu_entry_cache()
                 text_func = function()
                     local number
                     if self.cover_image_cache_maxsize > 0 then
-                        number = self.cover_image_cache_maxsize
+                        number = util.getFriendlySize(self.cover_image_cache_maxsize * 1e6)
                     elseif self.cover_image_cache_maxsize == 0 then
                         number = _("unlimited")
                     else
                         number = _("off")
                     end
-                    return T(_("Maximum size of cached covers (%1MiB)"), number)
+                    return T(_("Maximum size of cached covers (%1)"), number)
                 end,
                 help_text = _("If set to zero the cache size is unlimited.\nIf set to -1 the cache is disabled."),
                 checked_func = function()
@@ -488,18 +493,18 @@ function CoverImage:menu_entry_cache()
                     self:sizeSpinner(touchmenu_instance, "cover_image_cache_maxsize", _("Cache size"), -1, 100, 5, self.cleanCache)
                 end,
             },
-            self:menu_entry_set_path("cover_image_cache_path", _("Cover cache folder"), _("Current cache path:\n%1"),
+            self:menuEntrySetPath("cover_image_cache_path", _("Cover cache folder"), _("Current cache path:\n%1"),
                 ("Select a cache folder. The contents of the old folder will be migrated."), default_cache_path, true, false, self.migrateCache),
             {
                 text = _("Clear cached covers"),
                 help_text_func = function()
-                    local cache_count, cache_size_KiB
+                    local cache_count, cache_size
                         = self:getCacheFiles(self.cover_image_cache_path, self.cover_image_cache_prefix)
-                    return T(_("The cache contains %1 files and uses %2 MiB."), cache_count, math.floor((cache_size_KiB + 1023) / 1024))
+                    return T(_("The cache contains %1 files and uses %2."), cache_count, util.getFriendlySize(cache_size))
                 end,
                 callback = function()
                     UIManager:show(ConfirmBox:new{
-                        text =  _("Cear the cover image cache?"),
+                        text =  _("Clear the cover image cache?"),
                         ok_text = _("Clear"),
                         ok_callback = function()
                             self:emptyCache()
@@ -524,7 +529,7 @@ Menu entry for setting an specific G_reader_setting key for a path/file
 @bool new_file sets if a new filename can be entered
 @function migrate a callback for example moving the folder contents
 ]]
-function CoverImage:menu_entry_set_path(key, title, help, info, default, folder_only, new_file, migrate)
+function CoverImage:menuEntrySetPath(key, title, help, info, default, folder_only, new_file, migrate)
     return {
         text = title,
         help_text_func = function()
@@ -562,7 +567,7 @@ function CoverImage:menu_entry_set_path(key, title, help, info, default, folder_
     }
 end
 
-function CoverImage:menu_entry_format(title, format)
+function CoverImage:menuEntryFormat(title, format)
     return {
         text = title,
         checked_func = function()
@@ -572,16 +577,16 @@ function CoverImage:menu_entry_format(title, format)
             local old_cover_image_format = self.cover_image_format
             self.cover_image_format = format
             G_reader_settings:saveSetting("cover_image_format", format)
-            if self:coverEnabld() and old_cover_image_format ~= format then
+            if self:coverEnabled() and old_cover_image_format ~= format then
                 self:createCoverImage(self.ui.doc_settings)
             end
         end,
     }
 end
 
-function CoverImage:menu_entry_background(color)
+function CoverImage:menuEntryBackground(color, color_translatable)
     return {
-        text = _("Fit to screen, " .. color .. " background"),
+        text = T(_("Fit to screen, %1 background"), _(color_translatable)),
         checked_func = function()
             return self.cover_image_background == color
         end,
@@ -597,7 +602,7 @@ function CoverImage:menu_entry_background(color)
 end
 
 -- menu entry: scale, background, format
-function CoverImage:menu_entry_sbf()
+function CoverImage:menuEntrySBF()
     return {
         text = _("Size, background and format"),
         enabled_func = function()
@@ -607,7 +612,7 @@ function CoverImage:menu_entry_sbf()
             {
                 text_func = function()
                     return T(_("Aspect ratio stretch threshold (%1)"),
-                        self.cover_image_stretch_limit ~= 0 and self.cover_image_stretch_limit .."%" or "off")
+                        self.cover_image_stretch_limit ~= 0 and self.cover_image_stretch_limit .. "%" or _("off"))
                 end,
                 keep_menu_open = true,
                 help_text_func = function()
@@ -620,9 +625,9 @@ function CoverImage:menu_entry_sbf()
                     self:sizeSpinner(touchmenu_instance, "cover_image_stretch_limit", _("Set strech threshold"), 0, 20, 8, createCover)
                 end,
             },
-            self:menu_entry_background("black"),
-            self:menu_entry_background("white"),
-            self:menu_entry_background("gray"),
+            self:menuEntryBackground("black", _("black")),
+            self:menuEntryBackground("white", _("white")),
+            self:menuEntryBackground("gray", _("gray")),
             {
                 text = _("Original image"),
                 checked_func = function()
@@ -654,9 +659,9 @@ function CoverImage:menu_entry_sbf()
                     end
                 end,
             },
-            self:menu_entry_format(_("JPG file format"), "jpg"),
-            self:menu_entry_format(_("PNG file format"), "png"),
-            self:menu_entry_format(_("BMP file format"), "bmp"),
+            self:menuEntryFormat(_("JPG file format"), "jpg"),
+            self:menuEntryFormat(_("PNG file format"), "png"),
+            self:menuEntryFormat(_("BMP file format"), "bmp"),
         },
     }
 end
@@ -682,7 +687,7 @@ function CoverImage:addToMainMenu(menu_items)
                 separator = true,
             },
             -- menu entry: filename dialog
-            self:menu_entry_set_path("cover_image_path", _("Set image path"), _("Current Cover image path:\n%1"), set_image_text,
+            self:menuEntrySetPath("cover_image_path", _("Set image path"), _("Current Cover image path:\n%1"), set_image_text,
                  Device:getDefaultCoverPath(), false, true, self.migrateCover),
             -- menu entry: enable
             {
@@ -707,7 +712,7 @@ function CoverImage:addToMainMenu(menu_items)
                 end,
             },
             -- menu entry: scale, background, format
-            self:menu_entry_sbf(),
+            self:menuEntrySBF(),
             -- menu entry: exclude this cover
             {
                 text = _("Exclude this book cover"),
@@ -727,7 +732,7 @@ function CoverImage:addToMainMenu(menu_items)
                 separator = true,
             },
             -- menu entry: set fallback image
-            self:menu_entry_set_path("cover_image_fallback_path", _("Set fallback path"),
+            self:menuEntrySetPath("cover_image_fallback_path", _("Set fallback path"),
                 _("The fallback image used on document close is:\n%1"), _("You can select a fallback image."), default_fallback_path, false, false),
             -- menu entry: fallback
             {
@@ -749,7 +754,7 @@ function CoverImage:addToMainMenu(menu_items)
                 separator = true,
             },
             -- menu entry: Cache settings
-            self:menu_entry_cache(),
+            self:menuEntryCache(),
         },
     }
 end

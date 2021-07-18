@@ -122,13 +122,17 @@ function FileManagerMenu:onOpenLastDoc()
         })
         return
     end
-    local ReaderUI = require("apps/reader/readerui")
-    ReaderUI:showReader(last_file)
 
-    -- only close menu if we were called from the menu
+    -- Only close menu if we were called from the menu
     if self.menu_container then
+        -- Mimic's FileManager's onShowingReader refresh optimizations
+        self.ui.tearing_down = true
+        self.ui.dithered = nil
         self:onCloseFileManagerMenu()
     end
+
+    local ReaderUI = require("apps/reader/readerui")
+    ReaderUI:showReader(last_file)
 end
 
 function FileManagerMenu:setUpdateItemTable()
@@ -545,6 +549,26 @@ To:
             end,
         })
     end
+    --- @note: Intended to debug/investigate B288 quirks on PocketBook devices
+    if Device:hasEinkScreen() and Device:isPocketBook() then
+        table.insert(self.menu_items.developer_options.sub_item_table, {
+            -- @translators B288 is the codename of the CPU/chipset (SoC stands for 'System on Chip').
+            text = _("Ignore feature bans on B288 SoCs"),
+            enabled_func = function()
+                return Device:isB288SoC()
+            end,
+            checked_func = function()
+                return G_reader_settings:isTrue("pb_ignore_b288_quirks")
+            end,
+            callback = function()
+                G_reader_settings:flipNilOrFalse("pb_ignore_b288_quirks")
+                local InfoMessage = require("ui/widget/infomessage")
+                UIManager:show(InfoMessage:new{
+                    text = _("This will take effect on next restart."),
+                })
+            end,
+        })
+    end
     if Device:isAndroid() then
         table.insert(self.menu_items.developer_options.sub_item_table, {
             text = _("Start E-ink test"),
@@ -638,8 +662,10 @@ To:
         text = _("File search"),
         help_text = _([[Search a book by filename in the current or home folder and its subfolders.
 
+Wildcards for one '?' or more '*' characters can be used.
 A search for '*' will show all files.
-Search string supports Lua patterns.
+
+The sorting order is the same as in filemanager.
 
 Tap a book in the search results to open it.]]),
         callback = function()
@@ -784,7 +810,7 @@ function FileManagerMenu:onShowMenu(tab_index)
         }
     end
 
-    main_menu.close_callback = function ()
+    main_menu.close_callback = function()
         self:onCloseFileManagerMenu()
     end
 

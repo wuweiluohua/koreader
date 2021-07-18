@@ -520,6 +520,38 @@ function ReaderToc:isChapterEnd(cur_pageno)
     return _end
 end
 
+function ReaderToc:getChapterPageCount(pageno)
+    if self.ui.document:hasHiddenFlows() then
+        -- Count pages until new chapter, starting by going backwards to the beginning of the current chapter if necessary
+        local page_count = 1
+        if not self:isChapterStart(pageno) then
+            local test_page = self.ui.document:getPrevPage(pageno)
+            while test_page > 0 do
+                page_count = page_count + 1
+                if self:isChapterStart(test_page) then
+                    break
+                end
+                test_page = self.ui.document:getPrevPage(test_page)
+            end
+        end
+
+        -- Then forward
+        local test_page = self.ui.document:getNextPage(pageno)
+        while test_page > 0 do
+            page_count = page_count + 1
+            if self:isChapterStart(test_page) then
+                return page_count - 1
+            end
+            test_page = self.ui.document:getNextPage(test_page)
+        end
+    else
+        local next_chapter = self:getNextChapter(pageno) or self.ui.document:getPageCount() + 1
+        local previous_chapter = self:isChapterStart(pageno) and pageno or self:getPreviousChapter(pageno) or 1
+        local page_count = next_chapter - previous_chapter
+        return page_count
+    end
+end
+
 function ReaderToc:getChapterPagesLeft(pageno)
     if self.ui.document:hasHiddenFlows() then
         -- Count pages until new chapter
@@ -643,7 +675,7 @@ function ReaderToc:onShowToc()
 
     local items_per_page = G_reader_settings:readSetting("toc_items_per_page") or self.toc_items_per_page_default
     local items_font_size = G_reader_settings:readSetting("toc_items_font_size") or Menu.getItemFontSize(items_per_page)
-    local items_show_separator = G_reader_settings:isTrue("toc_items_show_separator")
+    local items_with_dots = G_reader_settings:nilOrTrue("toc_items_with_dots")
     -- Estimate expand/collapse icon size
     -- *2/5 to acount for Menu top title and bottom icons, and add some space between consecutive icons
     local icon_size = math.floor(Screen:getHeight() / items_per_page * 2/5)
@@ -703,10 +735,11 @@ function ReaderToc:onShowToc()
         cface = Font:getFace("x_smallinfofont"),
         single_line = true,
         align_baselines = true,
+        with_dots = items_with_dots,
         items_per_page = items_per_page,
         items_font_size = items_font_size,
         items_padding = can_collapse and math.floor(Size.padding.fullscreen / 2) or nil, -- c.f., note above. Menu's default is twice that.
-        line_color = items_show_separator and Blitbuffer.COLOR_DARK_GRAY or Blitbuffer.COLOR_WHITE,
+        line_color = Blitbuffer.COLOR_WHITE,
         on_close_ges = {
             GestureRange:new{
                 ges = "two_finger_swipe",
@@ -759,6 +792,7 @@ function ReaderToc:onShowToc()
             alignment = "center",
             show_icon = false,
             text = trimmed_text,
+            face = Font:getFace("infofont", self.items_font_size),
         }
         UIManager:show(infomessage)
         return true
@@ -1062,14 +1096,14 @@ Enabling this option will restrict display to the chapter titles of progress bar
             UIManager:show(items_font)
         end,
     }
-    menu_items.toc_items_show_separator = {
-        text = _("Add a separator between ToC entries"),
+    menu_items.toc_items_with_dots = {
+        text = _("With dots"),
         keep_menu_open = true,
         checked_func = function()
-            return G_reader_settings:isTrue("toc_items_show_separator")
+            return G_reader_settings:nilOrTrue("toc_items_with_dots")
         end,
         callback = function()
-            G_reader_settings:flipNilOrFalse("toc_items_show_separator")
+            G_reader_settings:flipNilOrTrue("toc_items_with_dots")
         end
     }
 end

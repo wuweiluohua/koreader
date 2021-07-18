@@ -44,7 +44,7 @@ end
 
 function FileManagerHistory:onMenuHold(item)
     local readerui_instance = require("apps/reader/readerui"):_getRunningInstance()
-    local currently_opened_file = readerui_instance and readerui_instance.document.file
+    local currently_opened_file = readerui_instance and readerui_instance.document and readerui_instance.document.file
     self.histfile_dialog = nil
     local buttons = {
         {
@@ -155,12 +155,7 @@ function FileManagerHistory:onShowHist()
 
     self:updateItemTable()
     self.hist_menu.close_callback = function()
-        -- Close it at next tick so it stays displayed
-        -- while a book is opening (avoids a transient
-        -- display of the underlying File Browser)
-        UIManager:nextTick(function()
-            UIManager:close(self.hist_menu)
-        end)
+        UIManager:close(self.hist_menu)
     end
     UIManager:show(self.hist_menu)
     return true

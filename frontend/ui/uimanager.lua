@@ -22,6 +22,7 @@ local UIManager = {
     FULL_REFRESH_COUNT =
         G_reader_settings:isTrue("night_mode") and G_reader_settings:readSetting("night_full_refresh_count") or G_reader_settings:readSetting("full_refresh_count") or DEFAULT_FULL_REFRESH_COUNT,
     refresh_count = 0,
+    currently_scrolling = false,
 
     -- How long to wait between ZMQ wakeups: 50ms.
     ZMQ_TIMEOUT = 50 * 1000,
@@ -466,16 +467,16 @@ function UIManager:close(widget, refreshtype, refreshregion, refreshdither)
     end
     logger.dbg("close widget:", widget.name or widget.id or tostring(widget))
     local dirty = false
-    -- Ensure all the widgets can get onFlushSettings event.
+    -- First notify the closed widget to save its settings...
     widget:handleEvent(Event:new("FlushSettings"))
-    -- first send close event to widget
+    -- ...and notify it that it ought to be gone now.
     widget:handleEvent(Event:new("CloseWidget"))
-    -- make it disabled by default and check if any widget wants it disabled or enabled
+    -- Make sure it's disabled by default and check if there are any widgets that want it disabled or enabled.
     Input.disable_double_tap = true
     local requested_disable_double_tap = nil
     local is_covered = false
     local start_idx = 1
-    -- then remove all references to that widget on stack and refresh
+    -- Then remove all references to that widget on stack and refresh.
     for i = #self._window_stack, 1, -1 do
         if self._window_stack[i].widget == widget then
             self._dirty[self._window_stack[i].widget] = nil
@@ -1076,7 +1077,10 @@ function UIManager:discardEvents(set_or_seconds)
 end
 
 --[[--
-Transmits an @{ui.event.Event|Event} to active widgets.
+Transmits an @{ui.event.Event|Event} to active widgets, top to bottom.
+Stops at the first handler that returns `true`.
+Note that most complex widgets are based on @{ui.widget.container.WidgetContainer|WidgetContainer},
+which itself will take care of propagating an event to its members.
 
 @param event an @{ui.event.Event|Event} object
 ]]
@@ -1113,26 +1117,34 @@ function UIManager:sendEvent(event)
         end
     end
 
-    -- if the event is not consumed, active widgets (from top to bottom) can access it.
-    -- NOTE: _window_stack can shrink when widgets are closed (CloseWidget & Close events).
+    -- If the event was not consumed (no handler returned true), active widgets (from top to bottom) can access it.
+    -- NOTE: _window_stack can shrink/grow when widgets are closed (CloseWidget & Close events) or opened.
+    --       Simply looping in reverse would only cover the list shrinking, and that only by a *single* element,
+    --       something we can't really guarantee, hence the more dogged iterator below,
+    --       which relies on a hash check of already processed widgets (LuaJIT actually hashes the table's GC reference),
+    --       rather than a simple loop counter, and will in fact iterate *at least* #items ^ 2 times.
+    --       Thankfully, that list should be very small, so the overhead should be minimal.
     local checked_widgets = {top_widget}
-    for i = #self._window_stack, 1, -1 do
+    local i = #self._window_stack
+    while i > 0 do
         local widget = self._window_stack[i]
         if checked_widgets[widget] == nil then
-            -- active widgets has precedence to handle this event
+            checked_widgets[widget] = true
+            -- Widget's active widgets have precedence to handle this event
             -- NOTE: While FileManager only has a single (screenshotter), ReaderUI has many active_widgets (each ReaderUI module gets added to the list).
             if widget.widget.active_widgets then
-                checked_widgets[widget] = true
                 for _, active_widget in ipairs(widget.widget.active_widgets) do
                     if active_widget:handleEvent(event) then return end
                 end
             end
             if widget.widget.is_always_active then
-                -- active widgets will handle this event
+                -- Widget itself is flagged always active, let it handle the event
                 -- NOTE: is_always_active widgets currently are widgets that want to show a VirtualKeyboard or listen to Dispatcher events
-                checked_widgets[widget] = true
                 if widget.widget:handleEvent(event) then return end
             end
+            i = #self._window_stack
+        else
+            i = i - 1
         end
     end
 end
@@ -1143,18 +1155,18 @@ Transmits an @{ui.event.Event|Event} to all registered widgets.
 @param event an @{ui.event.Event|Event} object
 ]]
 function UIManager:broadcastEvent(event)
-    -- the widget's event handler might close widgets in which case
-    -- a simple iterator like ipairs would skip over some entries
-    local i = 1
-    while i <= #self._window_stack do
-        local prev_widget = self._window_stack[i].widget
-        self._window_stack[i].widget:handleEvent(event)
-        local top_widget = self._window_stack[i]
-        if top_widget == nil then
-            -- top widget closed itself
-            break
-        elseif top_widget.widget == prev_widget then
-            i = i + 1
+    -- Unlike sendEvent, we send the event to *all* (window-level) widgets (i.e., we don't stop, even if a handler returns true).
+    -- NOTE: Same defensive approach to _window_stack changing from under our feet as above.
+    local checked_widgets = {}
+    local i = #self._window_stack
+    while i > 0 do
+        local widget = self._window_stack[i]
+        if checked_widgets[widget] == nil then
+            checked_widgets[widget] = true
+            widget.widget:handleEvent(event)
+            i = #self._window_stack
+        else
+            i = i - 1
         end
     end
 end
@@ -1281,6 +1293,10 @@ function UIManager:_refresh(mode, region, dither)
             -- (which is the vast majority of them), in which case we drop it to avoid enqueuing a useless full-screen refresh.
             return
         end
+    end
+    -- Downgrade all refreshes to "fast" when ReaderPaging or ReaderScrolling have set this flag
+    if self.currently_scrolling then
+        mode = "fast"
     end
     if not region and mode == "full" then
         self.refresh_count = 0 -- reset counter on explicit full refresh

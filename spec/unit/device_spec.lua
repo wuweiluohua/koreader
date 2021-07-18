@@ -9,7 +9,7 @@ describe("device module", function()
         mock_fb = {
             new = function()
                 return {
-                    getSize = function() return {w = 600, h = 800} end,
+                    getRawSize = function() return {w = 600, h = 800} end,
                     getWidth = function() return 600 end,
                     getDPI = function() return 72 end,
                     setViewport = function() end,
@@ -242,7 +242,7 @@ describe("device module", function()
 
             kindle_dev.powerd:toggleFrontlight()
             assert.stub(os.execute).was_called_with(
-                "echo -n 0 > /sys/class/backlight/max77696-bl/brightness")
+                "printf '%s' 0 > /sys/class/backlight/max77696-bl/brightness")
             -- Here be shenanigans: we don't override powerd's fl_intensity when we turn the light off,
             -- so that we can properly turn it back on at the previous intensity ;)
             assert.is.same(kindle_dev.powerd.fl_intensity, 5)

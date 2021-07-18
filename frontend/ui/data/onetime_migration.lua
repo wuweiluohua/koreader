@@ -7,7 +7,7 @@ local lfs = require("libs/libkoreader-lfs")
 local logger = require("logger")
 
 -- Date at which the last migration snippet was added
-local CURRENT_MIGRATION_DATE = 20210414
+local CURRENT_MIGRATION_DATE = 20210715
 
 -- Retrieve the date of the previous migration, if any
 local last_migration_date = G_reader_settings:readSetting("last_migration_date", 0)
@@ -171,9 +171,9 @@ if last_migration_date < 20210409 then
        logger.warn("os.rename:", err)
     end
 
-    -- Make sure Cache gets the memo
-    local Cache = require("cache")
-    Cache:refreshSnapshot()
+    -- Make sure DocCache gets the memo
+    local DocCache = require("document/doccache")
+    DocCache:refreshSnapshot()
 end
 
 -- Calibre, cache migration, https://github.com/koreader/koreader/pull/7528
@@ -193,9 +193,9 @@ if last_migration_date < 20210412 then
        logger.warn("os.rename:", err)
     end
 
-    -- Make sure Cache gets the memo
-    local Cache = require("cache")
-    Cache:refreshSnapshot()
+    -- Make sure DocCache gets the memo
+    local DocCache = require("document/doccache")
+    DocCache:refreshSnapshot()
 end
 
 -- Calibre, cache encoding format change, https://github.com/koreader/koreader/pull/7543
@@ -206,6 +206,83 @@ if last_migration_date < 20210414 then
     local ok, err = os.remove(cache_path .. "/books.dat")
     if not ok then
        logger.warn("os.remove:", err)
+    end
+end
+
+-- 20210503: DocCache, migration to Persist, https://github.com/koreader/koreader/pull/7624
+-- 20210508: DocCache, KOPTInterface hash fix, https://github.com/koreader/koreader/pull/7634
+if last_migration_date < 20210508 then
+    logger.info("Performing one-time migration for 20210503 & 20210508")
+
+    local DocCache = require("document/doccache")
+    DocCache:clearDiskCache()
+end
+
+-- 20210518, ReaderFooter, https://github.com/koreader/koreader/pull/7702
+-- 20210622, ReaderFooter, https://github.com/koreader/koreader/pull/7876
+if last_migration_date < 20210622 then
+    logger.info("Performing one-time migration for 20210622")
+
+    local ReaderFooter = require("apps/reader/modules/readerfooter")
+    local settings = G_reader_settings:readSetting("footer", ReaderFooter.default_settings)
+
+    -- Make sure we have a full set, some of these were historically kept as magic nils...
+    for k, v in pairs(ReaderFooter.default_settings) do
+        if settings[k] == nil then
+            settings[k] = v
+        end
+    end
+    G_reader_settings:saveSetting("footer", settings)
+end
+
+-- 20210521, ReaderZooming, zoom_factor -> kopt_zoom_factor, https://github.com/koreader/koreader/pull/7728
+if last_migration_date < 20210521 then
+    logger.info("Performing one-time migration for 20210521")
+
+    -- ReaderZooming:init has the same logic for individual DocSettings in onReadSettings
+    if G_reader_settings:has("zoom_factor") and G_reader_settings:hasNot("kopt_zoom_factor") then
+        G_reader_settings:saveSetting("kopt_zoom_factor", G_reader_settings:readSetting("zoom_factor"))
+        G_reader_settings:delSetting("zoom_factor")
+    elseif G_reader_settings:has("zoom_factor") and G_reader_settings:has("kopt_zoom_factor") then
+        G_reader_settings:delSetting("zoom_factor")
+    end
+end
+
+-- 20210531, ReaderZooming, deprecate zoom_mode in global settings, https://github.com/koreader/koreader/pull/7780
+if last_migration_date < 20210531 then
+    logger.info("Performing one-time migration for 20210531")
+
+    if G_reader_settings:has("zoom_mode") then
+        local ReaderZooming = require("apps/reader/modules/readerzooming")
+        -- NOTE: For simplicity's sake, this will overwrite potentially existing genus/type globals,
+        --       as they were ignored in this specific case anyway...
+        local zoom_mode_genus, zoom_mode_type = ReaderZooming:mode_to_combo(G_reader_settings:readSetting("zoom_mode"))
+        G_reader_settings:saveSetting("kopt_zoom_mode_genus", zoom_mode_genus)
+        G_reader_settings:saveSetting("kopt_zoom_mode_type", zoom_mode_type)
+        G_reader_settings:delSetting("zoom_mode")
+    end
+end
+
+-- 20210629, Moves Duration Format to Date Time settings for other plugins to use, https://github.com/koreader/koreader/pull/7897
+if last_migration_date < 20210629 then
+    logger.info("Performing one-time migration for 20210629")
+
+    local footer = G_reader_settings:child("footer")
+    if footer and footer:has("duration_format") then
+        local user_format = footer:readSetting("duration_format")
+        G_reader_settings:saveSetting("duration_format", user_format)
+        footer:delSetting("duration_format")
+    end
+end
+
+-- 20210715, Rename `numeric` to `natural`, https://github.com/koreader/koreader/pull/7978
+if last_migration_date < 20210715 then
+    logger.info("Performing one-time migration for 20210715")
+    if G_reader_settings:has("collate") then
+        local collate = G_reader_settings:readSetting("collate")
+        if collate == "numeric" then
+            G_reader_settings:saveSetting("collate", "natural")
+        end
     end
 end
 
