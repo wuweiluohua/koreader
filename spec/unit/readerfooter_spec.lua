@@ -1,16 +1,15 @@
 describe("Readerfooter module", function()
-    local DocumentRegistry, ReaderUI, DocSettings, UIManager
+    local DocumentRegistry, ReaderUI, ReaderFooter, DocSettings, UIManager
     local purgeDir, Screen
     local tapFooterMenu
-
-    local function is_am()
-        -- Technically only an issue for 1 digit results from %-H, e.g., anything below 10:00 AM
-        return tonumber(os.date("%H")) < 10
-    end
+    local sample_epub = "spec/front/unit/data/juliet.epub"
+    local sample_pdf = "spec/front/unit/data/2col.pdf"
+    local toc_pdf = "spec/front/unit/data/paper.pdf"
+    local doc_epub, doc_pdf
 
     setup(function()
         require("commonrequire")
-        package.unloadAll()
+        disable_plugins()
         local Device = require("device")
         -- Override powerd for running tests on devices with batteries.
         Device.powerd.isChargingHW = function() return false end
@@ -19,6 +18,7 @@ describe("Readerfooter module", function()
         DocumentRegistry = require("document/documentregistry")
         DocSettings = require("docsettings")
         ReaderUI = require("apps/reader/readerui")
+        ReaderFooter = require("apps/reader/modules/readerfooter")
         UIManager = require("ui/uimanager")
         purgeDir = require("ffi/util").purgeDir
         Screen = require("device").screen
@@ -54,6 +54,8 @@ describe("Readerfooter module", function()
             end
             error('Menu item not found: "Status bar"!')
         end
+        doc_epub = DocumentRegistry:openDocument(sample_epub)
+        doc_pdf = DocumentRegistry:openDocument(sample_pdf)
     end)
 
     teardown(function()
@@ -61,137 +63,89 @@ describe("Readerfooter module", function()
         G_reader_settings:delSetting("reader_footer_mode")
         G_reader_settings:delSetting("footer")
         G_reader_settings:flush()
+        doc_epub:close()
+        doc_pdf:close()
     end)
 
+    local readerui
+
     before_each(function()
-        G_reader_settings:saveSetting("footer", {
-            disabled = false,
-            all_at_once = true,
-            toc_markers = true,
-            battery = true,
-            time = true,
-            page_progress = true,
-            pages_left = true,
-            percentage = true,
-            book_time_to_read = true,
-            chapter_time_to_read = true,
-        })
+        local settings = {}
+        for k, v in pairs(ReaderFooter.default_settings) do
+            settings[k] = v
+        end
+        -- Enforce Battery, the real default is dynamic (Device:hasBattery())
+        settings.battery = true
+        G_reader_settings:saveSetting("footer", settings)
+
         -- NOTE: Forcefully disable the statistics plugin, as lj-sqlite3 is horribly broken under Busted,
         --       causing it to erratically fail to load, affecting the results of this test...
         G_reader_settings:saveSetting("plugins_disabled", {
             statistics = true,
         })
-        UIManager:run()
+    end)
+
+    after_each(function()
+        fastforward_ui_events()
+        readerui:onClose()
+        UIManager:quit()
+        purgeDir(DocSettings:getSidecarDir(sample_epub))
+        os.remove(DocSettings:getHistoryPath(sample_epub))
+        purgeDir(DocSettings:getSidecarDir(sample_pdf))
+        os.remove(DocSettings:getHistoryPath(sample_pdf))
+        purgeDir(DocSettings:getSidecarDir(toc_pdf))
+        os.remove(DocSettings:getHistoryPath(toc_pdf))
     end)
 
     it("should setup footer as visible in all_at_once mode", function()
         G_reader_settings:saveSetting("reader_footer_mode", 1)
-        local sample_pdf = "spec/front/unit/data/2col.pdf"
-        purgeDir(DocSettings:getSidecarDir(sample_pdf))
-        os.remove(DocSettings:getHistoryPath(sample_pdf))
+        local settings = G_reader_settings:readSetting("footer")
+        settings.all_at_once = true
+        G_reader_settings:saveSetting("footer", settings)
 
-        local readerui = ReaderUI:new{
+        readerui = ReaderUI:new{
             dimen = Screen:getSize(),
             document = DocumentRegistry:openDocument(sample_pdf),
         }
         assert.is.same(true, readerui.view.footer_visible)
         G_reader_settings:delSetting("reader_footer_mode")
-        readerui:closeDocument()
-        readerui:onClose()
     end)
 
     it("should setup footer as visible not in all_at_once", function()
-        G_reader_settings:saveSetting("footer", {
-            disabled = false,
-            all_at_once = false,
-            toc_markers = true,
-            battery = true,
-            time = true,
-            page_progress = true,
-            pages_left = true,
-            percentage = true,
-            book_time_to_read = true,
-            chapter_time_to_read = true,
-        })
         G_reader_settings:saveSetting("reader_footer_mode", 1)
-        local sample_pdf = "spec/front/unit/data/2col.pdf"
-        purgeDir(DocSettings:getSidecarDir(sample_pdf))
-        os.remove(DocSettings:getHistoryPath(sample_pdf))
+        -- default settings
 
-        local readerui = ReaderUI:new{
+        readerui = ReaderUI:new{
             dimen = Screen:getSize(),
             document = DocumentRegistry:openDocument(sample_pdf),
         }
         assert.is.same(true, readerui.view.footer_visible)
         assert.is.same(1, readerui.view.footer.mode, 1)
         G_reader_settings:delSetting("reader_footer_mode")
-        readerui:closeDocument()
-        readerui:onClose()
-    end)
-
-    it("should setup footer as invisible in full screen mode", function()
-        G_reader_settings:saveSetting("reader_footer_mode", 1)
-        local sample_pdf = "spec/front/unit/data/2col.pdf"
-        purgeDir(DocSettings:getSidecarDir(sample_pdf))
-        os.remove(DocSettings:getHistoryPath(sample_pdf))
-        local cfg = DocSettings:open(sample_pdf)
-        cfg:saveSetting("kopt_full_screen", 0)
-        cfg:flush()
-
-        local readerui = ReaderUI:new{
-            dimen = Screen:getSize(),
-            document = DocumentRegistry:openDocument(sample_pdf),
-        }
-        assert.is.same(false, readerui.view.footer_visible)
-        G_reader_settings:delSetting("reader_footer_mode")
-        readerui:closeDocument()
-        readerui:onClose()
-    end)
-
-    it("should setup footer as visible in mini progress bar mode", function()
-        G_reader_settings:saveSetting("reader_footer_mode", 1)
-        local sample_pdf = "spec/front/unit/data/2col.pdf"
-        purgeDir(DocSettings:getSidecarDir(sample_pdf))
-        os.remove(DocSettings:getHistoryPath(sample_pdf))
-        local cfg = DocSettings:open(sample_pdf)
-        cfg:saveSetting("kopt_full_screen", 0)
-        cfg:flush()
-
-        local readerui = ReaderUI:new{
-            dimen = Screen:getSize(),
-            document = DocumentRegistry:openDocument(sample_pdf),
-        }
-        assert.is.same(false, readerui.view.footer_visible)
-        G_reader_settings:delSetting("reader_footer_mode")
-        readerui:closeDocument()
-        readerui:onClose()
     end)
 
     it("should setup footer as invisible", function()
         G_reader_settings:saveSetting("reader_footer_mode", 1)
-        local sample_epub = "spec/front/unit/data/juliet.epub"
-        purgeDir(DocSettings:getSidecarDir(sample_epub))
-        os.remove(DocSettings:getHistoryPath(sample_epub))
+        -- default settings
+
         local cfg = DocSettings:open(sample_epub)
         cfg:saveSetting("copt_status_line", 1)
         cfg:flush()
 
-        local readerui = ReaderUI:new{
+        readerui = ReaderUI:new{
             dimen = Screen:getSize(),
             document = DocumentRegistry:openDocument(sample_epub),
         }
         assert.is.same(true, readerui.view.footer_visible)
         G_reader_settings:delSetting("reader_footer_mode")
-        readerui:closeDocument()
-        readerui:onClose()
     end)
 
     it("should setup footer for epub without error", function()
-        local sample_epub = "spec/front/unit/data/juliet.epub"
-        purgeDir(DocSettings:getSidecarDir(sample_epub))
-        os.remove(DocSettings:getHistoryPath(sample_epub))
+        local settings = G_reader_settings:readSetting("footer")
+        settings.all_at_once = true
+        G_reader_settings:saveSetting("footer", settings)
 
-        local readerui = ReaderUI:new{
+        readerui = ReaderUI:new{
             dimen = Screen:getSize(),
             document = DocumentRegistry:openDocument(sample_epub),
         }
@@ -203,16 +157,14 @@ describe("Readerfooter module", function()
         -- c.f., NOTE above, Statistics are disabled, hence the N/A results
         assert.are.same('1 / '..page_count..' | '..timeinfo..' | ⇒ 0 | 0% | ⤠ 0% | ⏳ N/A | ⤻ N/A',
                         footer.footer_text.text)
-        readerui:closeDocument()
-        readerui:onClose()
     end)
 
     it("should setup footer for pdf without error", function()
-        local sample_pdf = "spec/front/unit/data/2col.pdf"
-        purgeDir(DocSettings:getSidecarDir(sample_pdf))
-        os.remove(DocSettings:getHistoryPath(sample_pdf))
+        local settings = G_reader_settings:readSetting("footer")
+        settings.all_at_once = true
+        G_reader_settings:saveSetting("footer", settings)
 
-        local readerui = ReaderUI:new{
+        readerui = ReaderUI:new{
             dimen = Screen:getSize(),
             document = DocumentRegistry:openDocument(sample_pdf),
         }
@@ -221,16 +173,14 @@ describe("Readerfooter module", function()
         local timeinfo = readerui.view.footer.textGeneratorMap.time(footer)
         assert.are.same('1 / 2 | '..timeinfo..' | ⇒ 1 | 0% | ⤠ 50% | ⏳ N/A | ⤻ N/A',
                         readerui.view.footer.footer_text.text)
-        readerui:closeDocument()
-        readerui:onClose()
     end)
 
     it("should switch between different modes", function()
-        local sample_pdf = "spec/front/unit/data/2col.pdf"
-        purgeDir(DocSettings:getSidecarDir(sample_pdf))
-        os.remove(DocSettings:getHistoryPath(sample_pdf))
+        local settings = G_reader_settings:readSetting("footer")
+        settings.all_at_once = true
+        G_reader_settings:saveSetting("footer", settings)
 
-        local readerui = ReaderUI:new{
+        readerui = ReaderUI:new{
             dimen = Screen:getSize(),
             document = DocumentRegistry:openDocument(sample_pdf),
         }
@@ -244,7 +194,7 @@ describe("Readerfooter module", function()
                         footer.footer_text.text)
 
         -- disable show all at once, page progress should be on the first
-        tapFooterMenu(fake_menu, "Show all at once")
+        tapFooterMenu(fake_menu, "Show all selected items at once")
         assert.are.same('1 / 2', footer.footer_text.text)
 
         -- disable page progress, time should follow
@@ -260,7 +210,7 @@ describe("Readerfooter module", function()
         assert.are.same('0%', footer.footer_text.text)
 
         -- disable battery, percentage should follow
-        tapFooterMenu(fake_menu, "Battery status".." ()")
+        tapFooterMenu(fake_menu, "Battery percentage".." ()")
         assert.are.same('⤠ 50%', footer.footer_text.text)
 
         -- disable percentage, book time to read should follow
@@ -268,133 +218,120 @@ describe("Readerfooter module", function()
         assert.are.same('⏳ N/A', footer.footer_text.text)
 
         -- disable book time to read, chapter time to read should follow
-        tapFooterMenu(fake_menu, "Book time to read".." (⏳)")
+        tapFooterMenu(fake_menu, "Time left to finish book".." (⏳)")
         assert.are.same('⤻ N/A', footer.footer_text.text)
 
         -- disable chapter time to read, text should be empty
-        tapFooterMenu(fake_menu, "Chapter time to read".." (⤻)")
+        tapFooterMenu(fake_menu, "Time left to finish chapter".." (⤻)")
         assert.are.same('', footer.footer_text.text)
 
-        -- reenable chapter time to read, text should be chapter time to read
-        tapFooterMenu(fake_menu, "Chapter time to read".." (⤻)")
+        -- re-enable chapter time to read, text should be chapter time to read
+        tapFooterMenu(fake_menu, "Time left to finish chapter".." (⤻)")
         assert.are.same('⤻ N/A', footer.footer_text.text)
-        readerui:closeDocument()
-        readerui:onClose()
     end)
 
     it("should rotate through different modes", function()
-        local sample_pdf = "spec/front/unit/data/2col.pdf"
-        local readerui = ReaderUI:new{
+        -- default settings (we'll poke at footer.settings directly post-instantiation)
+
+        readerui = ReaderUI:new{
             dimen = Screen:getSize(),
             document = DocumentRegistry:openDocument(sample_pdf),
         }
         local footer = readerui.view.footer
-        footer.settings.all_at_once = false
         footer.mode = 0
-        footer:onTapFooter()
+        footer:TapFooter()
         assert.is.same(1, footer.mode)
-        footer:onTapFooter()
+        footer:TapFooter()
         -- 2 is pages_left_book, an alternate variant of page_progress, disabled by default (#7047)
         assert.is.same(3, footer.mode)
-        footer:onTapFooter()
+        footer:TapFooter()
         assert.is.same(4, footer.mode)
-        footer:onTapFooter()
+        footer:TapFooter()
         assert.is.same(5, footer.mode)
-        footer:onTapFooter()
+        footer:TapFooter()
         assert.is.same(6, footer.mode)
-        footer:onTapFooter()
+        footer:TapFooter()
         assert.is.same(7, footer.mode)
-        footer:onTapFooter()
+        footer:TapFooter()
         assert.is.same(8, footer.mode)
-        footer:onTapFooter()
+        footer:TapFooter()
         assert.is.same(0, footer.mode)
 
         footer.settings.all_at_once = true
+        footer:updateFooterTextGenerator()
         footer.mode = 5
-        footer:onTapFooter()
+        footer:TapFooter()
         assert.is.same(0, footer.mode)
-        footer:onTapFooter()
+        footer:TapFooter()
         assert.is.same(1, footer.mode)
-        footer:onTapFooter()
+        footer:TapFooter()
         assert.is.same(0, footer.mode)
         -- Make it visible again to make the following tests behave...
-        footer:onTapFooter()
+        footer:TapFooter()
         assert.is.same(1, footer.mode)
-        readerui:closeDocument()
-        readerui:onClose()
     end)
 
     it("should pick up screen resize in resetLayout", function()
-        local sample_pdf = "spec/front/unit/data/2col.pdf"
-        purgeDir(DocSettings:getSidecarDir(sample_pdf))
-        os.remove(DocSettings:getHistoryPath(sample_pdf))
+        local settings = G_reader_settings:readSetting("footer")
+        settings.all_at_once = true
+        G_reader_settings:saveSetting("footer", settings)
 
-        local readerui = ReaderUI:new{
+        readerui = ReaderUI:new{
             dimen = Screen:getSize(),
             document = DocumentRegistry:openDocument(sample_pdf),
         }
         local footer = readerui.view.footer
         local horizontal_margin = Screen:scaleBySize(10)*2
         footer:onUpdateFooter()
-        -- Account for trimming of the leading 0 in the AM
-        local expected = is_am() and 362 or 370
+        local expected = 370
         assert.is.same(expected, footer.text_width)
         assert.is.same(600, footer.progress_bar.width
                             + footer.text_width
                             + horizontal_margin)
-        expected = is_am() and 218 or 210
+        expected = 210
         assert.is.same(expected, footer.progress_bar.width)
 
         local old_screen_getwidth = Screen.getWidth
         Screen.getWidth = function() return 900 end
+        local new_horizontal_margin = Screen:scaleBySize(10)*2
         footer:resetLayout()
-        expected = is_am() and 362 or 370
+        expected = 370
         assert.is.same(expected, footer.text_width)
         assert.is.same(900, footer.progress_bar.width
                             + footer.text_width
-                            + horizontal_margin)
-        expected = is_am() and 518 or 510
+                            + new_horizontal_margin)
+        expected = 510 - (new_horizontal_margin - horizontal_margin)
         assert.is.same(expected, footer.progress_bar.width)
         Screen.getWidth = old_screen_getwidth
-        readerui:closeDocument()
-        readerui:onClose()
     end)
 
     it("should update width on PosUpdate event", function()
-        local sample_epub = "spec/front/unit/data/juliet.epub"
-        purgeDir(DocSettings:getSidecarDir(sample_epub))
-        os.remove(DocSettings:getHistoryPath(sample_epub))
+        local settings = G_reader_settings:readSetting("footer")
+        settings.all_at_once = true
+        G_reader_settings:saveSetting("footer", settings)
 
-        local readerui = ReaderUI:new{
+        readerui = ReaderUI:new{
             dimen = Screen:getSize(),
             document = DocumentRegistry:openDocument(sample_epub),
         }
         local footer = readerui.view.footer
         footer:onPageUpdate(1)
-        local expected = is_am() and 210 or 202
+        local expected = 202
         assert.are.same(expected, footer.progress_bar.width)
-        expected = is_am() and 370 or 378
+        expected = 378
         assert.are.same(expected, footer.text_width)
 
         footer:onPageUpdate(100)
-        expected = is_am() and 186 or 178
+        expected = 178
         assert.are.same(expected, footer.progress_bar.width)
-        expected = is_am() and 394 or 402
+        expected = 402
         assert.are.same(expected, footer.text_width)
-        readerui:closeDocument()
-        readerui:onClose()
     end)
 
     it("should support chapter markers", function()
-        local sample_epub = "spec/front/unit/data/juliet.epub"
-        purgeDir(DocSettings:getSidecarDir(sample_epub))
-        os.remove(DocSettings:getHistoryPath(sample_epub))
+        -- default settings (we'll poke at footer.settings directly post-instantiation)
 
-        G_reader_settings:saveSetting("footer", {
-            toc_markers = true,
-        })
-
-        local readerui = ReaderUI:new{
+        readerui = ReaderUI:new{
             dimen = Screen:getSize(),
             document = DocumentRegistry:openDocument(sample_epub),
         }
@@ -408,23 +345,39 @@ describe("Readerfooter module", function()
         footer.settings.toc_markers = false
         footer:setTocMarkers()
         assert.are.same(nil, footer.progress_bar.ticks)
-        readerui:closeDocument()
-        readerui:onClose()
+    end)
+
+    it("should not crash with paging documents in scroll mode", function()
+        G_reader_settings:saveSetting("reader_footer_mode", 1)
+        local ReaderView = require("apps/reader/modules/readerview")
+        local default_view_mode = ReaderView.view_mode
+        ReaderView.view_mode = "scroll"
+
+        readerui = ReaderUI:new{
+            dimen = Screen:getSize(),
+            document = DocumentRegistry:openDocument(toc_pdf),
+        }
+        local footer = readerui.view.footer
+        assert.is.same("scroll", readerui.view.view_mode)
+        -- the progress bar scale and ticks must remain page-based
+        assert.is.same(footer.pages, footer.progress_bar.last)
+        assert.is.truthy(#footer.progress_bar.ticks > 0)
+        for _, tick in ipairs(footer.progress_bar.ticks) do
+            assert.is_true(tick <= footer.progress_bar.last)
+        end
+
+        ReaderView.view_mode = default_view_mode
     end)
 
     it("should schedule/unschedule auto refresh time task", function()
-        local sample_epub = "spec/front/unit/data/juliet.epub"
-        purgeDir(DocSettings:getSidecarDir(sample_epub))
-        os.remove(DocSettings:getHistoryPath(sample_epub))
-        UIManager:quit()
+        assert.are.same(0, #UIManager._task_queue)
 
-        assert.are.same({}, UIManager._task_queue)
-        G_reader_settings:saveSetting("footer", {
-            auto_refresh_time = true,
-            all_at_once = true,
-            time = true,
-        })
-        local readerui = ReaderUI:new{
+        local settings = G_reader_settings:readSetting("footer")
+        settings.auto_refresh_time = true
+        settings.all_at_once = true
+        G_reader_settings:saveSetting("footer", settings)
+
+        readerui = ReaderUI:new{
             dimen = Screen:getSize(),
             document = DocumentRegistry:openDocument(sample_epub),
         }
@@ -445,24 +398,18 @@ describe("Readerfooter module", function()
             end
         end
         assert.is.same(0, found)
-        readerui:closeDocument()
-        readerui:onClose()
     end)
 
     it("should not schedule auto refresh time task if footer is disabled", function()
-        local sample_epub = "spec/front/unit/data/juliet.epub"
-        purgeDir(DocSettings:getSidecarDir(sample_epub))
-        os.remove(DocSettings:getHistoryPath(sample_epub))
-        UIManager:quit()
+        assert.are.same(0, #UIManager._task_queue)
 
-        assert.are.same({}, UIManager._task_queue)
-        G_reader_settings:saveSetting("footer", {
-            disabled = true,
-            auto_refresh_time = true,
-            all_at_once = true,
-            time = true,
-        })
-        local readerui = ReaderUI:new{
+        local settings = G_reader_settings:readSetting("footer")
+        settings.disabled = true
+        settings.auto_refresh_time = true
+        settings.all_at_once = true
+        G_reader_settings:saveSetting("footer", settings)
+
+        readerui = ReaderUI:new{
             dimen = Screen:getSize(),
             document = DocumentRegistry:openDocument(sample_epub),
         }
@@ -474,24 +421,18 @@ describe("Readerfooter module", function()
             end
         end
         assert.is.same(0, found)
-        readerui:closeDocument()
-        readerui:onClose()
     end)
 
     it("should toggle auto refresh time task by toggling the menu", function()
-        local sample_pdf = "spec/front/unit/data/2col.pdf"
-        purgeDir(DocSettings:getSidecarDir(sample_pdf))
-        os.remove(DocSettings:getHistoryPath(sample_pdf))
-        UIManager:quit()
+        assert.are.same(0, #UIManager._task_queue)
 
-        assert.are.same({}, UIManager._task_queue)
-        G_reader_settings:saveSetting("footer", {
-            disabled = false,
-            auto_refresh_time = true,
-            all_at_once = true,
-            time = true,
-        })
-        local readerui = ReaderUI:new{
+        local settings = G_reader_settings:readSetting("footer")
+        settings.disabled = false
+        settings.auto_refresh_time = true
+        settings.all_at_once = true
+        G_reader_settings:saveSetting("footer", settings)
+
+        readerui = ReaderUI:new{
             dimen = Screen:getSize(),
             document = DocumentRegistry:openDocument(sample_pdf),
         }
@@ -508,7 +449,7 @@ describe("Readerfooter module", function()
         assert.is.same(1, found)
 
         -- disable auto refresh time
-        tapFooterMenu(fake_menu, "Auto refresh")
+        tapFooterMenu(fake_menu, "Auto refresh items")
         found = 0
         for _,task in ipairs(UIManager._task_queue) do
             if task.action == footer.autoRefreshFooter then
@@ -518,7 +459,7 @@ describe("Readerfooter module", function()
         assert.is.same(0, found)
 
         -- enable auto refresh time again
-        tapFooterMenu(fake_menu, "Auto refresh")
+        tapFooterMenu(fake_menu, "Auto refresh items")
         found = 0
         for _,task in ipairs(UIManager._task_queue) do
             if task.action == footer.autoRefreshFooter then
@@ -526,28 +467,20 @@ describe("Readerfooter module", function()
             end
         end
         assert.is.same(1, found)
-        readerui:closeDocument()
-        readerui:onClose()
     end)
 
     it("should support toggle footer through menu if tap zone is disabled", function()
-        local saved_tap_zone_minibar = DTAP_ZONE_MINIBAR
-        DTAP_ZONE_MINIBAR.w = 0 --luacheck: ignore
-        DTAP_ZONE_MINIBAR.h = 0 --luacheck: ignore
+        local DTAP_ZONE_MINIBAR = G_defaults:readSetting("DTAP_ZONE_MINIBAR")
+        DTAP_ZONE_MINIBAR.w = 0
+        DTAP_ZONE_MINIBAR.h = 0
+        G_defaults:saveSetting("DTAP_ZONE_MINIBAR", DTAP_ZONE_MINIBAR)
 
-        local sample_pdf = "spec/front/unit/data/2col.pdf"
-        purgeDir(DocSettings:getSidecarDir(sample_pdf))
-        os.remove(DocSettings:getHistoryPath(sample_pdf))
-        UIManager:quit()
+        assert.are.same(0, #UIManager._task_queue)
 
-        assert.are.same({}, UIManager._task_queue)
         G_reader_settings:saveSetting("reader_footer_mode", 1)
-        G_reader_settings:saveSetting("footer", {
-            disabled = false,
-            page_progress = true,
-            time = true,
-        })
-        local readerui = ReaderUI:new{
+        -- default settings
+
+        readerui = ReaderUI:new{
             dimen = Screen:getSize(),
             document = DocumentRegistry:openDocument(sample_pdf),
         }
@@ -572,24 +505,22 @@ describe("Readerfooter module", function()
         tapFooterMenu(fake_menu, "Toggle mode")
         assert.is.same(3, footer.mode)
 
-        DTAP_ZONE_MINIBAR = saved_tap_zone_minibar --luacheck: ignore
-        readerui:closeDocument()
-        readerui:onClose()
+        G_defaults:delSetting("DTAP_ZONE_MINIBAR")
     end)
 
     it("should remove and add modes to footer text in all_at_once mode", function()
-        local sample_pdf = "spec/front/unit/data/2col.pdf"
-        purgeDir(DocSettings:getSidecarDir(sample_pdf))
-        os.remove(DocSettings:getHistoryPath(sample_pdf))
-        UIManager:quit()
+        assert.are.same(0, #UIManager._task_queue)
 
-        assert.are.same({}, UIManager._task_queue)
-        G_reader_settings:saveSetting("footer", {
-            all_at_once = true,
-            page_progress = true,
-            pages_left = true,
-        })
-        local readerui = ReaderUI:new{
+        local settings = G_reader_settings:readSetting("footer")
+        settings.all_at_once = true
+        settings.battery = false
+        settings.time = false
+        settings.percentage = false
+        settings.book_time_to_read = false
+        settings.chapter_time_to_read = false
+        G_reader_settings:saveSetting("footer", settings)
+
+        readerui = ReaderUI:new{
             dimen = Screen:getSize(),
             document = DocumentRegistry:openDocument(sample_pdf),
         }
@@ -606,24 +537,17 @@ describe("Readerfooter module", function()
         -- add mode to footer text
         tapFooterMenu(fake_menu, "Progress percentage".." (⤠)")
         assert.are.same('1 / 2 | ⤠ 50%', footer.footer_text.text)
-        readerui:closeDocument()
-        readerui:onClose()
     end)
 
     it("should initialize text mode in all_at_once mode", function()
-        local sample_pdf = "spec/front/unit/data/2col.pdf"
-        purgeDir(DocSettings:getSidecarDir(sample_pdf))
-        os.remove(DocSettings:getHistoryPath(sample_pdf))
-        UIManager:quit()
+        assert.are.same(0, #UIManager._task_queue)
 
-        assert.are.same({}, UIManager._task_queue)
         G_reader_settings:saveSetting("reader_footer_mode", 0)
-        G_reader_settings:saveSetting("footer", {
-            all_at_once = true,
-            page_progress = true,
-            pages_left = true,
-        })
-        local readerui = ReaderUI:new{
+        local settings = G_reader_settings:readSetting("footer")
+        settings.all_at_once = true
+        G_reader_settings:saveSetting("footer", settings)
+
+        readerui = ReaderUI:new{
             dimen = Screen:getSize(),
             document = DocumentRegistry:openDocument(sample_pdf)
         }
@@ -632,19 +556,22 @@ describe("Readerfooter module", function()
         assert.is.truthy(footer.settings.all_at_once)
         assert.is.truthy(0, footer.mode)
         assert.is.falsy(readerui.view.footer_visible)
-        readerui:closeDocument()
-        readerui:onClose()
     end)
 
     it("should support disabling all the modes", function()
-        local sample_epub = "spec/front/unit/data/juliet.epub"
-        purgeDir(DocSettings:getSidecarDir(sample_epub))
-        os.remove(DocSettings:getHistoryPath(sample_epub))
-        UIManager:quit()
+        assert.are.same(0, #UIManager._task_queue)
 
-        assert.are.same({}, UIManager._task_queue)
-        G_reader_settings:saveSetting("footer", {})
-        local readerui = ReaderUI:new{
+        local settings = G_reader_settings:readSetting("footer")
+        settings.battery = false
+        settings.time = false
+        settings.page_progress = false
+        settings.pages_left = false
+        settings.percentage = false
+        settings.book_time_to_read = false
+        settings.chapter_time_to_read = false
+        G_reader_settings:saveSetting("footer", settings)
+
+        readerui = ReaderUI:new{
             dimen = Screen:getSize(),
             document = DocumentRegistry:openDocument(sample_epub),
         }
@@ -665,25 +592,19 @@ describe("Readerfooter module", function()
 
         -- test in all at once mode
         tapFooterMenu(fake_menu, "Progress percentage".." (⤠)")
-        tapFooterMenu(fake_menu, "Show all at once")
+        tapFooterMenu(fake_menu, "Show all selected items at once")
         assert.is.same(false, footer.has_no_mode)
         tapFooterMenu(fake_menu, "Progress percentage".." (⤠)")
         assert.is.same(true, footer.has_no_mode)
         tapFooterMenu(fake_menu, "Progress percentage".." (⤠)")
         assert.is.same(false, footer.has_no_mode)
-        readerui:closeDocument()
-        readerui:onClose()
     end)
 
     it("should return correct footer height in time mode", function()
-        local sample_epub = "spec/front/unit/data/juliet.epub"
-        purgeDir(DocSettings:getSidecarDir(sample_epub))
-        os.remove(DocSettings:getHistoryPath(sample_epub))
-        UIManager:quit()
-
         G_reader_settings:saveSetting("reader_footer_mode", 2)
-        G_reader_settings:saveSetting("footer", { time = true })
-        local readerui = ReaderUI:new{
+        -- default settings
+
+        readerui = ReaderUI:new{
             dimen = Screen:getSize(),
             document = DocumentRegistry:openDocument(sample_epub),
         }
@@ -692,19 +613,21 @@ describe("Readerfooter module", function()
         assert.falsy(footer.has_no_mode)
         assert.truthy(readerui.view.footer_visible)
         assert.is.same(15, footer:getHeight())
-        readerui:closeDocument()
-        readerui:onClose()
     end)
 
     it("should return correct footer height when all modes are disabled", function()
-        local sample_epub = "spec/front/unit/data/juliet.epub"
-        purgeDir(DocSettings:getSidecarDir(sample_epub))
-        os.remove(DocSettings:getHistoryPath(sample_epub))
-        UIManager:quit()
-
         G_reader_settings:saveSetting("reader_footer_mode", 1)
-        G_reader_settings:saveSetting("footer", {})
-        local readerui = ReaderUI:new{
+        local settings = G_reader_settings:readSetting("footer")
+        settings.battery = false
+        settings.time = false
+        settings.page_progress = false
+        settings.pages_left = false
+        settings.percentage = false
+        settings.book_time_to_read = false
+        settings.chapter_time_to_read = false
+        G_reader_settings:saveSetting("footer", settings)
+
+        readerui = ReaderUI:new{
             dimen = Screen:getSize(),
             document = DocumentRegistry:openDocument(sample_epub),
         }
@@ -713,19 +636,22 @@ describe("Readerfooter module", function()
         assert.truthy(footer.has_no_mode)
         assert.truthy(readerui.view.footer_visible)
         assert.is.same(15, footer:getHeight())
-        readerui:closeDocument()
-        readerui:onClose()
     end)
 
     it("should disable footer when all modes + progressbar are disabled", function()
-        local sample_epub = "spec/front/unit/data/juliet.epub"
-        purgeDir(DocSettings:getSidecarDir(sample_epub))
-        os.remove(DocSettings:getHistoryPath(sample_epub))
-        UIManager:quit()
-
         G_reader_settings:saveSetting("reader_footer_mode", 1)
-        G_reader_settings:saveSetting("footer", {disable_progress_bar = true})
-        local readerui = ReaderUI:new{
+        local settings = G_reader_settings:readSetting("footer")
+        settings.battery = false
+        settings.time = false
+        settings.page_progress = false
+        settings.pages_left = false
+        settings.percentage = false
+        settings.book_time_to_read = false
+        settings.chapter_time_to_read = false
+        settings.disable_progress_bar = true
+        G_reader_settings:saveSetting("footer", settings)
+
+        readerui = ReaderUI:new{
             dimen = Screen:getSize(),
             document = DocumentRegistry:openDocument(sample_epub),
         }
@@ -733,18 +659,14 @@ describe("Readerfooter module", function()
 
         assert.truthy(footer.has_no_mode)
         assert.falsy(readerui.view.footer_visible)
-        readerui:closeDocument()
-        readerui:onClose()
     end)
 
     it("should disable footer if settings.disabled is true", function()
-        local sample_epub = "spec/front/unit/data/juliet.epub"
-        purgeDir(DocSettings:getSidecarDir(sample_epub))
-        os.remove(DocSettings:getHistoryPath(sample_epub))
-        UIManager:quit()
+        local settings = G_reader_settings:readSetting("footer")
+        settings.disabled = true
+        G_reader_settings:saveSetting("footer", settings)
 
-        G_reader_settings:saveSetting("footer", { disabled = true })
-        local readerui = ReaderUI:new{
+        readerui = ReaderUI:new{
             dimen = Screen:getSize(),
             document = DocumentRegistry:openDocument(sample_epub),
         }
@@ -760,15 +682,12 @@ describe("Readerfooter module", function()
             end
         end
         assert.is.same(0, found)
-
-        readerui:closeDocument()
-        readerui:onClose()
     end)
 
     --[[ This toggling behaviour has been removed:
     it("should toggle between full and min progress bar for cre documents", function()
         local sample_txt = "spec/front/unit/data/sample.txt"
-        local readerui = ReaderUI:new{
+        readerui = ReaderUI:new{
             dimen = Screen:getSize(),
             document = DocumentRegistry:openDocument(sample_txt),
         }
@@ -789,8 +708,6 @@ describe("Readerfooter module", function()
         readerui.rolling:onSetStatusLine(0)
         assert.is.same(0, footer.mode)
         assert.falsy(readerui.view.footer_visible)
-        readerui:closeDocument()
-        readerui:onClose()
     end)
     ]]--
 end)

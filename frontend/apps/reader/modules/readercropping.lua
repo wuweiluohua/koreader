@@ -5,14 +5,15 @@ local CenterContainer = require("ui/widget/container/centercontainer")
 local Event = require("ui/event")
 local FrameContainer = require("ui/widget/container/framecontainer")
 local Geom = require("ui/geometry")
-local InputContainer = require("ui/widget/container/inputcontainer")
 local Math = require("optmath")
 local UIManager = require("ui/uimanager")
+local WidgetContainer = require("ui/widget/container/widgetcontainer")
 local VerticalGroup = require("ui/widget/verticalgroup")
-local Screen = require("device").screen
+local Device = require("device")
+local Screen = Device.screen
 local _ = require("gettext")
 
-local ReaderCropping = InputContainer:new{}
+local ReaderCropping = WidgetContainer:extend{}
 
 function ReaderCropping:onPageCrop(mode)
     self.ui:handleEvent(Event:new("CloseConfigMenu"))
@@ -20,8 +21,6 @@ function ReaderCropping:onPageCrop(mode)
     -- backup original zoom mode as cropping use "page" zoom mode
     self.orig_zoom_mode = self.view.zoom_mode
     if mode == "auto" then
-        --- @fixme: This is weird. "auto" crop happens to be the default, yet the default zoom mode/genus is "page", not "content".
-        ---         This effectively yields different results whether auto is enabled by default, or toggled at runtime...
         if self.document.configurable.text_wrap ~= 1 then
             self:setCropZoomMode(true)
         end
@@ -56,8 +55,6 @@ function ReaderCropping:onPageCrop(mode)
     -- prepare bottom buttons so we know the size available for the page above it
     local button_table = ButtonTable:new{
         width = Screen:getWidth(),
-        button_font_face = "cfont",
-        button_font_size = 20,
         buttons = {{
             {
                 text = _("Cancel"),
@@ -85,7 +82,11 @@ function ReaderCropping:onPageCrop(mode)
         }
     }
     -- height available for page
-    local page_container_h = Screen:getHeight() - button_table:getSize().h
+    local page_container_h = Screen:getHeight()
+    if Device:isTouchDevice() then
+        -- non-touch devices do not need cancel and apply buttons
+        page_container_h = page_container_h - button_table:getSize().h
+    end
     local page_dimen = Geom:new{
         w = Screen:getWidth(),
         h = page_container_h,
@@ -102,9 +103,8 @@ function ReaderCropping:onPageCrop(mode)
     self.crop_dialog = VerticalGroup:new{
         align = "left",
         self.bbox_widget,
-        button_container,
+        (Device:isTouchDevice() and button_container) or nil, -- button bar only available for touch devices
     }
-
     UIManager:show(self.crop_dialog)
     return true
 end
@@ -156,10 +156,6 @@ function ReaderCropping:setCropZoomMode(confirmed)
         self:setZoomMode(zoom_mode_type
                     and "content"..zoom_mode_type
                     or self.orig_zoom_mode)
-        -- Update the configurable, too
-        self.document.configurable.zoom_mode_genus = zoom_mode_type
-                                                 and 3 -- "content"
-                                                  or 4 -- "page"
         self.ui:handleEvent(Event:new("InitScrollPageStates"))
     else
         self:setZoomMode(self.orig_zoom_mode)
@@ -171,7 +167,9 @@ function ReaderCropping:setZoomMode(mode)
 end
 
 function ReaderCropping:onReadSettings(config)
-    self.document.bbox = config:readSetting("bbox")
+    if config:has("bbox") then
+        self.document.bbox = config:readSetting("bbox")
+    end
 end
 
 function ReaderCropping:onSaveSettings()

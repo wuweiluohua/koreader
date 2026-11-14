@@ -2,11 +2,14 @@
 This module contains miscellaneous helper functions specific to our usage of LuaSocket/LuaSec.
 ]]
 
+local Device = require("device")
 local Version = require("version")
 local http = require("socket.http")
 local https = require("ssl.https")
 local ltn12 = require("ltn12")
 local socket = require("socket")
+local ffiUtil = require("ffi/util")
+local T = ffiUtil.template
 
 local socketutil = {
     -- Init to the default LuaSocket/LuaSec values
@@ -14,9 +17,10 @@ local socketutil = {
     total_timeout = -1,
 }
 
---- Builds a sensible UserAgent that fits Wikipedia's UA policy <https://meta.wikimedia.org/wiki/User-Agent_policy>
+--- Builds a sensible UserAgent that fits Wikipedia's UA policy <https://foundation.wikimedia.org/wiki/Policy:Wikimedia_Foundation_User-Agent_Policy>
 local socket_ua = http.USERAGENT
-socketutil.USER_AGENT = "KOReader/" .. Version:getShortVersion() .. " (https://koreader.rocks/) " .. socket_ua:gsub(" ", "/")
+socketutil.USER_AGENT = T("KOReader/%1 (%2; %3; %4; https://github.com/koreader/koreader) %5",
+    Version:getShortVersion(), Device.model, jit.os, jit.arch, socket_ua:gsub(" ", "/"))
 -- Monkey-patch it in LuaSocket, as it already takes care of inserting the appropriate header to its requests.
 http.USERAGENT = socketutil.USER_AGENT
 
@@ -45,15 +49,17 @@ socketutil.DEFAULT_TOTAL_TIMEOUT = -1
 -- as that's what the socket timeout will end up using most of the time.
 -- Note that name resolution happens earlier and one level lower (e.g., glibc),
 -- so name resolution delays will fall outside of these timeouts.
+-- Returns the block & total timeouts now in effect, so callers can report them later (e.g., via describe_error()).
 function socketutil:set_timeout(block_timeout, total_timeout)
     self.block_timeout = block_timeout or 5
     self.total_timeout = total_timeout or 15
 
     -- Also update the actual LuaSocket & LuaSec constants, because:
     -- 1. LuaSocket's `open` does a `settimeout` *after* create with this constant
-    -- 2. KOSync updates it to a stupidly low value
+    -- 2. Rogue code might be attempting to enforce them
     http.TIMEOUT = self.block_timeout
     https.TIMEOUT = self.block_timeout
+    return self.block_timeout, self.total_timeout
 end
 
 --- Reset timeout values to LuaSocket defaults.
@@ -87,12 +93,48 @@ socket.tcp = socketutil.tcp
 socketutil.TIMEOUT_CODE         = "timeout"      -- from LuaSocket's io.c
 socketutil.SSL_HANDSHAKE_CODE   = "wantread"     -- from LuaSec's ssl.c
 socketutil.SINK_TIMEOUT_CODE    = "sink timeout" -- from our own socketutil
+-- NOTE: Despite its legacy name above, LuaSec returns "wantread"/"wantwrite" whenever the socket wait times out
+--       while OpenSSL is waiting on the peer, i.e., during the handshake *or* while sending/receiving data.
+socketutil.SSL_WANTREAD_CODE    = "wantread"     -- from LuaSec's ssl.c
+socketutil.SSL_WANTWRITE_CODE   = "wantwrite"    -- from LuaSec's ssl.c
+
+--- Translate a LuaSocket/LuaSec error code into a human-readable explanation.
+-- Returns nil for codes it doesn't know about (e.g., HTTP status codes), so callers can fall back to their own text.
+-- @param code The error code returned by LuaSocket/LuaSec (e.g., the first return value of http.request)
+-- @param block_timeout (required) The block timeout (in seconds) that was in effect for the request.
+-- @param total_timeout (required) The total timeout (in seconds) that was in effect for the request.
+-- NOTE: Don't read socketutil.block_timeout/total_timeout here: callers usually call reset_timeout()
+--       right after the request, so by the time we get here those hold the defaults, not what was in effect.
+--       Use the values returned by set_timeout(). If they're missing anyway, the duration is just omitted.
+function socketutil.describe_error(code, block_timeout, total_timeout)
+    if type(code) ~= "string" then
+        return nil
+    end
+    local _ = require("gettext")
+    local msg
+    if code == socketutil.TIMEOUT_CODE then
+        msg = block_timeout and T(_("Connection timed out: no response within %1 seconds."), block_timeout)
+                             or _("Connection timed out: no response.")
+    elseif code == socketutil.SSL_WANTREAD_CODE then
+        msg = block_timeout and T(_("Secure connection timed out: no data received within %1 seconds."), block_timeout)
+                             or _("Secure connection timed out: no data received.")
+    elseif code == socketutil.SSL_WANTWRITE_CODE then
+        msg = block_timeout and T(_("Secure connection timed out: could not send data within %1 seconds."), block_timeout)
+                             or _("Secure connection timed out: could not send data.")
+    elseif code == socketutil.SINK_TIMEOUT_CODE then
+        msg = total_timeout and T(_("Transfer aborted: took longer than %1 seconds."), total_timeout)
+                             or _("Transfer aborted: took too long.")
+    elseif code == "closed" then
+        msg = _("Connection closed by the server.")
+    end
+    if msg then
+        -- Keep the raw code around, it's what people will search for or paste into bug reports.
+        return T("%1 (%2)", msg, code)
+    end
+end
 
 -- NOTE: Use os.time() for simplicity's sake (we don't really need subsecond precision).
 --       LuaSocket itself is already using gettimeofday anyway (although it does the maths, like ffi/util's getTimestamp).
---       Proper etiquette would have everyone using clock_gettime(CLOCK_MONOTONIC) for this kind of stuff,
---       but it's a tad more annoying to use because it's stuffed in librt in old glibc versions,
---       and I have no idea what macOS & Android do with it (but it is POSIX). Plus, win32.
 --- Custom version of `ltn12.sink.table` that honors total_timeout
 function socketutil.table_sink(t)
     if socketutil.total_timeout < 0 then
@@ -136,6 +178,60 @@ function socketutil.file_sink(handle, io_err)
     else
         return nil, io_err or "unable to open file"
     end
+end
+
+function socketutil.redact_headers(headers)
+    local sensitive_headers = {
+        ["authorization"] = true,
+        ["cookie"] = true,
+        ["proxy-authorization"] = true,
+        ["set-cookie"] = true,
+    }
+    local safe_headers = {}
+    for key, value in pairs(headers) do
+        if sensitive_headers[key] then
+            safe_headers[key] = "REDACTED"
+        else
+            safe_headers[key] = value
+        end
+    end
+    return safe_headers
+end
+
+function socketutil.redact_request(request)
+    local sensitive_props = {
+        ["password"] = true,
+        ["user"] = true,
+    }
+    local safe_request = {}
+    for key, value in pairs(request) do
+        if sensitive_props[key] then
+            safe_request[key] = "REDACTED"
+        elseif key == "headers" then
+            safe_request[key] = socketutil.redact_headers(value)
+        else
+            safe_request[key] = value
+        end
+    end
+    return safe_request
+end
+
+function socketutil.chainSinkWithProgressCallback(sink, progressCallback)
+    if sink == nil or progressCallback == nil then
+        return sink
+    end
+
+    local downloaded_bytes = 0
+    local progress_reporter_filter = function(chunk, err)
+        if chunk ~= nil then
+            -- accumulate the downloaded bytes so we don't need to check the actual file every time
+            downloaded_bytes = downloaded_bytes + chunk:len()
+            progressCallback(downloaded_bytes)
+        end
+        return chunk, err
+    end
+
+    return ltn12.sink.chain(progress_reporter_filter, sink)
 end
 
 return socketutil

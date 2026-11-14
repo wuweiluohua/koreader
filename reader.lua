@@ -1,5 +1,11 @@
 #!./luajit
-io.stdout:write([[
+
+-- Enforce line-buffering for stdout (this is the default if it points to a tty, but we redirect to a file on most platforms).
+io.stdout:setvbuf("line")
+-- Enforce a reliable locale for numerical representations
+os.setlocale("C", "numeric")
+
+io.write([[
 ---------------------------------------------
                 launching...
   _  _____  ____                _
@@ -11,24 +17,33 @@ io.stdout:write([[
  It's a scroll... It's a codex... It's KOReader!
 
  [*] Current time: ]], os.date("%x-%X"), "\n")
-io.stdout:flush()
-
--- Load default settings
-require("defaults")
-local DataStorage = require("datastorage")
-pcall(dofile, DataStorage:getDataDir() .. "/defaults.persistent.lua")
 
 -- Set up Lua and ffi search paths
 require("setupkoenv")
 
-io.stdout:write(" [*] Version: ", require("version"):getCurrentRevision(), "\n\n")
-io.stdout:flush()
+-- Apply startup user patches and execute startup user scripts
+local userpatch = require("userpatch")
+userpatch.applyPatches(userpatch.early_once)
+userpatch.applyPatches(userpatch.early)
+
+local Version = require("version")
+io.write(" [*] Version: ", Version:getCurrentRevision(), "\n\n")
+
+-- Load default settings
+G_defaults = require("luadefaults"):open()
 
 -- Read settings and check for language override
 -- Has to be done before requiring other files because
 -- they might call gettext on load
+local DataStorage = require("datastorage")
 G_reader_settings = require("luasettings"):open(
     DataStorage:getDataDir().."/settings.reader.lua")
+
+local device_id = G_reader_settings:readSetting("device_id")
+if device_id == nil or device_id == "" then
+    local random = require("random")
+    G_reader_settings:saveSetting("device_id", random.uuid())
+end
 
 -- Apply the JIT opt tweaks ASAP when the C BB is disabled,
 -- because we want to avoid the jit.flush() from bb:enableCBB,
@@ -40,7 +55,7 @@ end
 
 local lang_locale = G_reader_settings:readSetting("language")
 -- Allow quick switching to Arabic for testing RTL/UI mirroring
-if os.getenv("KO_RTL") then lang_locale = "ar_AA" end
+if os.getenv("KO_RTL") then lang_locale = "ar" end
 local _ = require("gettext")
 if lang_locale then
     _.changeLang(lang_locale)
@@ -61,7 +76,7 @@ if G_reader_settings:isTrue("debug") and G_reader_settings:isTrue("debug_verbose
 -- Option parsing:
 local longopts = {
     debug = "d",
-    verbose = "d",
+    verbose = "v",
     profile = "p",
     help = "h",
 }
@@ -140,50 +155,17 @@ end
 
 -- Setup device
 local Device = require("device")
--- DPI
-local dpi_override = G_reader_settings:readSetting("screen_dpi")
-if dpi_override ~= nil then
-    Device:setScreenDPI(dpi_override)
-end
--- Night mode
-if G_reader_settings:isTrue("night_mode") then
-    Device.screen:toggleNightMode()
-end
--- Ensure the proper rotation on startup.
--- We default to the rotation KOReader closed with.
--- If the rotation is not locked it will be overridden by a book or the FM when opened.
-local rotation_mode = G_reader_settings:readSetting("closed_rotation_mode")
-if rotation_mode and rotation_mode ~= Device.screen:getRotationMode() then
-    Device.screen:setRotationMode(rotation_mode)
-end
--- Dithering
-if Device:hasEinkScreen() then
-    Device.screen:setupDithering()
-    if Device.screen.hw_dithering and G_reader_settings:isTrue("dev_no_hw_dither") then
-        Device.screen:toggleHWDithering(false)
-    end
-    if Device.screen.sw_dithering and G_reader_settings:isTrue("dev_no_sw_dither") then
-        Device.screen:toggleSWDithering(false)
-    end
-    -- NOTE: If device can HW dither (i.e., after setupDithering(), hw_dithering is true, but sw_dithering is false),
-    --       but HW dither is explicitly disabled, and SW dither enabled, don't leave SW dither disabled (i.e., re-enable sw_dithering)!
-    if Device:canHWDither() and G_reader_settings:isTrue("dev_no_hw_dither") and G_reader_settings:nilOrFalse("dev_no_sw_dither") then
-        Device.screen:toggleSWDithering(true)
-    end
-end
 
 -- Document renderers canvas
 local CanvasContext = require("document/canvascontext")
 CanvasContext:init(Device)
 
--- Handle one time migration stuff (settings, deprecation, ...) in case of an upgrade...
-require("ui/data/onetime_migration")
+-- Update the version log file if there was an update or the device has changed
+Version:updateVersionLog(Device.model)
 
--- Touch screen (this may display some widget, on first install on Kobo Touch,
--- so have it done after CanvasContext:init() but before Bidi.setup() to not
--- have mirroring mess x/y probing).
-if Device:needsTouchScreenProbe() then
-    Device:touchScreenProbe()
+-- Handle one time migration stuff (settings, deprecation, ...) in case of an upgrade...
+do
+    dofile("frontend/ui/data/onetime_migration.lua")
 end
 
 -- UI mirroring for RTL languages, and text shaping configuration
@@ -204,6 +186,9 @@ end
 
 local UIManager = require("ui/uimanager")
 
+-- Apply developer patches
+userpatch.applyPatches(userpatch.late)
+
 -- Inform once about color rendering on newly supported devices
 -- (there are some android devices that may not have a color screen,
 -- and we are not (yet?) able to guess that fact)
@@ -223,53 +208,52 @@ if G_reader_settings:isTrue("color_rendering") and not Device:hasColorScreen() t
         text = _("Color rendering is mistakenly enabled on your grayscale device.\nThis will subtly break some features, and adversely affect performance."),
         cancel_text = _("Ignore"),
         cancel_callback = function()
-                return
+            return
         end,
         ok_text = _("Disable"),
         ok_callback = function()
-                local Event = require("ui/event")
-                G_reader_settings:delSetting("color_rendering")
-                CanvasContext:setColorRenderingEnabled(false)
-                UIManager:broadcastEvent(Event:new("ColorRenderingUpdate"))
+            local Event = require("ui/event")
+            G_reader_settings:delSetting("color_rendering")
+            CanvasContext:setColorRenderingEnabled(false)
+            UIManager:broadcastEvent(Event:new("ColorRenderingUpdate"))
         end,
     })
+    -- This will only return once the user has made a choice.
+    UIManager:runOnce()
 end
 
--- Get which file to start with
-local last_file = G_reader_settings:readSetting("lastfile")
-local start_with = G_reader_settings:readSetting("start_with") or "filemanager"
+local exit_code
 
--- Helpers
-local function retryLastFile()
+if not Device:isStartupScriptUpToDate() then
     local ConfirmBox = require("ui/widget/confirmbox")
-    return ConfirmBox:new{
-        text = _("Cannot open last file.\nThis could be because it was deleted or because external storage is still being mounted.\nDo you want to retry?"),
+    UIManager:show(ConfirmBox:new{
+        text = _("KOReader's startup script has been updated. You'll need to completely exit KOReader to finalize the update."),
+        cancel_text = _("Ignore"),
+        ok_text = _("Quit"),
         ok_callback = function()
-            if lfs.attributes(last_file, "mode") ~= "file" then
-                UIManager:show(retryLastFile())
-            end
+            exit_code = 0
         end,
-        cancel_callback = function()
-            start_with = "filemanager"
-        end,
-    }
+    })
+    -- This will only return once the user has made a choice.
+    UIManager:runOnce()
 end
 
 -- Start app
-local exit_code
-if file then
+if exit_code then -- luacheck: ignore
+    -- We're quitting to finalize an update.
+elseif file then
     local ReaderUI = require("apps/reader/readerui")
-    UIManager:nextTick(function()
-        ReaderUI:showReader(file)
-    end)
+    ReaderUI:showReader(file)
     exit_code = UIManager:run()
 elseif directory then
     local FileManager = require("apps/filemanager/filemanager")
-    UIManager:nextTick(function()
-        FileManager:showFiles(directory)
-    end)
+    FileManager:showFiles(directory)
     exit_code = UIManager:run()
 else
+    -- Get which file to start with
+    local last_file = G_reader_settings:readSetting("lastfile")
+    local start_with = G_reader_settings:readSetting("start_with") or "filemanager"
+
     local QuickStart = require("ui/quickstart")
     if not QuickStart:isShown() then
         start_with = "last"
@@ -277,44 +261,42 @@ else
     end
 
     if start_with == "last" and last_file and lfs.attributes(last_file, "mode") ~= "file" then
+        local function retryLastFile()
+            local ConfirmBox = require("ui/widget/confirmbox")
+            return ConfirmBox:new{
+                text = _("Cannot open last file.\nThis could be because it was deleted or because external storage is still being mounted.\nDo you want to retry?"),
+                ok_callback = function()
+                    if lfs.attributes(last_file, "mode") ~= "file" then
+                        UIManager:show(retryLastFile())
+                    end
+                end,
+                cancel_callback = function()
+                    start_with = "filemanager"
+                end,
+            }
+        end
         UIManager:show(retryLastFile())
-        -- no exit code as something else will be run after this.
-        UIManager:run()
+        -- This will only return once the file is available or the user gave up.
+        UIManager:runOnce()
     end
     if start_with == "last" and last_file then
         local ReaderUI = require("apps/reader/readerui")
-        UIManager:nextTick(function()
-            ReaderUI:showReader(last_file)
-        end)
+        -- Instantiate RD
+        ReaderUI:showReader(last_file)
         exit_code = UIManager:run()
     else
         local FileManager = require("apps/filemanager/filemanager")
-        local home_dir =
-            G_reader_settings:readSetting("home_dir") or Device.home_dir or lfs.currentdir()
-        UIManager:nextTick(function()
-            FileManager:showFiles(home_dir)
-        end)
-        -- Always open history on top of filemanager so closing history
-        -- doesn't result in exit.
+        local home_dir = G_reader_settings:readSetting("home_dir") or Device.home_dir or lfs.currentdir()
+        -- Instantiate FM
+        FileManager:showFiles(home_dir)
+        -- Always open FM modules on top of filemanager, so closing 'em doesn't result in an exit
+        -- because of an empty widget stack, and so they can interact with the FM instance as expected.
         if start_with == "history" then
-            local FileManagerHistory = require("apps/filemanager/filemanagerhistory")
-            UIManager:nextTick(function()
-                FileManagerHistory:onShowHist()
-            end)
+            FileManager.instance.history:onShowHist()
         elseif start_with == "favorites" then
-            local FileManagerCollection = require("apps/filemanager/filemanagercollection")
-            UIManager:nextTick(function()
-                FileManagerCollection:new{
-                    ui = FileManager.instance,
-                }:onShowColl("favorites")
-            end)
+            FileManager.instance.collections:onShowColl()
         elseif start_with == "folder_shortcuts" then
-            local FileManagerShortcuts = require("apps/filemanager/filemanagershortcuts")
-            UIManager:nextTick(function()
-                FileManagerShortcuts:new{
-                    ui = FileManager.instance,
-                }:onShowFolderShortcutsDialog()
-            end)
+            FileManager.instance.folder_shortcuts:onShowFolderShortcutsDialog()
         end
         exit_code = UIManager:run()
     end
@@ -322,29 +304,7 @@ end
 
 -- Exit
 local function exitReader()
-    -- Exit code can be shoddy on some platforms due to broken library dtors calling _exit(0) from os.exit(N)
-    local ko_exit = os.getenv("KO_EXIT_CODE")
-    if ko_exit then
-        local fo = io.open(ko_exit, "w+")
-        fo:write(tostring(exit_code))
-        fo:close()
-    end
-
-    local ReaderActivityIndicator =
-        require("apps/reader/modules/readeractivityindicator")
-
-    -- Save any device settings before closing G_reader_settings
-    Device:saveSettings()
-
-    -- Save current rotation (or the original rotation if ScreenSaver temporarily modified it) to remember it for next startup
-    G_reader_settings:saveSetting("closed_rotation_mode", Device.orig_rotation_mode or Device.screen:getRotationMode())
-
-    G_reader_settings:close()
-
-    -- Close lipc handles
-    ReaderActivityIndicator:coda()
-
-    -- shutdown hardware abstraction
+    -- Shutdown hardware abstraction (it'll also flush G_reader_settings to disk)
     Device:exit()
 
     if Profiler then Profiler.stop() end
@@ -356,6 +316,13 @@ local function exitReader()
     end
 end
 
-local ret = exitReader()
+-- Apply before_exit patches and execute user scripts
+userpatch.applyPatches(userpatch.before_exit)
+
+local reader_retval = exitReader()
+
+-- Apply exit user patches and execute user scripts
+userpatch.applyPatches(userpatch.on_exit)
+
 -- Close the Lua state on exit
-os.exit(ret, true)
+os.exit(reader_retval, true)

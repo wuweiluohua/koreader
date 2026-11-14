@@ -1,8 +1,9 @@
 describe("luasettings module", function()
-    local Settings
+    local DataStorage, Settings
     setup(function()
         require("commonrequire")
-        Settings = require("frontend/luasettings"):open("this-is-not-a-valid-file")
+        DataStorage = require("datastorage")
+        Settings = require("luasettings"):open(DataStorage:getDataDir() .. "/this-is-not-a-valid-file")
     end)
 
     it("should handle undefined keys", function()
@@ -67,7 +68,9 @@ describe("luasettings module", function()
     end)
 
     describe("table wrapper", function()
-        Settings:delSetting("key")
+        setup(function()
+            Settings:delSetting("key")
+        end)
 
         it("should add item to table", function()
             Settings:addTableItem("key", 1)

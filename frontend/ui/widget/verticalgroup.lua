@@ -5,10 +5,9 @@ A layout widget that puts objects under each other.
 local BD = require("ui/bidi")
 local WidgetContainer = require("ui/widget/container/widgetcontainer")
 
-local VerticalGroup = WidgetContainer:new{
+local VerticalGroup = WidgetContainer:extend{
     align = "center",
     allow_mirroring = true,
-    _mirroredUI = BD.mirroredUILayout(),
     _size = nil,
     _offsets = {},
 }
@@ -35,7 +34,7 @@ end
 function VerticalGroup:paintTo(bb, x, y)
     local size = self:getSize()
     local align = self.align
-    if self._mirroredUI and self.allow_mirroring then
+    if BD.mirroredUILayout() and self.allow_mirroring then
         if align == "left" then
             align = "right"
         elseif align == "right" then

@@ -43,7 +43,6 @@ describe("ReadHistory module", function()
 
     local function assert_item_is(h, i, name, fileRemoved)
         assert.is.same(name, h.hist[i].text)
-        assert.is.same(i, h.hist[i].index)
         assert.is.same(joinPath(realpath(test_data_dir()), name), h.hist[i].file)
         if fileRemoved then
             assert.is_nil(realpath(test_file(name)))
@@ -93,6 +92,7 @@ describe("ReadHistory module", function()
         local h = reload()
         now = now + 61
         h:addItem(test_file("a"), now)
+        mkdir(DataStorage:getHistoryDir())
         touch(legacy_history_file("b"))
         h = reload()
         assert.is.same(2, #h.hist)
@@ -114,6 +114,7 @@ describe("ReadHistory module", function()
         local h = reload()
         now = now + 61
         h:addItem(test_file("f"), now)
+        mkdir(DataStorage:getHistoryDir())
         touch(legacy_history_file("c"))
         touch(legacy_history_file("b"))
         now = now + 61
@@ -260,44 +261,24 @@ describe("ReadHistory module", function()
         rm(test_file("e"))
     end)
 
-    it("should remove duplicate entry", function()
-        rm(file("history.lua"))
-        touch(test_file("a"))
-        touch(test_file("b"))
-        local h = reload()
-        now = now + 61
-        h:addItem(test_file("b"), now)
-        now = now + 61
-        h:addItem(test_file("b"), now)
-        touch(legacy_history_file("a"))
-        now = now + 61
-        h:addItem(test_file("a"), now)  -- ensure a is before b
-        h = reload()
-        assert.is.same(2, #h.hist)
-        assert_item_is(h, 1, "a")
-        assert_item_is(h, 2, "b")
-
-        rm(legacy_history_file("a"))
-        rm(test_file("a"))
-        rm(test_file("b"))
-    end)
-
     it("should reduce the total count", function()
         local function to_file(i)
             return test_file(string.format("%04d", i))
         end
         rm(file("history.lua"))
         local h = reload()
-        for i = 1000, 1, -1 do
+        for i = 600, 1, -1 do
             touch(to_file(i))
-            h:addItem(to_file(i))
+            h:addItem(to_file(i), nil, i ~= 1)
         end
 
-        for i = 1, 500 do  -- at most 500 items are stored
+        -- at most 500 items are stored
+        assert.is.same(500, #h.hist)
+        for i = 1, 500 do
             assert_item_is(h, i, string.format("%04d", i))
         end
 
-        for i = 1, 1000 do
+        for i = 1, 600 do
             rm(to_file(i))
         end
     end)

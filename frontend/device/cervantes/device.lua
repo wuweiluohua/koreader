@@ -12,20 +12,6 @@ local function getProductId()
     return product_id
 end
 
-local function isConnected()
-    -- read carrier state from sysfs (for eth0)
-    local file = io.open("/sys/class/net/eth0/carrier", "rb")
-
-    -- file exists while Wi-Fi module is loaded.
-    if not file then return 0 end
-
-    -- 0 means not connected, 1 connected
-    local out = file:read("*number")
-    file:close()
-
-    return out or 0
-end
-
 local function isMassStorageSupported()
     -- we rely on 3rd party package for that. It should be installed as part of KOReader prerequisites,
     local safemode_version = io.open("/usr/share/safemode/version", "rb")
@@ -34,8 +20,9 @@ local function isMassStorageSupported()
     return true
 end
 
-local Cervantes = Generic:new{
+local Cervantes = Generic:extend{
     model = "Cervantes",
+    ota_model = "cervantes",
     isCervantes = yes,
     isAlwaysPortrait = yes,
     isTouchDevice = yes,
@@ -46,8 +33,11 @@ local Cervantes = Generic:new{
     hasFastWifiStatusQuery = yes,
     hasKeys = yes,
     hasWifiManager = yes,
+    hasWifiRestore = yes,
     canReboot = yes,
     canPowerOff = yes,
+    canSuspend = yes,
+    supportsScreensaver = yes,
     home_dir = "/mnt/public",
 
     -- do we support usb mass storage?
@@ -64,33 +54,33 @@ local Cervantes = Generic:new{
     canHWInvert = yes,
 }
 -- Cervantes Touch
-local CervantesTouch = Cervantes:new{
+local CervantesTouch = Cervantes:extend{
     model = "CervantesTouch",
     display_dpi = 167,
     hasFrontlight = no,
     hasMultitouch = no,
 }
 -- Cervantes TouchLight / Fnac Touch Plus
-local CervantesTouchLight = Cervantes:new{
+local CervantesTouchLight = Cervantes:extend{
     model = "CervantesTouchLight",
     display_dpi = 167,
     hasMultitouch = no,
 }
 -- Cervantes 2013 / Fnac Touch Light
-local Cervantes2013 = Cervantes:new{
+local Cervantes2013 = Cervantes:extend{
     model = "Cervantes2013",
     display_dpi = 212,
     hasMultitouch = no,
     --- @fixme: Possibly requires canHWInvert = no, as it seems to be based on a similar board as the Kobo Aura...
 }
 -- Cervantes 3 / Fnac Touch Light 2
-local Cervantes3 = Cervantes:new{
+local Cervantes3 = Cervantes:extend{
     model = "Cervantes3",
     display_dpi = 300,
     hasMultitouch = no,
 }
 -- Cervantes 4
-local Cervantes4 = Cervantes:new{
+local Cervantes4 = Cervantes:extend{
     model = "Cervantes4",
     display_dpi = 300,
     hasNaturalLight = yes,
@@ -105,14 +95,10 @@ local Cervantes4 = Cervantes:new{
 
 -- input events
 function Cervantes:initEventAdjustHooks()
-    if self.touch_switch_xy then
-        self.input:registerEventAdjustHook(self.input.adjustTouchSwitchXY)
-    end
-
-    if self.touch_mirrored_x then
+    if self.touch_switch_xy and self.touch_mirrored_x then
         self.input:registerEventAdjustHook(
-            self.input.adjustTouchMirrorX,
-            self.screen:getWidth()
+            self.input.adjustTouchSwitchAxesAndMirrorX,
+            (self.screen:getWidth() - 1)
         )
     end
 
@@ -137,9 +123,9 @@ function Cervantes:init()
             [116] = "Power",
         }
     }
-    self.input.open("/dev/input/event0") -- Keys
-    self.input.open("/dev/input/event1") -- touchscreen
-    self.input.open("fake_events") -- usb events
+    self.input:open("/dev/input/event0") -- Keys
+    self.input:open("/dev/input/event1") -- touchscreen
+    self.input:open("fake_events") -- usb events
     self:initEventAdjustHooks()
     Generic.init(self)
 end
@@ -174,10 +160,10 @@ function Cervantes:initNetworkManager(NetworkMgr)
             complete_callback()
         end
     end
-    function NetworkMgr:turnOnWifi(complete_callback)
+    function NetworkMgr:turnOnWifi(complete_callback, interactive)
         logger.info("Cervantes: enabling Wi-Fi")
         os.execute("./enable-wifi.sh")
-        self:reconnectOrShowNetworkMenu(complete_callback)
+        return self:reconnectOrShowNetworkMenu(complete_callback, interactive)
     end
     function NetworkMgr:getNetworkInterfaceName()
         return "eth0"
@@ -192,33 +178,8 @@ function Cervantes:initNetworkManager(NetworkMgr)
     function NetworkMgr:restoreWifiAsync()
         os.execute("./restore-wifi-async.sh")
     end
-    function NetworkMgr:isWifiOn()
-        return 1 == isConnected()
-    end
-end
-
--- screensaver
-function Cervantes:supportsScreensaver()
-    return true
-end
-function Cervantes:intoScreenSaver()
-    local Screensaver = require("ui/screensaver")
-    if self.screen_saver_mode == false then
-        Screensaver:setup()
-        Screensaver:show()
-    end
-    self.powerd:beforeSuspend()
-    self.screen_saver_mode = true
-end
-function Cervantes:outofScreenSaver()
-    if self.screen_saver_mode == true then
-        local Screensaver = require("ui/screensaver")
-        Screensaver:close()
-        local UIManager = require("ui/uimanager")
-        UIManager:nextTick(function() UIManager:setDirty("all", "full") end)
-    end
-    self.powerd:afterResume()
-    self.screen_saver_mode = false
+    NetworkMgr.isWifiOn = NetworkMgr.sysfsWifiOn
+    NetworkMgr.isConnected = NetworkMgr.ifHasAnAddress
 end
 
 -- power functions: suspend, resume, reboot, poweroff
@@ -229,10 +190,92 @@ function Cervantes:resume()
     os.execute("./resume.sh")
 end
 function Cervantes:reboot()
-    os.execute("reboot")
+    os.execute("sleep 1 && reboot &")
 end
 function Cervantes:powerOff()
-    os.execute("halt")
+    os.execute("sleep 1 && halt &")
+end
+
+function Cervantes:isStartupScriptUpToDate()
+    local md5 = require("ffi/MD5")
+    -- Compare the hash of the *active* script to the *potential* one.
+    return md5.sumFile("/tmp/koreader.sh") == md5.sumFile("koreader.sh")
+end
+
+-- This method is the same as the one in kobo/device.lua except the sleep cover part.
+function Cervantes:setEventHandlers(UIManager)
+    -- We do not want auto suspend procedure to waste battery during
+    -- suspend. So let's unschedule it when suspending, and restart it after
+    -- resume. Done via the plugin's onSuspend/onResume handlers.
+    UIManager.event_handlers.Suspend = function()
+        self:onPowerEvent("Suspend")
+    end
+    UIManager.event_handlers.Resume = function()
+        self:onPowerEvent("Resume")
+    end
+    UIManager.event_handlers.PowerPress = function()
+        -- Always schedule power off.
+        -- Press the power button for 2+ seconds to shutdown directly from suspend.
+        UIManager:scheduleIn(2, UIManager.poweroff_action)
+    end
+    UIManager.event_handlers.PowerRelease = function()
+        if not UIManager._entered_poweroff_stage then
+            UIManager:unschedule(UIManager.poweroff_action)
+            -- resume if we were suspended
+            if self.screen_saver_mode then
+                if self.screen_saver_lock then
+                    UIManager.event_handlers.Suspend()
+                else
+                    UIManager.event_handlers.Resume()
+                end
+            else
+                UIManager.event_handlers.Suspend()
+            end
+        end
+    end
+    UIManager.event_handlers.Light = function()
+        self:getPowerDevice():toggleFrontlight()
+    end
+    -- USB plug events with a power-only charger
+    UIManager.event_handlers.Charging = function()
+        self:_beforeCharging()
+        -- NOTE: Plug/unplug events will wake the device up, which is why we put it back to sleep.
+        if self.screen_saver_mode and not self.screen_saver_lock then
+           UIManager.event_handlers.Suspend()
+        end
+    end
+    UIManager.event_handlers.NotCharging = function()
+        -- We need to put the device into suspension, other things need to be done before it.
+        self:usbPlugOut()
+        self:_afterNotCharging()
+        if self.screen_saver_mode and not self.screen_saver_lock then
+           UIManager.event_handlers.Suspend()
+        end
+    end
+    -- USB plug events with a data-aware host
+    UIManager.event_handlers.UsbPlugIn = function()
+        self:_beforeCharging()
+        -- NOTE: Plug/unplug events will wake the device up, which is why we put it back to sleep.
+        if self.screen_saver_mode and not self.screen_saver_lock then
+            UIManager.event_handlers.Suspend()
+        elseif not self.screen_saver_lock then
+            -- Potentially start an USBMS session
+            local MassStorage = require("ui/elements/mass_storage")
+            MassStorage:start()
+        end
+    end
+    UIManager.event_handlers.UsbPlugOut = function()
+        -- We need to put the device into suspension, other things need to be done before it.
+        self:usbPlugOut()
+        self:_afterNotCharging()
+        if self.screen_saver_mode and not self.screen_saver_lock then
+            UIManager.event_handlers.Suspend()
+        elseif not self.screen_saver_lock then
+            -- Potentially dismiss the USBMS ConfirmBox
+            local MassStorage = require("ui/elements/mass_storage")
+            MassStorage:dismiss()
+        end
+    end
 end
 
 -------------- device probe ------------

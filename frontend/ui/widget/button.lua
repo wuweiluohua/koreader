@@ -8,7 +8,6 @@ A button widget that shows text or an icon and handles callback when tapped.
         enabled = false, -- defaults to true
         callback = some_callback_function,
         width = Screen:scaleBySize(50),
-        max_width = Screen:scaleBySize(100),
         bordersize = Screen:scaleBySize(3),
         margin = 0,
         padding = Screen:scaleBySize(2),
@@ -17,6 +16,7 @@ A button widget that shows text or an icon and handles callback when tapped.
 
 local Blitbuffer = require("ffi/blitbuffer")
 local CenterContainer = require("ui/widget/container/centercontainer")
+local Dbg = require("dbg")
 local Device = require("device")
 local Font = require("ui/font")
 local FrameContainer = require("ui/widget/container/framecontainer")
@@ -24,43 +24,70 @@ local Geom = require("ui/geometry")
 local GestureRange = require("ui/gesturerange")
 local IconWidget = require("ui/widget/iconwidget")
 local InputContainer = require("ui/widget/container/inputcontainer")
+local LeftContainer = require("ui/widget/container/leftcontainer")
 local Size = require("ui/size")
+local TextBoxWidget = require("ui/widget/textboxwidget")
 local TextWidget = require("ui/widget/textwidget")
 local UIManager = require("ui/uimanager")
 local _ = require("gettext")
 local Screen = Device.screen
 local logger = require("logger")
 
-local Button = InputContainer:new{
-    text = nil, -- mandatory
+local DGENERIC_ICON_SIZE = G_defaults:readSetting("DGENERIC_ICON_SIZE")
+
+local Button = InputContainer:extend{
+    text = nil, -- mandatory (unless icon is provided)
     text_func = nil,
+    checked_func = nil, -- checkmark appended to text
+    checkmark = "  \u{2713}",
+    lang = nil,
     icon = nil,
+    alpha = false,
     icon_width = Screen:scaleBySize(DGENERIC_ICON_SIZE), -- our icons are square
     icon_height = Screen:scaleBySize(DGENERIC_ICON_SIZE),
     icon_rotation_angle = 0,
+    align = "center", -- or "left"
     preselect = false,
     callback = nil,
     enabled = true,
     hidden = false,
     allow_hold_when_disabled = false,
+    focusable = true, -- if false, the button won't be added to focusmanager.layout
+    -- Allow any button to have a physical key_binding(s), same shape as InputContainer.key_events
+    -- entries: a single key string, or an array of keys/modifier-key combinations.
+    key_bindings = nil,
+    hold_key_bindings = nil,
     margin = 0,
     bordersize = Size.border.button,
-    background = Blitbuffer.COLOR_WHITE,
+    background = nil, -- white by default
     radius = nil,
     padding = Size.padding.button,
     padding_h = nil,
     padding_v = nil,
+    -- Provide only one of these two: 'width' to get a fixed width,
+    -- 'max_width' to allow it to be smaller if text or icon is smaller.
     width = nil,
     max_width = nil,
+    height = nil, -- if not set, depends on the font size
+    avoid_text_truncation = true,
     text_font_face = "cfont",
     text_font_size = 20,
     text_font_bold = true,
+    menu_style = nil, -- see init()
     vsync = nil, -- when "flash_ui" is enabled, allow bundling the highlight with the callback, and fence that batch away from the unhighlight. Avoid delays when callback requires a "partial" on Kobo Mk. 7, c.f., ffi/framebuffer_mxcfb for more details.
 }
 
 function Button:init()
+    if self.menu_style then
+        self.align = "left"
+        self.padding_h = Size.padding.large
+        self.text_font_face = "smallinfofont"
+        self.text_font_size = 22
+        self.text_font_bold = false
+    end
+
     -- Prefer an optional text_func over text
-    if self.text_func and type(self.text_func) == "function" then
+    if self.text_func then
         self.text = self.text_func()
     end
 
@@ -76,86 +103,215 @@ function Button:init()
         self.padding_v = self.padding
     end
 
+    local outer_pad_width = 2*self.padding_h + 2*self.margin + 2*self.bordersize -- unscaled_size_check: ignore
+
+    -- If this button could be made smaller while still not needing truncation
+    -- or a smaller font size, we'll set this: it may allow an upper widget to
+    -- resize/relayout itself to look more compact/nicer (as this size would
+    -- depends on translations)
+    self._min_needed_width = nil
+
+    -- Our button's text may end up using a smaller font size, and/or be multiline.
+    -- We will give the button the height it would have if no such tweaks were
+    -- made. LeftContainer and CenterContainer will vertically center the
+    -- TextWidget or TextBoxWidget in that height (hopefully no ink will overflow)
+    local reference_height = self.height
     if self.text then
+        local text = self.checked_func == nil and self.text or self:getDisplayText()
+        local fgcolor = self.enabled and Blitbuffer.COLOR_BLACK or Blitbuffer.COLOR_DARK_GRAY
+        local face = Font:getFace(self.text_font_face, self.text_font_size)
+        local max_width = self.max_width or self.width
+        if max_width then
+            max_width = max_width - outer_pad_width
+        end
         self.label_widget = TextWidget:new{
-            text = self.text,
-            max_width = self.max_width and self.max_width - 2*self.padding_h - 2*self.margin - 2*self.bordersize or nil,
-            fgcolor = self.enabled and Blitbuffer.COLOR_BLACK or Blitbuffer.COLOR_DARK_GRAY,
+            text = text,
+            lang = self.lang,
+            max_width = max_width,
+            fgcolor = fgcolor,
             bold = self.text_font_bold,
-            face = Font:getFace(self.text_font_face, self.text_font_size)
+            face = face,
         }
+        reference_height = reference_height or self.label_widget:getSize().h
+        if not self.label_widget:isTruncated() then
+            local checkmark_width = 0
+            if self.checked_func and not self.checked_func() then
+                checkmark_width = TextWidget.getTextWidth(self.checkmark, face, self.text_font_bold)
+            end
+            self._min_needed_width = self.label_widget:getSize().w + checkmark_width + outer_pad_width
+        end
+        self.did_truncation_tweaks = false
+        if self.avoid_text_truncation and self.label_widget:isTruncated() then
+            self.did_truncation_tweaks = true
+            local font_size_2_lines = TextBoxWidget:getFontSizeToFitHeight(reference_height, 2, 0)
+            while self.label_widget:isTruncated() do
+                local new_size = self.label_widget.face.orig_size - 1
+                if new_size <= font_size_2_lines then
+                    -- Switch to a 2-lines TextBoxWidget
+                    self.label_widget:free(true)
+                    self.label_widget = TextBoxWidget:new{
+                        text = text,
+                        lang = self.lang,
+                        line_height = 0,
+                        alignment = self.align,
+                        width = max_width,
+                        height = reference_height,
+                        height_adjust = true,
+                        height_overflow_show_ellipsis = true,
+                        fgcolor = fgcolor,
+                        bgcolor = self.background,
+                        bold = self.text_font_bold,
+                        face = Font:getFace(self.text_font_face, new_size),
+                    }
+                    if not self.label_widget.has_split_inside_word then
+                        break
+                    end
+                    -- No good wrap opportunity (split inside a word): ignore this TextBoxWidget
+                    -- and go on with a TextWidget with the smaller font size
+                end
+                if new_size < 8 then -- don't go too small
+                    break
+                end
+                self.label_widget:free(true)
+                self.label_widget = TextWidget:new{
+                    text = text,
+                    lang = self.lang,
+                    max_width = max_width,
+                    fgcolor = fgcolor,
+                    bold = self.text_font_bold,
+                    face = Font:getFace(self.text_font_face, new_size),
+                }
+            end
+        end
     else
         self.label_widget = IconWidget:new{
             icon = self.icon,
+            alpha = self.alpha,
             rotation_angle = self.icon_rotation_angle,
             dim = not self.enabled,
             width = self.icon_width,
             height = self.icon_height,
         }
+        self._min_needed_width = self.icon_width + outer_pad_width
     end
     local widget_size = self.label_widget:getSize()
-    if self.width == nil then
-        self.width = widget_size.w
+    local label_container_height = reference_height or widget_size.h
+    local inner_width
+    if self.width then
+        inner_width = self.width - outer_pad_width
+    else
+        inner_width = widget_size.w
     end
     -- set FrameContainer content
+    if self.align == "left" then
+        self.label_container = LeftContainer:new{
+            dimen = Geom:new{
+                w = inner_width,
+                h = label_container_height,
+            },
+            self.label_widget,
+        }
+    else
+        self.label_container = CenterContainer:new{
+            dimen = Geom:new{
+                w = inner_width,
+                h = label_container_height,
+            },
+            self.label_widget,
+        }
+    end
+    local background_color, border_color, radius
+    if self.background then -- colored button
+        background_color = self.background
+        border_color = background_color -- without black border
+        radius = self.radius or Size.radius.button -- with rounded corners
+    else
+        background_color = Blitbuffer.COLOR_WHITE
+        radius = self.radius
+    end
     self.frame = FrameContainer:new{
         margin = self.margin,
+        show_parent = self.show_parent,
         bordersize = self.bordersize,
-        background = self.background,
-        radius = self.radius,
+        background = background_color,
+        color = border_color,
+        radius = radius,
         padding_top = self.padding_v,
         padding_bottom = self.padding_v,
         padding_left = self.padding_h,
         padding_right = self.padding_h,
-        CenterContainer:new{
-            dimen = Geom:new{
-                w = self.width,
-                h = widget_size.h
-            },
-            self.label_widget,
-        }
+        self.label_container
     }
     if self.preselect then
         self.frame.invert = true
     end
     self.dimen = self.frame:getSize()
     self[1] = self.frame
-    if Device:isTouchDevice() then
-        self.ges_events = {
-            TapSelectButton = {
-                GestureRange:new{
-                    ges = "tap",
-                    range = self.dimen,
-                },
-                doc = "Tap Button",
+    self.ges_events = {
+        TapSelectButton = {
+            GestureRange:new{
+                ges = "tap",
+                range = self.dimen,
             },
-            HoldSelectButton = {
-                GestureRange:new{
-                    ges = "hold",
-                    range = self.dimen,
-                },
-                doc = "Hold Button",
+        },
+        HoldSelectButton = {
+            GestureRange:new{
+                ges = "hold",
+                range = self.dimen,
             },
-            -- Safe-guard for when used inside a MovableContainer
-            HoldReleaseSelectButton = {
-                GestureRange:new{
-                    ges = "hold_release",
-                    range = self.dimen,
-                },
-            }
+        },
+        -- Safe-guard for when used inside a MovableContainer
+        HoldReleaseSelectButton = {
+            GestureRange:new{
+                ges = "hold_release",
+                range = self.dimen,
+            },
         }
+    }
+    if self.key_bindings then
+        Dbg.dassert(type(self.key_bindings) == "string" or type(self.key_bindings) == "table",
+            "Button.key_bindings must be a string or a table")
+        local bind = type(self.key_bindings) == "string" and { self.key_bindings } or self.key_bindings
+        self.key_events.Shortcut = { bind }
+        self.onShortcut = function(this)
+            if this.enabled and this.callback then
+                this.callback()
+                return true
+            end
+            return false
+        end
+    end
+    if self.hold_key_bindings then
+        Dbg.dassert(type(self.hold_key_bindings) == "string" or type(self.hold_key_bindings) == "table",
+            "Button.hold_key_bindings must be a string or a table")
+        local bind = type(self.hold_key_bindings) == "string" and { self.hold_key_bindings } or self.hold_key_bindings
+        self.key_events.HoldShortcut = { bind }
+        self.onHoldShortcut = function(this)
+            if this.enabled and this.hold_callback then
+                this.hold_callback()
+                return true
+            end
+            return false
+        end
+    end
+end
+
+function Button:getMinNeededWidth()
+    if self._min_needed_width and self._min_needed_width < self.width then
+        return self._min_needed_width
     end
 end
 
 function Button:setText(text, width)
     if text ~= self.text then
         -- Don't trash the frame if we're already a text button, and we're keeping the geometry intact
-        if self.text and width and width == self.width then
+        if self.text and width and width == self.width and not self.did_truncation_tweaks then
             self.text = text
             self.label_widget:setText(text)
         else
             self.text = text
             self.width = width
+            self.label_widget:free()
             self:init()
         end
     end
@@ -165,8 +321,13 @@ function Button:setIcon(icon, width)
     if icon ~= self.icon then
         self.icon = icon
         self.width = width
+        self.label_widget:free()
         self:init()
     end
+end
+
+function Button:getDisplayText()
+    return self.checked_func() and self.text .. self.checkmark or self.text
 end
 
 function Button:onFocus()
@@ -185,6 +346,9 @@ function Button:enable()
     if not self.enabled then
         if self.text then
             self.label_widget.fgcolor = Blitbuffer.COLOR_BLACK
+            if self.label_widget.update then -- using a TextBoxWidget
+                self.label_widget:update() -- needed to redraw with the new color
+            end
         else
             self.label_widget.dim = false
         end
@@ -196,6 +360,9 @@ function Button:disable()
     if self.enabled then
         if self.text then
             self.label_widget.fgcolor = Blitbuffer.COLOR_DARK_GRAY
+            if self.label_widget.update then
+                self.label_widget:update()
+            end
         else
             self.label_widget.dim = true
         end
@@ -220,6 +387,14 @@ function Button:enableDisable(enable)
     else
         self:disable()
     end
+end
+
+function Button:paintTo(bb, x, y)
+    if self.enabled_func then
+        -- state may change because of outside factors, so check it on each painting
+        self:enableDisable(self.enabled_func())
+    end
+    InputContainer.paintTo(self, bb, x, y)
 end
 
 function Button:hide()
@@ -250,10 +425,16 @@ end
 -- Used by onTapSelectButton to handle visual feedback when flash_ui is enabled
 function Button:_doFeedbackHighlight()
     -- NOTE: self[1] -> self.frame, if you're confused about what this does vs. onFocus/onUnfocus ;).
+    -- The frame's geometry is only known after the first paint.
+    if not (self[1] and self[1].dimen) then
+        logger.dbg("Button:", tostring(self), "attempted a feedback highlight in an unpainted frame!")
+        return
+    end
     if self.text then
         -- We only want the button's *highlight* to have rounded corners (otherwise they're redundant, same color as the bg).
         -- The nil check is to discriminate the default from callers that explicitly request a specific radius.
-        if self[1].radius == nil then
+        -- The frame may have no background: fall back to the invert flag.
+        if (self[1].radius == nil or self.background) and self[1].background then
             self[1].radius = Size.radius.button
             -- And here, it's easier to just invert the bg/fg colors ourselves,
             -- so as to preserve the rounded corners in one step.
@@ -275,8 +456,14 @@ function Button:_doFeedbackHighlight()
 end
 
 function Button:_undoFeedbackHighlight(is_translucent)
+    -- Same as in _doFeedbackHighlight().
+    if not (self[1] and self[1].dimen) then
+        logger.dbg("Button:", tostring(self), "attempted a feedback unhighlight in an unpainted frame!")
+        return
+    end
     if self.text then
-        if self[1].radius == Size.radius.button then
+        -- Only invert back what was inverted.
+        if self[1].radius == Size.radius.button and self[1].background then
             self[1].radius = nil
             self[1].background = self[1].background:invert()
             self.label_widget.fgcolor = self.label_widget.fgcolor:invert()
@@ -365,9 +552,14 @@ function Button:onTapSelectButton()
                     UIManager:forceRePaint()
                 end
             end
+            if self.checked_func and not self.no_refresh_checkmark then
+                local text = self:getDisplayText()
+                self.label_widget:setText(text)
+                self:refresh()
+            end
         elseif self.tap_input then
             self:onInput(self.tap_input)
-        elseif type(self.tap_input_func) == "function" then
+        elseif self.tap_input_func then
             self:onInput(self.tap_input_func())
         end
     end
@@ -384,13 +576,13 @@ function Button:refresh()
     -- e.g., right after a setText or setIcon is a no-go, as those kill the frame.
     --       (Although, setText, if called with the current width, will conserve the frame).
     if not self[1].dimen then
-        logger.dbg("Button:", self, "attempted a repaint in an unpainted frame!")
+        logger.dbg("Button:", tostring(self), "attempted a repaint in an unpainted frame!")
         return
     end
     UIManager:widgetRepaint(self[1], self[1].dimen.x, self.dimen.y)
 
     UIManager:setDirty(nil, function()
-        return self.enabled and "fast" or "ui", self[1].dimen
+        return (self.enabled and not self.background) and "fast" or "ui", self[1].dimen
     end)
 end
 
@@ -406,7 +598,7 @@ function Button:onHoldSelectButton()
         elseif self.hold_input then
             self:onInput(self.hold_input, true)
             self._hold_handled = true
-        elseif type(self.hold_input_func) == "function" then
+        elseif self.hold_input_func then
             self:onInput(self.hold_input_func(), true)
             self._hold_handled = true
         end

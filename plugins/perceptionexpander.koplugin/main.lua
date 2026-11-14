@@ -14,8 +14,10 @@ local DataStorage = require("datastorage")
 local Blitbuffer = require("ffi/blitbuffer")
 
 local PerceptionExpander = Widget:extend{
-    is_enabled = nil,
     name = "perceptionexpander",
+    is_doc_only = true,
+    settings_file = DataStorage:getSettingsDir() .. "/perception_expander.lua",
+    is_enabled = nil,
     page_counter = 0,
     shift_each_pages = 100,
     margin = 0.1,
@@ -24,21 +26,15 @@ local PerceptionExpander = Widget:extend{
     margin_shift = 0.03,
     settings = nil,
     ALMOST_CENTER_OF_THE_SCREEN = 0.37,
-    last_screen_mode = nil
+    last_screen_mode = nil,
 }
 
 function PerceptionExpander:init()
-    if not self.settings then self:readSettingsFile() end
-
-    self.is_enabled = self.settings:isTrue("is_enabled")
-    if not self.is_enabled then
-        return
+    self.settings = LuaSettings:open(self.settings_file)
+    if self.settings:isTrue("is_enabled") then
+        self.is_enabled = true
+        self:createUI(true)
     end
-    self:createUI(true)
-end
-
-function PerceptionExpander:readSettingsFile()
-    self.settings = LuaSettings:open(DataStorage:getSettingsDir() .. "/perception_expander.lua")
 end
 
 function PerceptionExpander:createUI(readSettings)
@@ -136,6 +132,7 @@ function PerceptionExpander:showSettingsDialog()
             {
                 {
                     text = _("Cancel"),
+                    id = "close",
                     callback = function()
                         self.settings_dialog:onClose()
                         UIManager:close(self.settings_dialog)
@@ -144,7 +141,7 @@ function PerceptionExpander:showSettingsDialog()
                 {
                     text = _("Apply"),
                     callback = function()
-                        self:saveSettings(MultiInputDialog:getFields())
+                        self:saveSettings(self.settings_dialog:getFields())
                         self.settings_dialog:onClose()
                         UIManager:close(self.settings_dialog)
                         self:createUI()
@@ -152,8 +149,6 @@ function PerceptionExpander:showSettingsDialog()
                 },
             },
         },
-        width = math.floor(Screen:getWidth() * 0.8),
-        height = math.floor(Screen:getHeight() * 0.3),
     }
     UIManager:show(self.settings_dialog)
     self.settings_dialog:onShowKeyboard()
@@ -221,7 +216,7 @@ function PerceptionExpander:saveSettings(fields)
 
         local line_intensity = fields[3] ~= "" and tonumber(fields[3]) or self.line_color_intensity * 10
         if line_intensity then
-            self.line_color_intensity = line_intensity / 10
+            self.line_color_intensity = line_intensity * (1/10)
         end
         self.shift_each_pages = fields[4] ~= "" and tonumber(fields[4]) or self.shift_each_pages
     end
@@ -231,7 +226,7 @@ function PerceptionExpander:saveSettings(fields)
     self.settings:saveSetting("line_color_intensity", self.line_color_intensity)
     self.settings:saveSetting("shift_each_pages", self.shift_each_pages)
     self.settings:saveSetting("is_enabled", self.is_enabled)
-    self.settings:flush()
+    self.updated = true
 
     self:createUI()
 end
@@ -239,6 +234,13 @@ end
 function PerceptionExpander:paintTo(bb, x, y)
     if self.is_enabled and self[1] then
         self[1]:paintTo(bb, x, y)
+    end
+end
+
+function PerceptionExpander:onFlushSettings()
+    if self.updated then
+        self.settings:flush()
+        self.updated = nil
     end
 end
 

@@ -9,130 +9,280 @@ This module translates text using Google Translate.
 --  https://github.com/ssut/py-googletrans/blob/master/googletrans/client.py
 --  https://stackoverflow.com/questions/26714426/what-is-the-meaning-of-google-translate-query-params
 
+local Device = require("device")
 local InfoMessage = require("ui/widget/infomessage")
 local TextViewer = require("ui/widget/textviewer")
 local UIManager = require("ui/uimanager")
 local JSON = require("json")
 local Screen = require("device").screen
-local ffiutil  = require("ffi/util")
+local ffiUtil  = require("ffi/util")
 local logger = require("logger")
 local util = require("util")
-local T = ffiutil.template
+local T = ffiUtil.template
 local _ = require("gettext")
 
--- From https://cloud.google.com/translate/docs/languages
--- 20181217: 104 supported languages
+-- Extracted from https://translate.google.com/
+-- 20251003: 249 supported languages
 local AUTODETECT_LANGUAGE = "auto"
 local SUPPORTED_LANGUAGES = {
     -- @translators Many of the names for languages can be conveniently found pre-translated in the relevant language of this Wikipedia article: https://en.wikipedia.org/wiki/List_of_ISO_639-1_codes
+    ab = _("Abkhaz"),
+    ace = _("Acehnese"),
+    ach = _("Acholi"),
+    aa = _("Afar"),
     af = _("Afrikaans"),
     sq = _("Albanian"),
+    alz = _("Alur"),
     am = _("Amharic"),
     ar = _("Arabic"),
     hy = _("Armenian"),
+    as = _("Assamese"),
+    av = _("Avar"),
+    awa = _("Awadhi"),
+    ay = _("Aymara"),
     az = _("Azerbaijani"),
+    ban = _("Balinese"),
+    bal = _("Baluchi"),
+    bm = _("Bambara"),
+    bci = _("Baoulé"),
+    ba = _("Bashkir"),
     eu = _("Basque"),
+    btx = _("Batak Karo"),
+    bts = _("Batak Simalungun"),
+    bbc = _("Batak Toba"),
     be = _("Belarusian"),
+    bem = _("Bemba"),
     bn = _("Bengali"),
+    bew = _("Betawi"),
+    bho = _("Bhojpuri"),
+    bik = _("Bikol"),
     bs = _("Bosnian"),
+    br = _("Breton"),
     bg = _("Bulgarian"),
+    bua = _("Buryat"),
+    yue = _("Cantonese"),
     ca = _("Catalan"),
     ceb = _("Cebuano"),
+    ch = _("Chamorro"),
+    ce = _("Chechen"),
+    ny = _("Chichewa"),
+    -- @translators Many of the names for languages can be conveniently found pre-translated in the relevant language of this Wikipedia article: https://en.wikipedia.org/wiki/List_of_ISO_639-1_codes
     zh = _("Chinese (Simplified)"), -- "Simplified Chinese may be specified either by zh-CN or zh"
     zh_TW = _("Chinese (Traditional)"), -- converted to "zh-TW" below
+    chk = _("Chuukese"),
+    cv = _("Chuvash"),
     co = _("Corsican"),
+    crh = _("Crimean Tatar (Cyrillic)"),
+    ["crh-Latn"] = _("Crimean Tatar (Latin)"),
     hr = _("Croatian"),
     cs = _("Czech"),
     da = _("Danish"),
+    ["fa-AF"] = _("Dari"),
+    dv = _("Dhivehi"),
+    din = _("Dinka"),
+    doi = _("Dogri"),
+    dov = _("Dombe"),
     nl = _("Dutch"),
+    dyu = _("Dyula"),
+    dz = _("Dzongkha"),
     en = _("English"),
     eo = _("Esperanto"),
     et = _("Estonian"),
+    ee = _("Ewe"),
+    fo = _("Faroese"),
+    fj = _("Fijian"),
+    tl = _("Filipino"),
     fi = _("Finnish"),
+    fon = _("Fon"),
     fr = _("French"),
+    ["fr-CA"] = _("French (Canada)"),
     fy = _("Frisian"),
+    fur = _("Friulian"),
+    ff = _("Fulani"),
+    gaa = _("Ga"),
     gl = _("Galician"),
     ka = _("Georgian"),
     de = _("German"),
     el = _("Greek"),
-    -- @translators Many of the names for languages can be conveniently found pre-translated in the relevant language of this Wikipedia article: https://en.wikipedia.org/wiki/List_of_ISO_639-1_codes
+    gn = _("Guarani"),
     gu = _("Gujarati"),
     ht = _("Haitian Creole"),
+    -- @translators Many of the names for languages can be conveniently found pre-translated in the relevant language of this Wikipedia article: https://en.wikipedia.org/wiki/List_of_ISO_639-1_codes
+    cnh = _("Hakha Chin"),
     ha = _("Hausa"),
     haw = _("Hawaiian"),
     he = _("Hebrew"), -- "Hebrew may be specified either by he or iw"
+    hil = _("Hiligaynon"),
     hi = _("Hindi"),
     hmn = _("Hmong"),
     hu = _("Hungarian"),
+    hrx = _("Hunsrik"),
+    iba = _("Iban"),
     is = _("Icelandic"),
     ig = _("Igbo"),
+    ilo = _("Ilocano"),
     id = _("Indonesian"),
+    ["iu-Latn"] = _("Inuktut (Latin)"),
+    iu = _("Inuktut (Syllabics)"),
     ga = _("Irish"),
     it = _("Italian"),
+    jam = _("Jamaican Patois"),
     ja = _("Japanese"),
     jw = _("Javanese"),
-    -- @translators Many of the names for languages can be conveniently found pre-translated in the relevant language of this Wikipedia article: https://en.wikipedia.org/wiki/List_of_ISO_639-1_codes
+    kac = _("Jingpo"),
+    kl = _("Kalaallisut"),
     kn = _("Kannada"),
+    kr = _("Kanuri"),
+    pam = _("Kapampangan"),
     kk = _("Kazakh"),
+    kha = _("Khasi"),
     km = _("Khmer"),
+    cgg = _("Kiga"),
+    kg = _("Kikongo"),
+    rw = _("Kinyarwanda"),
+    ktu = _("Kituba"),
+    trp = _("Kokborok"),
+    kv = _("Komi"),
+    gom = _("Konkani"),
     ko = _("Korean"),
-    ku = _("Kurdish"),
+    kri = _("Krio"),
+    ku = _("Kurdish (Kurmanji)"),
+    ckb = _("Kurdish (Sorani)"),
+    -- @translators Many of the names for languages can be conveniently found pre-translated in the relevant language of this Wikipedia article: https://en.wikipedia.org/wiki/List_of_ISO_639-1_codes
     ky = _("Kyrgyz"),
     lo = _("Lao"),
+    ltg = _("Latgalian"),
     la = _("Latin"),
     lv = _("Latvian"),
+    lij = _("Ligurian"),
+    li = _("Limburgish"),
+    ln = _("Lingala"),
     lt = _("Lithuanian"),
+    lmo = _("Lombard"),
+    lg = _("Luganda"),
+    luo = _("Luo"),
     lb = _("Luxembourgish"),
     mk = _("Macedonian"),
+    mad = _("Madurese"),
+    mai = _("Maithili"),
+    mak = _("Makassar"),
     mg = _("Malagasy"),
     ms = _("Malay"),
+    ["ms-Arab"] = _("Malay (Jawi)"),
     ml = _("Malayalam"),
     mt = _("Maltese"),
+    mam = _("Mam"),
+    gv = _("Manx"),
     mi = _("Maori"),
     mr = _("Marathi"),
+    mh = _("Marshallese"),
+    mwr = _("Marwadi"),
+    mfe = _("Mauritian Creole"),
+    chm = _("Meadow Mari"),
+    ["mni-Mtei"] = _("Meiteilon (Manipuri)"),
+    min = _("Minang"),
+    lus = _("Mizo"),
     mn = _("Mongolian"),
     my = _("Myanmar (Burmese)"),
+    ["bm-Nkoo"] = _("NKo"),
+    nhe = _("Nahuatl (Eastern Huasteca)"),
+    ["ndc-ZW"] = _("Ndau"),
+    nr = _("Ndebele (South)"),
+    new = _("Nepalbhasa (Newari)"),
+    -- @translators Many of the names for languages can be conveniently found pre-translated in the relevant language of this Wikipedia article: https://en.wikipedia.org/wiki/List_of_ISO_639-1_codes
     ne = _("Nepali"),
     no = _("Norwegian"),
-    ny = _("Nyanja (Chichewa)"),
+    nus = _("Nuer"),
+    oc = _("Occitan"),
+    ["or"] = _("Odia (Oriya)"),
+    om = _("Oromo"),
+    os = _("Ossetian"),
+    pag = _("Pangasinan"),
+    pap = _("Papiamento"),
     ps = _("Pashto"),
     fa = _("Persian"),
     pl = _("Polish"),
-    pt = _("Portuguese"),
-    pa = _("Punjabi"),
+    pt = _("Portuguese (Brazil)"),
+    ["pt-PT"] = _("Portuguese (Portugal)"),
+    pa = _("Punjabi (Gurmukhi)"),
+    ["pa-Arab"] = _("Punjabi (Shahmukhi)"),
+    qu = _("Quechua"),
+    kek = _("Qʼeqchiʼ"),
+    rom = _("Romani"),
     ro = _("Romanian"),
+    rn = _("Rundi"),
     ru = _("Russian"),
+    se = _("Sami (North)"),
     sm = _("Samoan"),
+    sg = _("Sango"),
+    sa = _("Sanskrit"),
+    ["sat-Latn"] = _("Santali (Latin)"),
+    sat = _("Santali (Ol Chiki)"),
     gd = _("Scots Gaelic"),
+    nso = _("Sepedi"),
     sr = _("Serbian"),
     st = _("Sesotho"),
+    crs = _("Seychellois Creole"),
+    shn = _("Shan"),
     sn = _("Shona"),
+    scn = _("Sicilian"),
+    szl = _("Silesian"),
     sd = _("Sindhi"),
-    si = _("Sinhala (Sinhalese)"),
+    si = _("Sinhala"),
     sk = _("Slovak"),
+    -- @translators Many of the names for languages can be conveniently found pre-translated in the relevant language of this Wikipedia article: https://en.wikipedia.org/wiki/List_of_ISO_639-1_codes
     sl = _("Slovenian"),
     so = _("Somali"),
     es = _("Spanish"),
     su = _("Sundanese"),
+    sus = _("Susu"),
     sw = _("Swahili"),
+    ss = _("Swati"),
     sv = _("Swedish"),
-    tl = _("Tagalog (Filipino)"),
+    ty = _("Tahitian"),
     tg = _("Tajik"),
+    ["ber-Latn"] = _("Tamazight"),
+    ber = _("Tamazight (Tifinagh)"),
     ta = _("Tamil"),
+    tt = _("Tatar"),
     te = _("Telugu"),
+    tet = _("Tetum"),
     th = _("Thai"),
+    bo = _("Tibetan"),
+    ti = _("Tigrinya"),
+    tiv = _("Tiv"),
+    tpi = _("Tok Pisin"),
+    to = _("Tongan"),
+    lua = _("Tshiluba"),
+    ts = _("Tsonga"),
+    tn = _("Tswana"),
+    tcy = _("Tulu"),
+    tum = _("Tumbuka"),
     tr = _("Turkish"),
+    tk = _("Turkmen"),
+    tyv = _("Tuvan"),
+    ak = _("Twi"),
+    udm = _("Udmurt"),
     uk = _("Ukrainian"),
     ur = _("Urdu"),
+    ug = _("Uyghur"),
     uz = _("Uzbek"),
+    ve = _("Venda"),
+    vec = _("Venetian"),
     vi = _("Vietnamese"),
-    cy = _("Welsh"),
+    war = _("Waray"),
     -- @translators Many of the names for languages can be conveniently found pre-translated in the relevant language of this Wikipedia article: https://en.wikipedia.org/wiki/List_of_ISO_639-1_codes
+    cy = _("Welsh"),
+    wo = _("Wolof"),
     xh = _("Xhosa"),
+    sah = _("Yakut"),
     yi = _("Yiddish"),
     yo = _("Yoruba"),
+    yua = _("Yucatec Maya"),
+    zap = _("Zapotec"),
     zu = _("Zulu"),
 }
+
 -- Fix zh_TW => zh-TW:
 SUPPORTED_LANGUAGES["zh-TW"] = SUPPORTED_LANGUAGES["zh_TW"]
 SUPPORTED_LANGUAGES["zh_TW"] = nil
@@ -140,6 +290,7 @@ SUPPORTED_LANGUAGES["zh_TW"] = nil
 local ALT_LANGUAGE_CODES = {}
 ALT_LANGUAGE_CODES["zh-CN"] = "zh"
 ALT_LANGUAGE_CODES["iw"] = "he"
+ALT_LANGUAGE_CODES["tl"] = "fil"
 
 local Translator = {
     trans_servers = {
@@ -182,31 +333,28 @@ end
 
 function Translator:getLanguageName(lang, default_string)
     if SUPPORTED_LANGUAGES[lang] then
-        return SUPPORTED_LANGUAGES[lang]
+        return SUPPORTED_LANGUAGES[lang], true
     elseif ALT_LANGUAGE_CODES[lang] then
-        return SUPPORTED_LANGUAGES[ALT_LANGUAGE_CODES[lang]]
+        return SUPPORTED_LANGUAGES[ALT_LANGUAGE_CODES[lang]], true
     elseif lang then
-        return lang:upper()
+        return lang:upper(), false
     end
-    return default_string
+    return default_string, false
 end
 
 -- Will be called by ReaderHighlight to make it available in Reader menu
 function Translator:genSettingsMenu()
     local function genLanguagesItems(setting_name, default_checked_item)
         local items_table = {}
-        for lang_key, lang_name in ffiutil.orderedPairs(SUPPORTED_LANGUAGES) do
+        for lang_key, lang_name in ffiUtil.orderedPairs(SUPPORTED_LANGUAGES) do
             table.insert(items_table, {
                 text_func = function()
                     return T("%1 (%2)", lang_name, lang_key)
                 end,
                 checked_func = function()
-                    if G_reader_settings:has(setting_name) then
-                        return lang_key == G_reader_settings:readSetting(setting_name)
-                    else
-                        return lang_key == default_checked_item
-                    end
+                    return lang_key == (G_reader_settings:readSetting(setting_name) or default_checked_item)
                 end,
+                radio = true,
                 callback = function()
                     G_reader_settings:saveSetting(setting_name, lang_key)
                 end,
@@ -218,12 +366,47 @@ function Translator:genSettingsMenu()
         text = _("Translation settings"),
         sub_item_table = {
             {
+                text_func = function()
+                    local __, name = self:getDocumentLanguage()
+                    return T(_("Translate from book language: %1"), name or _("N/A"))
+                end,
+                help_text = _([[
+With books that specify their main language in their metadata (most EPUBs and FB2s), enabling this option will make this language the source language. Otherwise, auto-detection or the selected language will be used.
+This is useful:
+- For books in a foreign language, where consistent translation is needed and words in other languages are rare.
+- For books in familiar languages, to get definitions for words from the translation service.]]),
+                enabled_func = function()
+                    return self:getDocumentLanguage() ~= nil
+                end,
+                checked_func = function()
+                    return G_reader_settings:isTrue("translator_from_doc_lang")
+                end,
+                callback = function()
+                    G_reader_settings:flipTrue("translator_from_doc_lang")
+                end,
+            },
+            {
                 text = _("Auto-detect source language"),
+                help_text = _("This setting is best suited for foreign text found in books written in your native language."),
+                enabled_func = function()
+                    return not (G_reader_settings:isTrue("translator_from_doc_lang") and self:getDocumentLanguage() ~= nil)
+                end,
                 checked_func = function()
                     return G_reader_settings:nilOrTrue("translator_from_auto_detect")
+                        and not (G_reader_settings:isTrue("translator_from_doc_lang") and self:getDocumentLanguage() ~= nil)
                 end,
                 callback = function()
                     G_reader_settings:flipNilOrTrue("translator_from_auto_detect")
+                end,
+            },
+            {
+                text = _("Show romanizations"),
+                help_text = _("Displays source language text in Latin characters. This is useful for reading languages with non-Latin scripts."),
+                checked_func = function()
+                    return G_reader_settings:isTrue("translator_with_romanizations")
+                end,
+                callback = function()
+                    G_reader_settings:flipTrue("translator_with_romanizations")
                 end,
             },
             {
@@ -231,11 +414,12 @@ function Translator:genSettingsMenu()
                     local lang = G_reader_settings:readSetting("translator_from_language")
                     return T(_("Translate from: %1"), self:getLanguageName(lang, ""))
                 end,
+                help_text = _("If a specific source language is manually selected, it will be used everywhere, in all your books."),
                 enabled_func = function()
                     return not G_reader_settings:nilOrTrue("translator_from_auto_detect")
+                        and not (G_reader_settings:isTrue("translator_from_doc_lang") and self:getDocumentLanguage() ~= nil)
                 end,
                 sub_item_table = genLanguagesItems("translator_from_language"),
-                keep_menu_open = true,
                 separator = true,
             },
             {
@@ -244,13 +428,45 @@ function Translator:genSettingsMenu()
                     return T(_("Translate to: %1"), self:getLanguageName(lang, ""))
                 end,
                 sub_item_table = genLanguagesItems("translator_to_language", self:getTargetLanguage()),
-                keep_menu_open = true,
             },
         },
     }
 end
 
+function Translator:getDocumentLanguage()
+    local ui = require("apps/reader/readerui").instance
+    local lang = ui and ui.doc_props and ui.doc_props.language
+    if not lang then
+        return
+    end
+    lang = lang:match("(.*)-") or lang
+    lang = lang:lower()
+    local name, supported = self:getLanguageName(lang, "")
+    if supported then
+        return lang, name
+    end
+    -- ReaderTypography has a map of lang aliases (that we may meet
+    -- in book metadata) to their normalized lang tag: use it
+    local ReaderTypography = require("apps/reader/modules/readertypography")
+    lang = ReaderTypography.LANG_ALIAS_TO_LANG_TAG[lang]
+    if not lang then
+        return
+    end
+    name, supported = self:getLanguageName(lang, "")
+    if supported then
+        return lang, name
+    end
+end
+
 function Translator:getSourceLanguage()
+    if G_reader_settings:isTrue("translator_from_doc_lang") then
+        local lang = self:getDocumentLanguage()
+        if lang then
+            return lang
+        end
+        -- No document or metadata lang tag not supported:
+        -- fallback to other settings
+    end
     if G_reader_settings:isFalse("translator_from_auto_detect") and
             G_reader_settings:has("translator_from_language") then
         return G_reader_settings:readSetting("translator_from_language")
@@ -293,6 +509,7 @@ function Translator:loadPage(text, target_lang, source_lang)
     local query = ""
     self.trans_params.tl = target_lang
     self.trans_params.sl = source_lang
+
     for k,v in pairs(self.trans_params) do
         if type(v) == "table" then
             for _, v2 in ipairs(v) do
@@ -301,6 +518,9 @@ function Translator:loadPage(text, target_lang, source_lang)
         else
             query = query .. k .. '=' .. v .. '&'
         end
+    end
+    if G_reader_settings:isTrue("translator_with_romanizations") then
+       query = query .. "dt=rm&"
     end
     local parsed = url.parse(self:getTransServer())
     parsed.path = self.trans_path
@@ -321,11 +541,12 @@ function Translator:loadPage(text, target_lang, source_lang)
 
     -- raise error message when network is unavailable
     if headers == nil then
-        error("Network is unreachable")
+        error(status or code or "network unreachable")
     end
 
     if code ~= 200 then
-        logger.warn("translator HTTP status not okay:", status)
+        logger.warn("translator HTTP status not okay:", status or code or "network unreachable")
+        logger.dbg("Response headers:", headers)
         return
     end
 
@@ -409,12 +630,19 @@ end
 Show translated text in TextViewer, with alternate translations
 
 @string text
-@string target_lang[opt] (`"en"`, `"fr"`, `…`)
+@bool detailed_view "true" to show alternate translation, definition, additional buttons
 @string source_lang[opt="auto"] (`"en"`, `"fr"`, `…`) or `"auto"` to auto-detect source language
+@string target_lang[opt] (`"en"`, `"fr"`, `…`)
 --]]
-function Translator:showTranslation(text, target_lang, source_lang)
+function Translator:showTranslation(text, detailed_view, source_lang, target_lang, ui_highlight, index)
+    if Device:hasClipboard() then
+        Device.input.setClipboardText(text)
+    end
+
     local NetworkMgr = require("ui/network/manager")
-    if NetworkMgr:willRerunWhenOnline(function() self:showTranslation(text, target_lang, source_lang) end) then
+    if NetworkMgr:willRerunWhenOnline(function()
+                self:showTranslation(text, detailed_view, source_lang, target_lang, ui_highlight, index)
+            end) then
         return
     end
 
@@ -422,11 +650,11 @@ function Translator:showTranslation(text, target_lang, source_lang)
     -- translation service query.
     local Trapper = require("ui/trapper")
     Trapper:wrap(function()
-        self:_showTranslation(text, target_lang, source_lang)
+        self:_showTranslation(text, detailed_view, source_lang, target_lang, ui_highlight, index)
     end)
 end
 
-function Translator:_showTranslation(text, target_lang, source_lang)
+function Translator:_showTranslation(text, detailed_view, source_lang, target_lang, ui_highlight, index)
     if not target_lang then
         target_lang = self:getTargetLanguage()
     end
@@ -455,64 +683,147 @@ function Translator:_showTranslation(text, target_lang, source_lang)
         source_lang = result[3]
     end
     local output = {}
+    local text_main = ""
+
+    local function is_result_valid(res)
+        return res and type(res) == "table" and #res > 0
+    end
 
     -- For both main and alternate translations, we may get multiple slices
     -- of the original text and its translations.
-    if result[1] and type(result[1]) == "table" and #result[1] > 0 then
+    if is_result_valid(result[1]) then
         -- Main translation: we can make a single string from the multiple parts
         -- for easier quick reading
         local source = {}
         local translated = {}
+        local romanized = {}
         for i, r in ipairs(result[1]) do
-            local s = type(r[2]) == "string" and r[2] or ""
+            if detailed_view then
+                local s = type(r[2]) == "string" and r[2] or ""
+                table.insert(source, s)
+                if type(r[4]) == "string" then
+                    table.insert(romanized, r[4])
+                end
+            end
             local t = type(r[1]) == "string" and r[1] or ""
-            table.insert(source, s)
             table.insert(translated, t)
         end
-        table.insert(output, "▣ " .. table.concat(source, " "))
-        table.insert(output, "● " .. table.concat(translated, " "))
+        text_main = table.concat(translated, " ")
+        if detailed_view then
+            text_main = "● " .. text_main
+            table.insert(output, "▣ " .. table.concat(source, " "))
+            if #romanized > 0 then
+                table.insert(output, table.concat(romanized, " "))
+            end
+        end
+        table.insert(output, text_main)
     end
 
-    if result[6] and type(result[6]) == "table" and #result[6] > 0 then
-        -- Alternative translations:
-        table.insert(output, "________")
-        for i, r in ipairs(result[6]) do
-            if type(r[3]) == "table" then
-                local s = type(r[1]) == "string" and r[1]:gsub("\n", "") or ""
-                table.insert(output, "▣ " .. s)
-                for j, rt in ipairs(r[3]) do
-                    -- Use number in solid black circle symbol (U+2776...277F)
-                    local symbol = util.unicodeCodepointToUtf8(10101 + (j < 10 and j or 10))
-                    local t = type(rt[1]) == "string" and rt[1]:gsub("\n", "") or ""
-                    table.insert(output, symbol .. " " .. t)
+    if detailed_view then
+        if is_result_valid(result[6]) then
+            -- Alternative translations:
+            table.insert(output, "")
+            table.insert(output, _("Alternate translations:"))
+            for i, r in ipairs(result[6]) do
+                if type(r[3]) == "table" then
+                    local s = type(r[1]) == "string" and r[1]:gsub("\n", "") or ""
+                    table.insert(output, "▣ " .. s)
+                    for j, rt in ipairs(r[3]) do
+                        -- Use number in solid black circle symbol (U+2776...277F)
+                        local symbol = util.unicodeCodepointToUtf8(10101 + (j < 10 and j or 10))
+                        local t = type(rt[1]) == "string" and rt[1]:gsub("\n", "") or ""
+                        table.insert(output, symbol .. " " .. t)
+                    end
                 end
             end
         end
-    end
-
-    if result[13] and type(result[13]) == "table" and #result[13] > 0 then
-        -- Definition(word)
-        table.insert(output, "________")
-        for i, r in ipairs(result[13]) do
-            if r[2] and type(r[2]) == "table" then
-                local symbol = util.unicodeCodepointToUtf8(10101 + (i < 10 and i or 10))
-                table.insert(output, symbol.. " ".. r[1])
-                for j, res in ipairs(r[2]) do
-                    table.insert(output, "\t● ".. res[1])
+        if is_result_valid(result[13]) then
+            -- Definition(word)
+            table.insert(output, "")
+            table.insert(output, _("Definition:"))
+            for i, r in ipairs(result[13]) do
+                if r[2] and type(r[2]) == "table" then
+                    local symbol = util.unicodeCodepointToUtf8(10101 + (i < 10 and i or 10))
+                    table.insert(output, symbol.. " ".. r[1])
+                    for j, res in ipairs(r[2]) do
+                        table.insert(output, "\t● ".. res[1])
+                    end
                 end
             end
         end
     end
 
     -- table.insert(output, require("dump")(result)) -- for debugging
-    UIManager:show(TextViewer:new{
+    local text_all = table.concat(output, "\n")
+
+    local textviewer, height, buttons_table
+    if detailed_view then
+        height = math.floor(Screen:getHeight() * 0.8)
+        buttons_table = {}
+        if ui_highlight then
+            local function save_note(note_text)
+                UIManager:close(textviewer)
+                if ui_highlight.highlight_dialog then
+                    UIManager:close(ui_highlight.highlight_dialog)
+                    ui_highlight.highlight_dialog = nil
+                end
+                if index then
+                    ui_highlight:editNote(index, false, note_text)
+                else -- new highlight
+                    ui_highlight.selected_text = ui_highlight.selected_text or ui_highlight.selected_text_backup
+                    ui_highlight.selected_text_backup = nil
+                    ui_highlight:addNote(note_text)
+                end
+            end
+            table.insert(buttons_table,
+                {
+                    {
+                        text = _("Save main translation to note"),
+                        callback = function()
+                            save_note(text_main)
+                        end,
+                    },
+                    {
+                        text = _("Save all to note"),
+                        callback = function()
+                            save_note(text_all)
+                        end,
+                    },
+                }
+            )
+        end
+        if Device:hasClipboard() then
+            table.insert(buttons_table,
+                {
+                    {
+                        text = _("Copy main translation"),
+                        callback = function()
+                            Device.input.setClipboardText(text_main)
+                        end,
+                    },
+                    {
+                        text = _("Copy all"),
+                        callback = function()
+                            Device.input.setClipboardText(text_all)
+                        end,
+                    },
+                }
+            )
+        end
+    end
+
+    textviewer = TextViewer:new{
         title = T(_("Translation from %1"), self:getLanguageName(source_lang, "?")),
+        title_multilines = true,
             -- Showing the translation target language in this title may make
             -- it quite long and wrapped, taking valuable vertical spacing
-        text = table.concat(output, "\n"),
-        height = math.floor(Screen:getHeight() * 0.8),
-        justified = G_reader_settings:nilOrTrue("dict_justify"),
-    })
+        text = text_all,
+        text_type = "lookup",
+        height = height,
+        add_default_buttons = true,
+        buttons_table = buttons_table,
+    }
+    UIManager:show(textviewer)
 end
 
 return Translator

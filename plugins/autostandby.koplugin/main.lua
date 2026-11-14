@@ -13,7 +13,7 @@ local SpinWidget = require("ui/widget/spinwidget")
 local logger = require("logger")
 local _ = require("gettext")
 
-local AutoStandby = WidgetContainer:new{
+local AutoStandby = WidgetContainer:extend{
     is_doc_only = false,
     name = "autostandby",
 
@@ -42,10 +42,17 @@ function AutoStandby:init()
 
     UIManager.event_hook:registerWidget("InputEvent", self)
     self.ui.menu:registerToMainMenu(self)
+
+    -- Schedule the next standby on plugin init, either:
+    --   1. When KOReader starts -> to prevent the device from instantly going into standby
+    --   2. During a transition  -> since the standby scheduled following the input event leading to the transition has been unscheduled
+    --        to avoid going into standby during the transition, re-schedule the next standby
+    self:_scheduleNext(os.time(), self.settings.data)
 end
 
 function AutoStandby:onCloseWidget()
     logger.dbg("AutoStandby:onCloseWidget() instance=", tostring(self))
+    -- Unschedule the next standby to avoid going into standby during a transition
     UIManager:unschedule(AutoStandby.allow)
 end
 
@@ -78,6 +85,12 @@ function AutoStandby:onInputEvent()
         logger.dbg("AutoStandby: input packed too close to previous one, ignoring")
         return
     end
+
+    self:_scheduleNext(t, config)
+end
+
+-- Schedule the next standby for when it's actually due
+function AutoStandby:_scheduleNext(t, config)
 
     -- Nuke past timer as we'll reschedule the allow (or not)
     UIManager:unschedule(AutoStandby.allow)
@@ -141,12 +154,11 @@ function AutoStandby:genSpinMenuItem(text, cfg, min, max)
         enabled_func = function() return self:isAllowedByConfig() end,
         callback = function()
             local spin = SpinWidget:new {
-                width = math.floor(Device.screen:getWidth() * 0.6),
                 value = self.settings:readSetting(cfg),
                 value_min = min and min() or 0,
                 value_max = max and max() or 9999,
                 value_hold_step = 10,
-                ok_text = "Update",
+                ok_text = _("Update"),
                 title_text = text,
                 callback = function(spin) self.settings:saveSetting(cfg, spin.value):flush() end,
             }

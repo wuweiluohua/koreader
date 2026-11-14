@@ -4,10 +4,14 @@ describe("Readertoc module", function()
 
     setup(function()
         require("commonrequire")
+        disable_plugins()
         DocumentRegistry = require("document/documentregistry")
         ReaderUI = require("apps/reader/readerui")
         Screen = require("device").screen
         DEBUG = require("dbg")
+
+        -- Expected values below established before the introduction of fractional positionning
+        G_reader_settings:saveSetting("cre_font_fractional_positioning", 0)
 
         local sample_epub = "spec/front/unit/data/juliet.epub"
         -- Clear settings from previous tests
@@ -23,6 +27,11 @@ describe("Readertoc module", function()
         -- reset book to first page
         readerui.rolling:onGotoPage(0)
         toc = readerui.toc
+    end)
+
+    teardown(function()
+        G_reader_settings:delSetting("cre_font_fractional_positioning")
+        G_reader_settings:flush()
     end)
 
     it("should get max toc depth", function()
@@ -76,7 +85,10 @@ describe("Readertoc module", function()
     it("should get page left of chapter", function()
         assert.truthy(toc:getChapterPagesLeft(10) > 10)
         assert.truthy(toc:getChapterPagesLeft(95) > 10)
-        assert.are.same(nil, toc:getChapterPagesLeft(290))
+        -- assert.are.same(nil, toc:getChapterPagesLeft(290))
+        -- Previous line somehow fails, but not if written this way:
+        local pagesleft = toc:getChapterPagesLeft(290)
+        assert.are.same(nil, pagesleft)
     end)
     it("should get page done of chapter", function()
         assert.truthy(toc:getChapterPagesDone(11) < 5)

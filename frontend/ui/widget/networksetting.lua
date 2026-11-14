@@ -56,6 +56,7 @@ local OverlapGroup = require("ui/widget/overlapgroup")
 local Size = require("ui/size")
 local TextWidget = require("ui/widget/textwidget")
 local UIManager = require("ui/uimanager")
+local util = require("util")
 local VerticalGroup = require("ui/widget/verticalgroup")
 local Widget = require("ui/widget/widget")
 local _ = require("gettext")
@@ -74,7 +75,7 @@ local function obtainIP()
 end
 
 
-local MinimalPaginator = Widget:new{
+local MinimalPaginator = Widget:extend{
     width = nil,
     height = nil,
     progress = nil,
@@ -100,20 +101,25 @@ end
 function MinimalPaginator:setProgress(progress) self.progress = progress end
 
 
-local NetworkItem = InputContainer:new{
+local NetworkItem = InputContainer:extend{
     dimen = nil,
     height = Screen:scaleBySize(44),
     icon_size = Screen:scaleBySize(32),
     width = nil,
     info = nil,
+    display_ssid = nil,
     background = Blitbuffer.COLOR_WHITE,
 }
 
 function NetworkItem:init()
-    self.dimen = Geom:new{w = self.width, h = self.height}
+    self.dimen = Geom:new{x = 0, y = 0, w = self.width, h = self.height}
     if not self.info.ssid then
         self.info.ssid = "[hidden]"
     end
+    if not self.info.flags then
+        self.info.flags = ""
+    end
+    self.display_ssid = util.fixUtf8(self.info.ssid, "�")
 
     local wifi_icon
     if string.find(self.info.flags, "WPA") then
@@ -149,7 +155,7 @@ function NetworkItem:init()
                 },
                 horizontal_space,
                 TextWidget:new{
-                    text = self.info.ssid,
+                    text = self.display_ssid,
                     face = Font:getFace("cfont"),
                 },
             },
@@ -204,12 +210,10 @@ function NetworkItem:init()
     }
 
     if Device:isTouchDevice() then
-        self.ges_events = {
-            TapSelect = {
-                GestureRange:new{
-                    ges = "tap",
-                    range = self.dimen,
-                }
+        self.ges_events.TapSelect = {
+            GestureRange:new{
+                ges = "tap",
+                range = self.dimen,
             }
         }
     end
@@ -265,7 +269,8 @@ end
 
 function NetworkItem:saveAndConnectToNetwork(password_input)
     local new_passwd = password_input:getInputText()
-    if new_passwd == nil or string.len(new_passwd) == 0 then
+    -- Dont set a empty password if WPA encryption, go through if it’s an open AP
+    if (new_passwd == nil or #new_passwd == 0) and string.find(self.info.flags, "WPA") then
         UIManager:show(InfoMessage:new{
             text = _("Password cannot be empty."),
         })
@@ -284,15 +289,16 @@ end
 function NetworkItem:onEditNetwork()
     local password_input
     password_input = InputDialog:new{
-        title = self.info.ssid,
+        title = self.display_ssid,
         input = self.info.password,
-        input_hint = "password",
+        input_hint = _("password (leave empty for open networks)"),
         input_type = "text",
         text_type = "password",
         buttons = {
             {
                 {
                     text = _("Cancel"),
+                    id = "close",
                     callback = function()
                         UIManager:close(password_input)
                     end,
@@ -326,15 +332,16 @@ end
 function NetworkItem:onAddNetwork()
     local password_input
     password_input = InputDialog:new{
-        title = self.info.ssid,
+        title = self.display_ssid,
         input = "",
-        input_hint = "password",
+        input_hint = _("password (leave empty for open networks)"),
         input_type = "text",
         text_type = "password",
         buttons = {
             {
                 {
                     text = _("Cancel"),
+                    id = "close",
                     callback = function()
                         UIManager:close(password_input)
                     end,
@@ -355,9 +362,11 @@ function NetworkItem:onAddNetwork()
 end
 
 function NetworkItem:onTapSelect(arg, ges_ev)
-    if not string.find(self.info.flags, "WPA") then
+    -- Open AP dont have specific flag so we can’t include them alongside WPA
+    -- so we exclude WEP instead (more encryption to exclude? not really future proof)
+    if string.find(self.info.flags, "WEP") then
         UIManager:show(InfoMessage:new{
-            text = _("Networks without WPA/WPA2 encryption are not supported.")
+            text = _("Networks with WEP encryption are not supported.")
         })
         return
     end
@@ -379,7 +388,7 @@ function NetworkItem:onTapSelect(arg, ges_ev)
 end
 
 
-local NetworkSetting = InputContainer:new{
+local NetworkSetting = InputContainer:extend{
     width = nil,
     height = nil,
     -- sample network_list entry: {
@@ -452,7 +461,7 @@ function NetworkSetting:init()
                     self.pagination:setProgress(curr_page/total_pages)
                     -- self.page_text:setText(curr_page .. "/" .. total_pages)
                     UIManager:setDirty(self, function()
-                        return "ui", self.dimen
+                        return "ui", self.popup.dimen
                     end)
                 end
             },
@@ -477,20 +486,26 @@ function NetworkSetting:init()
         }
     end
 
+    -- If the backend is already authenticated,
+    -- and NetworkMgr:reconnectOrShowNetworkMenu somehow missed it,
+    -- expedite the process.
+    -- Yes, this is a very old codepath that's hardly ever exercised anymore...
+    if not self.connect_callback then
+        return
+    end
+
     UIManager:nextTick(function()
         local connected_item = self:getConnectedItem()
         if connected_item ~= nil then
             obtainIP()
             if G_reader_settings:nilOrTrue("auto_dismiss_wifi_scan") then
-                UIManager:close(self, "ui", self.dimen)
+                UIManager:close(self)
             end
             UIManager:show(InfoMessage:new{
-                text = T(_("Connected to network %1"), BD.wrap(connected_item.info.ssid)),
+                text = T(_("Connected to network %1"), BD.wrap(connected_item.display_ssid)),
                 timeout = 3,
             })
-            if self.connect_callback then
-                self.connect_callback()
-            end
+            self.connect_callback()
         end
     end)
 end
@@ -508,6 +523,14 @@ function NetworkSetting:onTapClose(arg, ges_ev)
         UIManager:close(self)
         return true
     end
+end
+
+function NetworkSetting:onCloseWidget()
+    -- If we don't have a connectivity check ticking, assume we're done with this connection attempt *now*
+    if not NetworkMgr.pending_connectivity_check then
+        NetworkMgr.pending_connection = false
+    end
+    UIManager:setDirty(nil, "ui", self.popup.dimen)
 end
 
 return NetworkSetting

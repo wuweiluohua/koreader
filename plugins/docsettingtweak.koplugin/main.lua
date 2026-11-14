@@ -1,57 +1,47 @@
 local BD = require("ui/bidi")
 local DataStorage = require("datastorage")
-local FFIUtil = require("ffi/util")
+local Device = require("device")
 local InputDialog = require("ui/widget/inputdialog")
 local LuaSettings = require("luasettings")
 local UIManager = require("ui/uimanager")
 local WidgetContainer = require("ui/widget/container/widgetcontainer")
-local _ = require("gettext")
-local T = FFIUtil.template
+local ffiUtil = require("ffi/util")
 local filemanagerutil = require("apps/filemanager/filemanagerutil")
+local lfs = require("libs/libkoreader-lfs")
 local util = require("util")
+local _ = require("gettext")
+local T = ffiUtil.template
 
-local DocSettingTweak = WidgetContainer:new{
+local DocSettingTweak = WidgetContainer:extend{
     name = "docsettingtweak",
+    settings_file = DataStorage:getSettingsDir() .. "/directory_defaults.lua",
 }
 
-local directory_defaults_name = "directory_defaults.lua"
-local directory_defaults_path = FFIUtil.joinPath(DataStorage:getSettingsDir(), directory_defaults_name)
-local directory_defaults = nil
-local initialized = false
-
 function DocSettingTweak:init()
-    if not initialized then
-        -- Make sure our settings file exists
-        if not lfs.attributes(directory_defaults_path, "mode") then
-            FFIUtil.copyFile(FFIUtil.joinPath(self.path, "directory_defaults_template.lua"),
-                         directory_defaults_path)
-        end
-        initialized = true
+    if Device:isTouchDevice() or not Device:hasFewKeys() then
+        -- cannot exit from text editor on non-touch devices with few keys
+        self.ui.menu:registerToMainMenu(self)
     end
-    DocSettingTweak:loadDefaults()
-    self.ui.menu:registerToMainMenu(self)
-end
-
-function DocSettingTweak:loadDefaults()
-    directory_defaults = LuaSettings:open(directory_defaults_path)
 end
 
 function DocSettingTweak:addToMainMenu(menu_items)
     menu_items.doc_setting_tweak = {
         text = _("Tweak document settings"),
-        callback = function() DocSettingTweak:editDirectoryDefaults() end,
+        callback = function()
+            DocSettingTweak:editDirectoryDefaults()
+        end,
     }
 end
 
 function DocSettingTweak:editDirectoryDefaults()
-    local directory_defaults_file = io.open(directory_defaults_path, "rb")
-    local defaults = directory_defaults_file:read("*all")
-    directory_defaults_file:close()
+    if not lfs.attributes(self.settings_file, "mode") then
+        ffiUtil.copyFile(ffiUtil.joinPath(self.path, "directory_defaults_template.lua"), self.settings_file)
+    end
+    local defaults = util.readFromFile(self.settings_file, "rb")
     local config_editor
     config_editor = InputDialog:new{
-        title = T(_("Directory Defaults: %1"), BD.filepath(directory_defaults_path)),
+        title = T(_("Directory Defaults: %1"), BD.filepath(self.settings_file)),
         input = defaults,
-        input_type = "string",
         para_direction_rtl = false, -- force LTR
         fullscreen = true,
         condensed = true,
@@ -67,17 +57,15 @@ function DocSettingTweak:editDirectoryDefaults()
                 if not parse_error then
                     local syntax_okay, syntax_error = pcall(loadstring(content))
                     if syntax_okay then
-                        directory_defaults_file = io.open(directory_defaults_path, "w")
-                        directory_defaults_file:write(content)
-                        directory_defaults_file:close()
+                        if not util.writeToFile(content, self.settings_file) then
+                            return false, _("Missing defaults file")
+                        end
                         DocSettingTweak:loadDefaults()
                         return true, _("Defaults saved")
-                    else
-                        return false, T(_("Defaults invalid: %1"), syntax_error)
                     end
-                else
-                        return false, T(_("Defaults invalid: %1"), parse_error)
-                    end
+                    return false, T(_("Defaults invalid: %1"), syntax_error)
+                end
+                return false, T(_("Defaults invalid: %1"), parse_error)
             end
             return false, _("Defaults empty")
         end,
@@ -87,28 +75,36 @@ function DocSettingTweak:editDirectoryDefaults()
 end
 
 function DocSettingTweak:onDocSettingsLoad(doc_settings, document)
-    -- check that the documents settings are empty & and that we have defaults to customize
-    if next(doc_settings.data) == nil and directory_defaults.data ~= nil then
-        local base = G_reader_settings:readSetting("home_dir") or filemanagerutil.getDefaultDir()
-        if document.file == nil or document.file == "" then
-            return
+    -- check that the document has not been opened yet & and that we have defaults to customize
+    if document.is_new and lfs.attributes(self.settings_file, "mode") == "file" then
+        local directory_defaults = LuaSettings:open(self.settings_file)
+        if directory_defaults.data == nil then return true end
+        local tweaks = {}
+        for path, tweak in pairs(directory_defaults.data) do
+            tweaks[self.ui.folder_shortcuts:expandPath(path)] = tweak
         end
-        local directory = FFIUtil.dirname(document.file)
+        local base = filemanagerutil.getHomeFolder()
+        local absolute_path = ffiUtil.realpath(document.file)
+        local directory = ffiUtil.dirname(absolute_path)
         -- check if folder matches our defaults to override
         while directory:sub(1, #base) == base do
-            if directory_defaults:has(directory) then
-                doc_settings.data = util.tableDeepCopy(directory_defaults:readSetting(directory))
+            if tweaks[directory] then
+                local summary = doc_settings.data.summary -- keep status
+                doc_settings.data = util.tableDeepCopy(tweaks[directory])
+                doc_settings.data.doc_path = document.file
+                doc_settings.data.summary = doc_settings.data.summary or summary
                 break
             else
                 if directory == "/" or directory == "." then
                     -- have reached the filesystem root, abort
                     break
                 else
-                    directory = FFIUtil.dirname(directory)
+                    directory = ffiUtil.dirname(directory)
                 end
             end
         end
     end
+    return true -- unique handler at the moment
 end
 
 return DocSettingTweak

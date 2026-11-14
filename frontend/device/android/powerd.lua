@@ -6,25 +6,17 @@ local AndroidPowerD = BasePowerD:new{
     fl_max = 100,
 }
 
--- Let the footer know of the change
-local function broadcastLightChanges()
-    if package.loaded["ui/uimanager"] ~= nil then
-        local Event = require("ui/event")
-        local UIManager = require("ui/uimanager")
-        UIManager:broadcastEvent(Event:new("FrontlightStateChanged"))
-    end
-end
-
 function AndroidPowerD:frontlightIntensityHW()
     return math.floor(android.getScreenBrightness() / self.bright_diff * self.fl_max)
 end
 
 function AndroidPowerD:setIntensityHW(intensity)
-    -- if frontlight switch was toggled of, turn it on
+    -- If the frontlight switch was off, turn it on.
     android.enableFrontlightSwitch()
 
     self.fl_intensity = intensity
     android.setScreenBrightness(math.floor(intensity * self.bright_diff / self.fl_max))
+    self:_decideFrontlightState()
 end
 
 function AndroidPowerD:init()
@@ -35,23 +27,30 @@ function AndroidPowerD:init()
     --    do not use fl_min==0 if getScreenMinBrightness!=0,
     --    because intenstiy==0 would mean to use system intensity
     if min_bright ~= self.fl_min then
-        self.fl_min = math.ceil(min_bright * self.bright_diff / self.fl_max)
+        self.fl_min = math.ceil(min_bright * self.fl_max / self.bright_diff)
     end
 
     if self.device:hasNaturalLight() then
         self.fl_warmth_min = android.getScreenMinWarmth()
         self.fl_warmth_max = android.getScreenMaxWarmth()
         self.warm_diff = self.fl_warmth_max - self.fl_warmth_min
-        self.fl_warmth = self:getWarmth()
+
+        -- BasePowerD only sets warmth_scale after init() returns, c.f. KoboPowerD:init.
+        self.warmth_scale = 100 / self.fl_warmth_max
+
+        local warmth = G_reader_settings:readSetting("frontlight_warmth")
+        if warmth then
+            self.fl_warmth = warmth
+            self:setWarmth(warmth, true)
+        end
     end
 end
 
-function AndroidPowerD:setWarmth(warmth)
-    self.fl_warmth = warmth
-    android.setScreenWarmth(warmth / self.warm_diff)
+function AndroidPowerD:setWarmthHW(warmth)
+    android.setScreenWarmth(warmth)
 end
 
-function AndroidPowerD:getWarmth()
+function AndroidPowerD:frontlightWarmthHW()
     return android.getScreenWarmth() * self.warm_diff
 end
 
@@ -68,11 +67,13 @@ function AndroidPowerD:turnOffFrontlightHW()
         return
     end
     android.setScreenBrightness(self.fl_min)
-    self.is_fl_on = false
-    broadcastLightChanges()
+
+    if android.hasStandaloneWarmth() then
+        android.setScreenWarmth(self.fl_warmth_min)
+    end
 end
 
-function AndroidPowerD:turnOnFrontlightHW()
+function AndroidPowerD:turnOnFrontlightHW(done_callback)
     if self:isFrontlightOn() and self:isFrontlightOnHW() then
         return
     end
@@ -81,8 +82,10 @@ function AndroidPowerD:turnOnFrontlightHW()
 
     android.setScreenBrightness(math.floor(self.fl_intensity * self.bright_diff / self.fl_max))
 
-    self.is_fl_on = true
-    broadcastLightChanges()
+    if android.hasStandaloneWarmth() then
+        android.setScreenWarmth(math.floor(self.fl_warmth / self.warm_diff))
+    end
+    return false
 end
 
 return AndroidPowerD

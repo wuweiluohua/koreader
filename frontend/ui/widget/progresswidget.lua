@@ -5,14 +5,14 @@ Configurable attributes:
 
  * width
  * height
- * margin_v  -- vertical margin for solid infill
- * margin_h  -- horizontal margin for solid infill
+ * margin_v  -- vertical margin between border and fill bar
+ * margin_h  -- horizontal margin between border and fill bar
  * radius
  * bordersize
  * bordercolor
  * bgcolor
- * altcolor   -- alternate backrgound color for "alt" pages
- * rectdim    -- dim amount for infill
+ * fillcolor  -- color of the main fill bar
+ * altcolor   -- color of the alt fill bar
  * ticks (list)  -- default to nil, use this if you want to insert markers
  * tick_width
  * last  -- maximum tick, used with ticks
@@ -31,10 +31,15 @@ Example:
 local BD = require("ui/bidi")
 local Blitbuffer = require("ffi/blitbuffer")
 local Geom = require("ui/geometry")
+local IconWidget = require("ui/widget/iconwidget")
+local Math = require("optmath")
 local Widget = require("ui/widget/widget")
 local Screen = require("device").screen
 
-local ProgressWidget = Widget:new{
+-- Somewhat empirically chosen threshold to switch between the two designs ;o)
+local INITIAL_MARKER_HEIGHT_THRESHOLD = Screen:scaleBySize(12)
+
+local ProgressWidget = Widget:extend{
     width = nil,
     height = nil,
     margin_h = Screen:scaleBySize(3),
@@ -43,8 +48,8 @@ local ProgressWidget = Widget:new{
     bordersize = Screen:scaleBySize(1),
     bordercolor = Blitbuffer.COLOR_BLACK,
     bgcolor = Blitbuffer.COLOR_WHITE,
+    fillcolor = Blitbuffer.COLOR_DARK_GRAY,
     altcolor = Blitbuffer.COLOR_LIGHT_GRAY,
-    rectdim = 2/3,
     percentage = nil,
     ticks = nil,
     tick_width = Screen:scaleBySize(3),
@@ -52,10 +57,53 @@ local ProgressWidget = Widget:new{
     fill_from_right = false,
     allow_mirroring = true,
     alt = nil, -- table with alternate pages to mark with different color (in the form {{ini1, len1}, {ini2, len2}, ...})
-    _mirroredUI = BD.mirroredUILayout(),
     _orig_margin_v = nil,
     _orig_bordersize = nil,
+    initial_pos_marker = false, -- overlay a marker at the initial percentage position
+    initial_percentage = nil,
+    invert_direction = false, -- manually invert the direction regardless of UI mirroring
 }
+
+function ProgressWidget:init()
+    if self.initial_pos_marker then
+        if not self.initial_percentage then
+            self.initial_percentage = self.percentage
+        end
+
+        self:renderMarkerIcon()
+    end
+end
+
+function ProgressWidget:renderMarkerIcon()
+    if not self.initial_pos_marker then
+        return
+    end
+
+    if self.initial_pos_icon then
+        self.initial_pos_icon:free()
+    end
+
+    -- Can't do anything if we don't have a proper height yet...
+    if not self.height then
+        return
+    end
+
+    if self.height <= INITIAL_MARKER_HEIGHT_THRESHOLD then
+        self.initial_pos_icon = IconWidget:new{
+            icon = "position.marker.top",
+            width = Math.round(self.height / 2),
+            height = Math.round(self.height / 2),
+            alpha = true,
+        }
+    else
+        self.initial_pos_icon = IconWidget:new{
+            icon = "position.marker",
+            width = self.height,
+            height = self.height,
+            alpha = true,
+        }
+    end
+end
 
 function ProgressWidget:getSize()
     return { w = self.width, h = self.height }
@@ -63,80 +111,128 @@ end
 
 function ProgressWidget:paintTo(bb, x, y)
     local my_size = self:getSize()
-    self.dimen = Geom:new{
-        x = x, y = y,
-        w = my_size.w,
-        h = my_size.h
-    }
+    if not self.dimen then
+        self.dimen = Geom:new{
+            x = x, y = y,
+            w = my_size.w,
+            h = my_size.h,
+        }
+    else
+        self.dimen.x = x
+        self.dimen.y = y
+        self.dimen.w = my_size.w
+        self.dimen.h = my_size.h
+    end
     if self.dimen.w == 0 or self.dimen.h == 0 then return end
 
-    -- fill background
-    bb:paintRoundedRect(x, y, my_size.w, my_size.h, self.bgcolor, self.radius)
-    -- paint border
-    bb:paintBorder(x, y,
-                   my_size.w, my_size.h,
-                   self.bordersize, self.bordercolor, self.radius)
-    -- background for alternate pages (e.g. non-linear flows)
+    local _mirroredUI = BD.mirroredUILayout()
+    -- Apply inversion if requested (XOR operation with mirrored UI)
+    if self.invert_direction then
+        _mirroredUI = not _mirroredUI
+    end
+
+    -- We'll draw every bar element in order, bottom to top.
+    local fill_width = my_size.w - 2*(self.margin_h + self.bordersize)
+    local fill_y = y + self.margin_v + self.bordersize
+    local fill_height = my_size.h - 2*(self.margin_v + self.bordersize)
+
+    if self.radius == 0 then
+        -- If we don't have rounded borders, we can start with a simple border colored rectangle.
+        bb:paintRect(x, y, my_size.w, my_size.h, self.bordercolor)
+        -- And a full background bar inside (i.e., on top) of that.
+        bb:paintRect(x + self.margin_h + self.bordersize,
+                     fill_y,
+                     math.ceil(fill_width),
+                     math.ceil(fill_height),
+                     self.bgcolor)
+    else
+        -- Otherwise, we have to start with the background.
+        bb:paintRoundedRect(x, y, my_size.w, my_size.h, self.bgcolor, self.radius)
+        -- Then the border around that.
+        bb:paintBorder(math.floor(x), math.floor(y),
+                       my_size.w, my_size.h,
+                       self.bordersize, self.bordercolor, self.radius)
+    end
+
+    -- Then we can just paint the fill rectangle(s) and tick(s) on top of that.
+    -- First the fill bar(s)...
+    -- Fill bar for alternate pages (e.g. non-linear flows).
     if self.alt and self.alt[1] ~= nil then
-        local bar_width = (my_size.w-2*self.margin_h)
-        local y_pos = y + self.margin_v + self.bordersize
-        local bar_height = my_size.h-2*(self.margin_v+self.bordersize)
         for i=1, #self.alt do
-            local tick_x = bar_width*((self.alt[i][1]-1)/self.last)
-            local width = bar_width*(self.alt[i][2]/self.last)
-            width = math.ceil(tick_x + width)
+            local tick_x = fill_width * ((self.alt[i][1] - 1) / self.last)
+            local width = fill_width * (self.alt[i][2] / self.last)
+            if _mirroredUI then
+                tick_x = fill_width - tick_x - width
+            end
             tick_x = math.floor(tick_x)
-            width = width - tick_x
-            if self._mirroredUI then
-                tick_x = bar_width - tick_x - width
-            end
-            bb:paintRect(
-                x + self.margin_h + tick_x,
-                y_pos,
-                width,
-                bar_height,
-                self.altcolor)
+            width = math.ceil(width)
+
+            bb:paintRect(x + self.margin_h + self.bordersize + tick_x,
+                         fill_y,
+                         width,
+                         math.ceil(fill_height),
+                         self.altcolor)
         end
     end
-    -- paint percentage infill
-    -- note that "lightenRect" is misleading, it actualy darkens stuff
+
+    -- Main fill bar for the specified percentage.
     if self.percentage >= 0 and self.percentage <= 1 then
-        if self.fill_from_right or (self._mirroredUI and not self.fill_from_right) then
-            bb:lightenRect(x+self.margin_h + math.ceil((my_size.w-2*self.margin_h)*(1-self.percentage)),
-                    math.ceil(y+self.margin_v+self.bordersize),
-                    math.ceil((my_size.w-2*self.margin_h)*self.percentage),
-                    my_size.h-2*(self.margin_v+self.bordersize),
-                    self.rectdim)
-        else
-            bb:lightenRect(x+self.margin_h,
-                    math.ceil(y+self.margin_v+self.bordersize),
-                    math.ceil((my_size.w-2*self.margin_h)*self.percentage),
-                    my_size.h-2*(self.margin_v+self.bordersize),
-                    self.rectdim)
+        local fill_x = x + self.margin_h + self.bordersize
+        if self.fill_from_right or (_mirroredUI and not self.fill_from_right) then
+            fill_x = fill_x + (fill_width * (1 - self.percentage))
+            fill_x = math.floor(fill_x)
+        end
+
+        bb:paintRect(fill_x,
+                     fill_y,
+                     math.ceil(fill_width * self.percentage),
+                     math.ceil(fill_height),
+                     self.fillcolor)
+
+        -- Overlay the initial position marker on top of that
+        if self.initial_pos_marker and self.initial_percentage >= 0 then
+            local marker_x, icon_x, icon_y
+            if _mirroredUI then
+                marker_x = x + self.margin_h + self.bordersize + math.ceil(fill_width - (fill_width * self.initial_percentage))
+            else
+                marker_x = x + self.margin_h + self.bordersize + math.ceil(fill_width * self.initial_percentage)
+            end
+            if self.height <= INITIAL_MARKER_HEIGHT_THRESHOLD then
+                icon_x = Math.round(marker_x - self.height * (1/4))
+                icon_y = y - Math.round(self.height * (1/6))
+            else
+                icon_x = Math.round(marker_x - self.height * (1/2))
+                icon_y = y
+            end
+            self.initial_pos_icon:paintTo(bb, icon_x, icon_y)
         end
     end
-    -- ticks
+
+    -- ...then the tick(s).
     if self.ticks and self.last and self.last > 0 then
-        local bar_width = (my_size.w-2*self.margin_h)
-        local y_pos = y + self.margin_v + self.bordersize
-        local bar_height = my_size.h-2*(self.margin_v+self.bordersize)
         for i, tick in ipairs(self.ticks) do
-            local tick_x = bar_width*(tick/self.last)
-            if self._mirroredUI then
-                tick_x = bar_width - tick_x
+            local tick_x = fill_width * (tick / self.last)
+            if _mirroredUI then
+                tick_x = fill_width - tick_x
             end
-            bb:paintRect(
-                x + self.margin_h + tick_x,
-                y_pos,
-                self.tick_width,
-                bar_height,
-                self.bordercolor)
+            tick_x = math.floor(tick_x)
+
+            bb:paintRect(x + self.margin_h + self.bordersize + tick_x,
+                         fill_y,
+                         self.tick_width,
+                         math.ceil(fill_height),
+                         self.bordercolor)
         end
     end
 end
 
 function ProgressWidget:setPercentage(percentage)
     self.percentage = percentage
+    if self.initial_pos_marker then
+        if not self.initial_percentage then
+            self.initial_percentage = self.percentage
+        end
+    end
 end
 
 function ProgressWidget:getPercentageFromPosition(pos)
@@ -148,7 +244,13 @@ function ProgressWidget:getPercentageFromPosition(pos)
     if x < 0 or x > width then
         return nil
     end
-    if BD.mirroredUILayout() then
+    local mirrored = BD.mirroredUILayout()
+    -- Invert if requested
+    if self.invert_direction then
+        mirrored = not mirrored
+    end
+
+    if mirrored then
         x = width - x
     end
     return x / width
@@ -166,6 +268,9 @@ function ProgressWidget:setHeight(height)
     self.margin_v = math.max(self.margin_v, margin_v_min)
     self.bordersize = math.min(self._orig_bordersize, math.floor((self.height - 2*self.margin_v - 1) / 2))
     self.bordersize = math.max(self.bordersize, bordersize_min)
+
+    -- Re-render marker, if any
+    self:renderMarkerIcon()
 end
 
 function ProgressWidget:updateStyle(thick, height)
@@ -175,6 +280,7 @@ function ProgressWidget:updateStyle(thick, height)
         self.bordersize = Screen:scaleBySize(1)
         self.radius = Screen:scaleBySize(2)
         self.bgcolor = Blitbuffer.COLOR_WHITE
+        self.fillcolor = Blitbuffer.COLOR_DARK_GRAY
         self._orig_margin_v = nil
         self._orig_bordersize = nil
         if height then
@@ -186,12 +292,19 @@ function ProgressWidget:updateStyle(thick, height)
         self.bordersize = 0
         self.radius = 0
         self.bgcolor = Blitbuffer.COLOR_GRAY
+        self.fillcolor = Blitbuffer.COLOR_GRAY_5
         self.ticks = nil
         self._orig_margin_v = nil
         self._orig_bordersize = nil
         if height then
             self:setHeight(height)
         end
+    end
+end
+
+function ProgressWidget:free()
+    if self.initial_pos_icon then
+        self.initial_pos_icon:free()
     end
 end
 

@@ -1,13 +1,20 @@
 describe("Readerrolling module", function()
-    local DocumentRegistry, ReaderUI, Event, Screen
+    local DocumentRegistry, UIManager, ReaderUI, Event, Screen
     local readerui, rolling
 
     setup(function()
         require("commonrequire")
+        disable_plugins()
+        UIManager = require("ui/uimanager")
+        stub(UIManager, "getNthTopWidget")
+        UIManager.getNthTopWidget.returns({})
         DocumentRegistry = require("document/documentregistry")
         ReaderUI = require("apps/reader/readerui")
         Event = require("ui/event")
         Screen = require("device").screen
+
+        -- Expected values below established before the introduction of fractional positionning
+        G_reader_settings:saveSetting("cre_font_fractional_positioning", 0)
 
         local sample_epub = "spec/front/unit/data/juliet.epub"
         readerui = ReaderUI:new{
@@ -17,9 +24,15 @@ describe("Readerrolling module", function()
         rolling = readerui.rolling
     end)
 
+    teardown(function()
+        G_reader_settings:delSetting("cre_font_fractional_positioning")
+        G_reader_settings:flush()
+        readerui:onClose()
+    end)
+
     describe("test in portrait screen mode", function()
         it("should goto portrait screen mode", function()
-            readerui:handleEvent(Event:new("SetRotationMode", Screen.ORIENTATION_PORTRAIT))
+            readerui:handleEvent(Event:new("SetRotationMode", Screen.DEVICE_ROTATED_UPRIGHT))
         end)
 
         it("should goto certain page", function()
@@ -59,9 +72,11 @@ describe("Readerrolling module", function()
 
         it("should emit EndOfBook event at the end of sample epub", function()
             local called = false
+            local saved_handler = readerui.onEndOfBook
             readerui.onEndOfBook = function()
                 called = true
             end
+            finally(function() readerui.onEndOfBook = saved_handler end)
             -- check beginning of the book
             rolling:onGotoPage(1)
             assert.is.falsy(called)
@@ -75,45 +90,49 @@ describe("Readerrolling module", function()
             assert.is.truthy(called)
             rolling:onGotoViewRel(1)
             assert.is.truthy(called)
-            readerui.onEndOfBook = nil
         end)
 
         it("should emit EndOfBook event at the end sample txt", function()
             local sample_txt = "spec/front/unit/data/sample.txt"
-            local txt_readerui = ReaderUI:new{
+            local old_instance = readerui
+            finally(function()
+                ReaderUI.instance = old_instance
+                readerui = old_instance
+                rolling = readerui.rolling
+            end)
+            ReaderUI.instance = nil
+            readerui = ReaderUI:new{
                 dimen = Screen:getSize(),
                 document = DocumentRegistry:openDocument(sample_txt),
             }
+            rolling = readerui.rolling
             local called = false
-            txt_readerui.onEndOfBook = function()
+            readerui.onEndOfBook = function()
                 called = true
             end
-            local txt_rolling = txt_readerui.rolling
             -- check beginning of the book
-            txt_rolling:onGotoPage(1)
+            rolling:onGotoPage(1)
             assert.is.falsy(called)
-            txt_rolling:onGotoViewRel(-1)
-            txt_rolling:onGotoViewRel(-1)
+            rolling:onGotoViewRel(-1)
+            rolling:onGotoViewRel(-1)
             assert.is.falsy(called)
             -- not at the end of the book
-            txt_rolling:onGotoPage(3)
+            rolling:onGotoPage(3)
             assert.is.falsy(called)
-            txt_rolling:onGotoViewRel(1)
+            rolling:onGotoViewRel(1)
             assert.is.falsy(called)
             -- at the end of the book
-            txt_rolling:onGotoPage(txt_readerui.document:getPageCount())
+            rolling:onGotoPage(readerui.document:getPageCount())
             assert.is.falsy(called)
-            txt_rolling:onGotoViewRel(1)
+            rolling:onGotoViewRel(1)
             assert.is.truthy(called)
-            readerui.onEndOfBook = nil
-            txt_readerui:closeDocument()
-            txt_readerui:onClose()
+            readerui:onClose()
         end)
     end)
 
     describe("test in landscape screen mode", function()
         it("should go to landscape screen mode", function()
-            readerui:handleEvent(Event:new("SetRotationMode", Screen.ORIENTATION_LANDSCAPE))
+            readerui:handleEvent(Event:new("SetRotationMode", Screen.DEVICE_ROTATED_CLOCKWISE))
         end)
         it("should goto certain page", function()
             for i = 1, 10, 5 do
@@ -161,27 +180,27 @@ describe("Readerrolling module", function()
 
     describe("switching screen mode should not change current page number", function()
         teardown(function()
-            readerui:handleEvent(Event:new("SetRotationMode", Screen.ORIENTATION_PORTRAIT))
+            readerui:handleEvent(Event:new("SetRotationMode", Screen.DEVICE_ROTATED_UPRIGHT))
         end)
         it("for portrait-landscape-portrait switching", function()
-            for i = 80, 100, 10 do
-                readerui:handleEvent(Event:new("SetRotationMode", Screen.ORIENTATION_PORTRAIT))
+            for i = 80, 10 do
+                readerui:handleEvent(Event:new("SetRotationMode", Screen.DEVICE_ROTATED_UPRIGHT))
                 rolling:onGotoPage(i)
                 assert.are.same(i, rolling.current_page)
-                readerui:handleEvent(Event:new("SetRotationMode", Screen.ORIENTATION_LANDSCAPE))
+                readerui:handleEvent(Event:new("SetRotationMode", Screen.DEVICE_ROTATED_CLOCKWISE))
                 assert.are_not.same(i, rolling.current_page)
-                readerui:handleEvent(Event:new("SetRotationMode", Screen.ORIENTATION_PORTRAIT))
+                readerui:handleEvent(Event:new("SetRotationMode", Screen.DEVICE_ROTATED_UPRIGHT))
                 assert.are.same(i, rolling.current_page)
             end
         end)
         it("for landscape-portrait-landscape switching", function()
-            for i = 110, 130, 10 do
-                readerui:handleEvent(Event:new("SetRotationMode", Screen.ORIENTATION_LANDSCAPE))
+            for i = 110, 20 do
+                readerui:handleEvent(Event:new("SetRotationMode", Screen.DEVICE_ROTATED_CLOCKWISE))
                 rolling:onGotoPage(i)
                 assert.are.same(i, rolling.current_page)
-                readerui:handleEvent(Event:new("SetRotationMode", Screen.ORIENTATION_PORTRAIT))
+                readerui:handleEvent(Event:new("SetRotationMode", Screen.DEVICE_ROTATED_UPRIGHT))
                 assert.are_not.same(i, rolling.current_page)
-                readerui:handleEvent(Event:new("SetRotationMode", Screen.ORIENTATION_LANDSCAPE))
+                readerui:handleEvent(Event:new("SetRotationMode", Screen.DEVICE_ROTATED_CLOCKWISE))
                 assert.are.same(i, rolling.current_page)
             end
         end)
@@ -202,19 +221,16 @@ describe("Readerrolling module", function()
         it("should emit PageUpdate event after book is rendered", function()
             local ReaderView = require("apps/reader/modules/readerview")
             local saved_handler = ReaderView.onPageUpdate
-            ReaderView.onPageUpdate = function(_self)
-                assert.are.same(6, _self.ui.document:getPageCount())
+            ReaderView.onPageUpdate = function(this)
+                assert.are.same(6, this.ui.document:getPageCount())
             end
             local test_book = "spec/front/unit/data/sample.txt"
             require("docsettings"):open(test_book):purge()
-            local tmp_readerui = ReaderUI:new{
+            readerui:onClose()
+            readerui = ReaderUI:new{
                 document = DocumentRegistry:openDocument(test_book),
             }
             ReaderView.onPageUpdate = saved_handler
-            tmp_readerui:closeDocument()
-            tmp_readerui:onClose()
-            readerui:closeDocument()
-            readerui:onClose()
         end)
     end)
 end)

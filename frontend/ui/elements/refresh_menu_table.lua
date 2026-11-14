@@ -1,8 +1,6 @@
-local Device = require("device")
 local Event = require("ui/event")
 local UIManager = require("ui/uimanager")
 local _ = require("gettext")
-local Screen = Device.screen
 local T = require("ffi/util").template
 
 local function custom(refresh_rate_num)
@@ -26,7 +24,6 @@ local function spinWidgetSetRefresh(touchmenu_instance, refresh_rate_num)
     local left, right = custom(refresh_rate_num)
     local DoubleSpinWidget = require("ui/widget/doublespinwidget")
     local items = DoubleSpinWidget:new{
-        width = math.floor(Screen:getWidth() * 0.6),
         info_text = _("For every chapter set -1"),
         left_value = left,
         left_min = -1,
@@ -118,6 +115,11 @@ return {
             enabled_func = function() return UIManager.FULL_REFRESH_COUNT == -1 or G_reader_settings:isTrue("refresh_on_chapter_boundaries") end,
             checked_func = function() return G_reader_settings:isTrue("no_refresh_on_second_chapter_page") end,
             callback = function() UIManager:broadcastEvent(Event:new("ToggleNoFlashOnSecondChapterPage")) end,
+        },
+        {
+            text = _("Always flash on pages with images"),
+            checked_func = function() return G_reader_settings:nilOrTrue("refresh_on_pages_with_images") end,
+            callback = function() UIManager:broadcastEvent(Event:new("ToggleFlashOnPagesWithImages")) end,
         },
     }
 }

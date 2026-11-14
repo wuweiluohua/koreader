@@ -11,28 +11,126 @@ You can skip most of the following instructions if desired, and use our premade 
 
 ## Prerequisites
 
-To get and compile the source you must have `patch`, `wget`, `unzip`, `git`,
-`cmake` and `luarocks` installed, as well as a version of `autoconf`
-greater than 2.64. You also need `nasm`, `ragel`, and of course a compiler like `gcc`
-or `clang`.
+To get and compile the source you must have:
+- `autoconf`: version > 2.64
+- `automake`
+- `awk`
+- `bash`: version >= 4.0
+- `cmake`: version >= 3.17.5
+- `find`
+- `gcc/g++` or `clang/clang++`: with C11 & C++17 support
+- `gettext`
+- `git`
+- `libtool`
+- `make`: version >= 4.1 (recommended: >= 4.4 for transparent `-j` / `-l` handling)
+- `meson`: version >= 1.2.0 on Linux, >= 1.8.3 on macOS
+- `nasm`
+- `ninja` (recommended: >= 1.13.2 for make job server support)
+- `patch`
+- `pkg-config` or `pkgconf`
+- `python`: version >= 3.10
+- `unzip`
+- `wget`
 
-### Debian/Ubuntu and derivates
+Optional:
+- `7z`: for packing releases and the Android build assets
+- `ccache`: recommended for faster recompilation times
+- `luacheck`, `shellcheck` and `shfmt`: for linting the codebase with `./kodev check`
+- `luajit` (Linux only): to update Linux packages' metadata
+- `ffi-cdecl` or `luajit` + `tree-sitter >= 0.26.0` + `tree-sitter-c >= 0.24.0`: to generate FFI cdecls
+- `SDL3`: version >= 3.2.12, only the library, for running the emulator / tests (if not found, a version will automatically be built)
+
+### Alpine Linux
+
+Install the prerequisites using apk:
+
+```
+sudo apk add autoconf automake bash cmake coreutils diffutils findutils \
+    g++ gcc gettext-dev git grep gzip libtool linux-headers make meson \
+    nasm ninja-build patch pkgconf procps-ng sdl3 tar unzip wget
+```
+
+**Note:** don't forget to add `/usr/lib/ninja-build/bin` to `$PATH`
+so the real ninja is used (and not the binary provided by samurai).
+
+Optional:
+```
+sudo apk add 7zip ccache luacheck luajit shellcheck shfmt
+```
+
+### Arch Linux
+
+Install the prerequisites using pacman:
+
+```
+run0 pacman -S base-devel ca-certificates cmake gcc-libs git \
+    meson nasm ninja sdl3 unzip wget
+```
+
+Optional:
+```
+run0 pacman -S 7zip ccache luacheck luajit shellcheck shfmt
+```
+
+### Debian/Ubuntu
 
 Install the prerequisites using APT:
 
 ```
-sudo apt-get install build-essential git patch wget unzip \
-gettext autoconf automake cmake libtool nasm ragel luarocks lua5.1 libsdl2-dev \
-libssl-dev libffi-dev libsdl2-dev libc6-dev-i386 xutils-dev linux-libc-dev:i386 zlib1g:i386
+sudo apt install --no-install-recommends autoconf automake build-essential \
+    ca-certificates cmake gcc-multilib gettext git libtool libtool-bin meson \
+    nasm ninja-build patch pkg-config unzip wget
 ```
 
+To install SDL3, on recent enough distributions:
+```
+sudo apt install --no-install-recommends libsdl3-0
+```
+
+For building SDL3 on distributions that don't provide a recent enough version:
+```
+# Minimal Wayland support.
+sudo apt install --no-install-recommends libegl-dev libwayland-dev libxkbcommon-dev
+# Minimal X11 support.
+sudo apt install --no-install-recommends libx11-dev libxcursor-dev libxext-dev libxi-dev \
+    libxrandr-dev libxss-dev libxtst-dev
+```
+
+**Note:** Debian distributions might need `meson` to be installed from `bookworm-backports`
+because the version provided by the default repositories is too old:
+```
+sudo apt install --no-install-recommends meson/bookworm-backports
+```
+The bookworm-backports repository was already included on Linux Mint Debian Edition 6.
+Otherwise, follow full up-to-date instructions from here: https://wiki.debian.org/Backports.
+
+Optional:
+```
+sudo apt install --no-install-recommends  ccache libluajit-5.1-dev lua-check luajit \
+    p7zip-full shellcheck shfmt
+```
+And to install GCC plugin support for your installed GCC version, e.g. for `gcc-11`:
+```
+sudo apt install --no-install-recommends gcc-11-plugin-dev
+```
 
 ### Fedora/Red Hat
 
-Install the `libstdc++-static`, `SDL` and `SDL-devel` packages using DNF:
+Install the prerequisites using DNF:
 
 ```
-sudo dnf install libstdc++-static SDL SDL-devel
+sudo dnf install autoconf automake cmake gcc gcc-c++ gettext git libtool meson \
+    nasm ninja-build patch procps-ng SDL3 unzip wget
+```
+
+Optional:
+```
+sudo dnf install ccache gcc-plugin-devel luajit-devel p7zip shellcheck shfmt
+```
+And for luacheck:
+```
+sudo dnf install lua-argparse lua-filesystem luarocks
+luarocks install luacheck
 ```
 
 ### macOS
@@ -40,27 +138,54 @@ sudo dnf install libstdc++-static SDL SDL-devel
 Install the prerequisites using [Homebrew](https://brew.sh/):
 
 ```
-brew install nasm ragel binutils coreutils libtool autoconf automake cmake makedepend \
-sdl2 lua@5.1 luarocks gettext pkg-config wget gnu-getopt grep bison
+brew install autoconf automake bash binutils cmake coreutils findutils \
+    gettext gnu-getopt libtool make meson nasm ninja pkgconf sdl3 \
+    util-linux
 ```
 
-You will also have to ensure Homebrew's gettext, gnu-getopt, bison & grep are in your path, e.g., via
+You will also have to ensure Homebrew's findutils, gnu-getopt, make & util-linux are in your path, e.g., via
 ```
-export PATH="$(brew --prefix)/opt/gettext/bin:$(brew --prefix)/opt/gnu-getopt/bin:$(brew --prefix)/opt/bison/bin:$(brew --prefix)/opt/grep/libexec/gnubin:${PATH}"
-```
-See also `brew info gettext` for details on how to make that permanent in your shell.
-
-In the same vein, if that's not already the case, you probably also want to make sure Homebrew's stuff takes precedence:
-```
-export PATH="/usr/local/bin:/usr/local/sbin:${PATH/:\/usr\/local\/bin/}"
+export PATH="$(brew --prefix)/opt/findutils/libexec/gnubin:$(brew --prefix)/opt/gnu-getopt/bin:$(brew --prefix)/opt/make/libexec/gnubin:$(brew --prefix)/opt/util-linux/bin:${PATH}"
 ```
 
-*Note:* With current XCode versions, you *will* need to set a minimum deployment version higher than `10.04`. Otherwise, you'll hit various linking errors related to missing unwinding libraries/symbols.
-On Mojave, `10.09` has been known to behave with XCode 10, And `10.14` with XCode 11. When in doubt, go with your current macOS version.
+Optional:
+```
+brew install ccache luacheck p7zip shellcheck shfmt
+```
+
+*Note:* You can override the default targeted minimum deployment version by setting `MACOSX_DEPLOYMENT_TARGET`:
 ```
 export MACOSX_DEPLOYMENT_TARGET=10.09
 ```
-*Note:* On Catalina (10.15), you will currently *NOT* want to deploy for `10.15`, as [XCode is currently broken in that configuration](https://forums.developer.apple.com/thread/121887)! (i.e., deploy for `10.14` instead).
+
+### Nix
+
+Ensure the [nix is installed](https://nixos.org/download/).
+
+Then simply run the included nix shell:
+```
+nix-shell tools/shell.nix
+```
+
+### openSUSE
+
+Install the prerequisites using zypper:
+
+```
+sudo zypper install autoconf automake bash cmake find gcc gcc-32bit gcc-c++ gettext \
+    gawk git libSDL3-0 libtool make meson nasm ninja patch pkgconf unzip wget
+```
+
+Optional:
+
+```
+sudo zypper install 7zip ccache luajit-devel luajit-luacheck ShellCheck shfmt
+```
+
+And to install GCC plugin support for your installed GCC version, e.g. for `gcc15`:
+```
+sudo apt install gcc15-devel
+```
 
 ## Getting the source
 
@@ -85,9 +210,6 @@ To run KOReader on your development machine:
 ```
 ./kodev run
 ```
-
-*Note:* On macOS and possibly other non-Linux hosts, you might want to pass `--no-build` to prevent re-running the buildsystem, as incremental builds may not behave properly.
-
 
 You can specify the size and DPI of the emulator's screen using
 `-w=X` (width), `-h=X` (height), and `-d=X` (DPI).
@@ -119,11 +241,6 @@ Once you have the emulator ready to rock you can [build for other platforms too]
 
 ## Testing
 
-You may need to check out the [circleci config file][circleci-conf] to setup up
-a proper testing environment.
-
-Briefly, you need to install `luarocks` and then install `busted` and `ansicolors` with `luarocks`. The "eng" language data file for tesseract-ocr is also need to test OCR functionality. Finally, make sure that `luajit` in your system is at least of version 2.0.2.
-
 To automatically set up a number of primarily luarocks-related environment variables:
 
 ```
@@ -140,7 +257,7 @@ To run unit tests:
 To run a specific unit test (for test development):
 
 ```
-./kodev test front readerbookmark_spec.lua
+./kodev test front readerbookmark
 ```
 
 To run Lua static analysis:
@@ -194,17 +311,16 @@ De auteur van het boek is Plato en de titel is The Republic.
 
 Ccache can speed up recompilation by caching previous compilations and detecting
 when the same compilation is being repeated. In other words, it will decrease
-build time when the sources have been built before. Ccache support has been added to
-KOReader's build system. To install ccache:
+build time when the sources have been built before. To install ccache use:
 
-* in Ubuntu use:`sudo apt-get install ccache`
-* in Fedora use:`sudo dnf install ccache`
-* from source:
-  * download the latest ccache source from http://ccache.samba.org/download.html
-  * extract the source package in a directory
-  * `cd` to that directory and use:`./configure && make && sudo make install`
-* to disable ccache, use `export USE_NO_CCACHE=1` before make.
-* for more information about ccache, visit: https://ccache.samba.org/
+* Alpine Linux: `sudo apk add ccache`
+* Arch Linux: `run0 pacman -S ccache`
+* Debian/Ubuntu: `sudo apt-get install ccache`
+* Fedora/Red Hat: `sudo dnf install ccache`
+* macOS: `brew install ccache`
+* or from an official release or source: https://github.com/ccache/ccache/releases
+
+To disable ccache, use `export USE_NO_CCACHE=1` before make.
 
 [circleci-conf]:https://github.com/koreader/koreader/blob/master/.circleci/config.yml
 [koreader-weblate]:https://hosted.weblate.org/engage/koreader/

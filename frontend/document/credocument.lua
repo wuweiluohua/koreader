@@ -2,20 +2,23 @@ local Blitbuffer = require("ffi/blitbuffer")
 local CanvasContext = require("document/canvascontext")
 local DataStorage = require("datastorage")
 local Document = require("document/document")
-local FFIUtil = require("ffi/util")
 local FontList = require("fontlist")
 local Geom = require("ui/geometry")
 local RenderImage = require("ui/renderimage")
 local Screen = require("device").screen
+local buffer = require("string.buffer")
 local ffi = require("ffi")
 local C = ffi.C
+local cre -- Delayed loading
 local lfs = require("libs/libkoreader-lfs")
 local logger = require("logger")
+local lru = require("ffi/lru")
+local time = require("ui/time")
 
 -- engine can be initialized only once, on first document opened
 local engine_initialized = false
 
-local CreDocument = Document:new{
+local CreDocument = Document:extend{
     -- this is defined in kpvcrlib/crengine/crengine/include/lvdocview.h
     SCROLL_VIEW_MODE = 0,
     PAGE_VIEW_MODE = 1,
@@ -26,9 +29,17 @@ local CreDocument = Document:new{
     _smooth_scaling = false,
     _nightmode_images = true,
 
-    line_space_percent = 100,
     default_font = "Noto Serif",
+    monospace_font = "Droid Sans Mono",
     header_font = "Noto Sans",
+
+    prop_to_cre_prop = { -- see cre lvtinydom.h
+        title        = "doc.title",
+        authors      = "doc.authors",
+        series       = "doc.series.name",
+        series_index = "doc.series.number",
+        identifiers  = "doc.identifiers",
+    },
 
     -- Reasons for the fallback font ordering:
     -- - Noto Sans CJK SC before FreeSans/Serif, as it has nice and larger
@@ -42,42 +53,31 @@ local CreDocument = Document:new{
     --   in any fallback font. Also, we don't know if the user is using
     --   a serif or a sans main font, so choosing to have one of these early
     --   might not be the best decision (and moving them before FreeSans would
-    --   require one to set FreeSans as fallback to get its nicer glyphes, which
+    --   require one to set FreeSans as fallback to get its nicer glyphs, which
     --   would override Noto Sans CJK good symbol glyphs with smaller ones
     --   (Noto Sans & Serif do not have these symbol glyphs).
-    fallback_fonts = {
+    fallback_fonts = { -- const
         "Noto Sans CJK SC",
         "Noto Naskh Arabic",
         "Noto Sans Devanagari UI",
+        "Noto Sans Bengali UI",
         "FreeSans",
         "FreeSerif",
         "Noto Serif",
         "Noto Sans",
     },
 
-    default_css = "./data/cr3.css",
+    default_css = nil,
     provider = "crengine",
     provider_name = "Cool Reader Engine",
 
     hide_nonlinear_flows = false,
-    flows = {},
-    page_in_flow = {},
+    flows = nil, -- table
+    page_in_flow = nil, -- table
     last_linear_page = nil,
 }
 
--- NuPogodi, 20.05.12: inspect the zipfile content
-function CreDocument:zipContentExt(fname)
-    local std_out = io.popen("unzip ".."-qql \""..fname.."\"")
-    if std_out then
-        for line in std_out:lines() do
-            local size, ext = string.match(line, "%s+(%d+)%s+.+%.([^.]+)")
-            -- return the extention
-            if size and ext then return string.lower(ext) end
-        end
-    end
-end
-
-function CreDocument:cacheInit()
+function CreDocument.cacheInit()
     -- remove legacy cr3cache directory
     if lfs.attributes("./cr3cache", "mode") == "directory" then
         os.execute("rm -r ./cr3cache")
@@ -101,53 +101,72 @@ end
 
 function CreDocument:engineInit()
     if not engine_initialized then
-        require "libs/libkoreader-cre"
+        cre = require("libs/libkoreader-cre")
+
+        -- When forking to execute any stuff in a sub-process,
+        -- as that stuff may not care about properly closing
+        -- the document, skip cre.cpp finalizer to avoid any
+        -- assertion failure.
+        require("ffi/util").addRunInSubProcessAfterForkFunc("cre_skip_teardown", function()
+            cre.setSkipTearDown(true)
+        end)
+
         -- initialize cache
-        self:cacheInit()
+        CreDocument.cacheInit()
 
         -- initialize hyph dictionaries
         cre.initHyphDict("./data/hyph/")
 
         -- we need to initialize the CRE font list
         local fonts = FontList:getFontList()
-        for _k, _v in ipairs(fonts) do
-            if not _v:find("/urw/") and not _v:find("/nerdfonts/symbols.ttf") then
-                local ok, err = pcall(cre.registerFont, _v)
+        for k, v in ipairs(fonts) do
+            if not v:find("/urw/") and not v:find("/nerdfonts/symbols.ttf") then
+                local ok, err = pcall(cre.registerFont, v)
                 if not ok then
                     logger.err("failed to register crengine font:", err)
                 end
             end
         end
+        -- Make sure registered fonts have a proper entry at weight 400 and 700 when
+        -- possible, to avoid having synthesized fonts for these normal and bold weights.
+        -- This allows restoring a bit of the previous behaviour of crengine when it
+        -- wasn't handling font styles, and associated for each typeface one single
+        -- font to regular (400) and one to bold (700).
+        -- It should ensure we use real fonts (and not synthesized ones) for normal text
+        -- and bold text with the font_base_weight setting set to its default value of 0 (=400).
+        cre.regularizeRegisteredFontsWeights(true) -- true to print what modifications were made
+
+        -- Let our default font (even if we don't have a document) be known to crengine's FontManager
+        -- (self:setFontFace(self.default_font) would need a credocument to be loaded)
+        cre.setAsPreferredFontWithBias(self.default_font, 1 + 128*5 + 256*5)
+
+        -- Set up bias for some specific fonts
+        self:setOtherFontBiases()
 
         engine_initialized = true
     end
+
+    return cre
 end
 
 function CreDocument:init()
     self:updateColorRendering()
     self:engineInit()
 
-    local file_type = string.lower(string.match(self.file, ".+%.([^.]+)"))
-    if file_type == "zip" then
-        -- NuPogodi, 20.05.12: read the content of zip-file
-        -- and return extention of the 1st file
-        file_type = self:zipContentExt(self.file) or "unknown"
-    end
+    self.flows = {}
+    self.page_in_flow = {}
 
     -- June 2018: epub.css has been cleaned to be more conforming to HTML specs
-    -- and to not include class name based styles (with conditional compatiblity
+    -- and to not include class name based styles (with conditional compatibility
     -- styles for previously opened documents). It should be usable on all
     -- HTML based documents, except FB2 which has some incompatible specs.
     -- The other css files (htm.css, rtf.css...) have not been updated in the
     -- same way, and are kept as-is for when a previously opened document
     -- requests one of them.
-    self.default_css = "./data/epub.css"
-    if file_type == "fb2" or file_type == "fb3" then
-        self.default_css = "./data/fb2.css"
-    end
+    self.default_css = (self.is_fb2 or self.is_txt) and "./data/fb2.css" or "./data/epub.css"
 
     -- This mode must be the same as the default one set as ReaderView.view_mode
-    self._view_mode = DCREREADER_VIEW_MODE == "scroll" and self.SCROLL_VIEW_MODE or self.PAGE_VIEW_MODE
+    self._view_mode = G_defaults:readSetting("DCREREADER_VIEW_MODE") == "scroll" and self.SCROLL_VIEW_MODE or self.PAGE_VIEW_MODE
 
     local ok
     ok, self._document = pcall(cre.newDocView, CanvasContext:getWidth(), CanvasContext:getHeight(), self._view_mode)
@@ -190,8 +209,20 @@ function CreDocument:getDocumentFormat()
     return self._document:getDocumentFormat()
 end
 
+function CreDocument:getDocumentProps()
+    return self._document:getDocumentProps()
+end
+
+function CreDocument:setAltDocumentProp(prop, value)
+    logger.dbg("CreDocument: set alt document prop", prop, value)
+    if type(value) == "number" then -- series index
+        value = tostring(value)
+    end
+    self._document:setAltDocumentProp(self.prop_to_cre_prop[prop], value)
+end
+
 function CreDocument:setupDefaultView()
-    if self.loaded then
+    if self._loaded then
         -- Don't apply defaults if the document has already been loaded
         -- as this must be done before calling loadDocument()
         return
@@ -210,6 +241,22 @@ function CreDocument:setupDefaultView()
     self._document:setIntProperty("crengine.image.scaling.zoomout.inline.mode", 0)
     self._document:setIntProperty("crengine.image.scaling.zoomout.inline.scale", 1)
 
+    -- crengine won't create a cache for small documents, which could actually
+    -- makes re-opening small files slower than big files!
+    -- Also, we need a cache for ReaderRolling's partial rerenderings handling.
+    -- In crengine code:
+    -- A cache is created if the file size is larger than:
+    --   crengine.cache.filesize.min = PROP_MIN_FILE_SIZE_TO_CACHE: default 300000
+    --   (fallback: DOCUMENT_CACHING_SIZE_THRESHOLD=1048576)
+    -- A cache is searched for (to be used) only if the file size is larger than 65535:
+    --   hardcoded not overridable: DOCUMENT_CACHING_MIN_SIZE=65535
+    -- Other related variables:
+    --   PROP_FORCED_MIN_FILE_SIZE_TO_CACHE: not used (a hardcoded value of 30000 is used instead)
+    --     (if filesize < 30000: swapToCache simulated but not really done)
+    --   DOCUMENT_CACHING_MAX_RAM_USAGE 8388608: not used
+    -- Force having a cache with small documents (but at least > 65K)
+    self._document:setIntProperty("crengine.cache.filesize.min", 65536)
+
     -- If switching to two pages on view, we want it to behave like two columns
     -- and each view to be a single page number (instead of the default of two).
     -- This ensures that page number and count are consistent between top and
@@ -223,6 +270,12 @@ function CreDocument:setupDefaultView()
     -- loadDocument(only_metadata) another document to get its metadata
     -- or cover image, eg. from History hold menu).
     self:setupFallbackFontFaces()
+
+    -- Adjust or not fallback font sizes
+    self:setAdjustedFallbackFontSizes(G_reader_settings:nilOrTrue("cre_adjusted_fallback_font_sizes"))
+
+    -- set monospace fonts size scaling
+    self:setMonospaceFontScaling(G_reader_settings:readSetting("cre_monospace_scaling") or 100)
 
     -- adjust font sizes according to dpi set in canvas context
     self._document:adjustFontSizes(CanvasContext:getDPI())
@@ -246,11 +299,6 @@ function CreDocument:loadDocument(full_document)
     if not self._loaded then
         local only_metadata = full_document == false
         logger.dbg("CreDocument: loading document...")
-        if only_metadata then
-            -- Setting a default font before loading document
-            -- actually do prevent some crashes
-            self:setFontFace(self.default_font)
-        end
         if self._document:loadDocument(self.file, only_metadata) then
             self._loaded = true
             logger.dbg("CreDocument: loading done.")
@@ -267,7 +315,7 @@ function CreDocument:render()
     -- This is now configurable and done by ReaderRolling:
     -- -- set visible page count in landscape
     -- if math.max(CanvasContext:getWidth(), CanvasContext:getHeight()) / CanvasContext:getDPI()
-    --     < DCREREADER_TWO_PAGE_THRESHOLD then
+    --     < G_defaults:readSetting("DCREREADER_TWO_PAGE_THRESHOLD") then
     --     self:setVisiblePageCount(1)
     -- end
     logger.dbg("CreDocument: rendering document...")
@@ -277,9 +325,9 @@ function CreDocument:render()
     logger.dbg("CreDocument: rendering done.")
 end
 
-function CreDocument:getDocumentRenderingHash()
+function CreDocument:getDocumentRenderingHash(extended)
     if self.been_rendered then
-        return self._document:getDocumentRenderingHash()
+        return self._document:getDocumentRenderingHash(extended)
     end
     return 0
 end
@@ -295,10 +343,21 @@ function CreDocument:_readMetadata()
 end
 
 function CreDocument:close()
-    Document.close(self)
-    if self.buffer then
-        self.buffer:free()
-        self.buffer = nil
+    -- Let Document do the refcount check, and tell us if we actually need to tear down the instance.
+    if Document.close(self) then
+        -- Yup, final Document instance, we can safely destroy internal data.
+        -- (Document already took care of our self._document userdata).
+        if self.buffer then
+            self.buffer:free()
+            self.buffer = nil
+        end
+
+        -- Only exists if the call cache is enabled
+        --[[
+        if self._callCacheDestroy then
+            self._callCacheDestroy()
+        end
+        --]]
     end
 end
 
@@ -507,17 +566,43 @@ function CreDocument:getCoverPageImage()
     end
 end
 
-function CreDocument:getImageFromPosition(pos, want_frames)
-    local data, size = self._document:getImageDataFromPosition(pos.x, pos.y)
+function CreDocument:getImageFromPosition(pos, want_frames, accept_cre_scalable_image)
+    local data, size, cre_img = self._document:getImageDataFromPosition(pos.x, pos.y, accept_cre_scalable_image)
     if data and size then
         logger.dbg("CreDocument: got image data from position", data, size)
         local image = RenderImage:renderImageData(data, size, want_frames)
         C.free(data) -- free the userdata we got from crengine
         return image
     end
+    if cre_img then
+        -- The image is a scalable image (SVG), and we got an image object from crengine, that
+        -- can draw itself at any requested scale factor: returns a function, that will be used
+        -- by ImageViewer to get the perfect bb.
+        return function(scale, w, h)
+            logger.dbg("CreImage: scaling for", scale, w, h)
+            if not cre_img then
+                return
+            end
+            if scale == false then -- used to signal we are done with the object
+                cre_img:free()
+                cre_img = false
+                return
+            end
+            -- scale will be used if non-0, otherwise the bb will be made to fit in w/h,
+            -- keeping the original aspect ratio
+            local image_data, image_w, image_h, image_scale = cre_img:renderScaled(scale, w, h)
+            if image_data then
+                -- This data is held in the cre_img object, so this bb is only
+                -- valid as long as this object is alive, and until the next
+                -- call to this function that will replace this data.
+                local bb = Blitbuffer.new(image_w, image_h, Blitbuffer.TYPE_BBRGB32, image_data)
+                return bb, image_scale
+            end
+        end
+    end
 end
 
-function CreDocument:getWordFromPosition(pos)
+function CreDocument:getWordFromPosition(pos, do_not_draw_selection)
     local wordbox = {
         page = self._document:getCurrentPage(),
     }
@@ -530,7 +615,11 @@ function CreDocument:getWordFromPosition(pos)
     local word_found = false
     local box_found = false
 
-    local text_range = self._document:getTextFromPositions(pos.x, pos.y, pos.x, pos.y)
+    local drawSelection, drawSegmentedSelection
+    if do_not_draw_selection then
+        drawSelection, drawSegmentedSelection = false, false
+    end
+    local text_range = self._document:getTextFromPositions(pos.x, pos.y, pos.x, pos.y, drawSelection, drawSegmentedSelection)
     logger.dbg("CreDocument: get text range", text_range)
     if text_range then
         if text_range.text and text_range.text ~= "" then
@@ -540,25 +629,14 @@ function CreDocument:getWordFromPosition(pos)
         if text_range.pos0 and text_range.pos1 then
             -- get segments from these pos, to build the overall box
             local word_boxes = self._document:getWordBoxesFromPositions(text_range.pos0, text_range.pos1, true)
-            if #word_boxes > 0 then
-                local overall_box
-                for i = 1, #word_boxes do
-                    local line_box = word_boxes[i]
-                    if not overall_box then
-                        overall_box = line_box
-                    else
-                        if line_box.x0 < overall_box.x0 then overall_box.x0 = line_box.x0 end
-                        if line_box.y0 < overall_box.y0 then overall_box.y0 = line_box.y0 end
-                        if line_box.x1 > overall_box.x1 then overall_box.x1 = line_box.x1 end
-                        if line_box.y1 > overall_box.y1 then overall_box.y1 = line_box.y1 end
-                    end
-                end
-                wordbox.sbox = Geom:new{
-                    x = overall_box.x0,
-                    y = overall_box.y0,
-                    w = overall_box.x1 - overall_box.x0,
-                    h = overall_box.y1 - overall_box.y0,
-                }
+            -- convert to Geom so we can use Geom.boundingBox
+            for i=1, #word_boxes do
+                local v = word_boxes[i]
+                word_boxes[i] = { x = v.x0,        y = v.y0,
+                                  w = v.x1 - v.x0, h = v.y1 - v.y0 }
+            end
+            wordbox.sbox = Geom.boundingBox(word_boxes)
+            if wordbox.sbox then
                 box_found = true
             end
         end
@@ -601,16 +679,21 @@ function CreDocument:getWordFromPosition(pos)
     ]]--
 end
 
-function CreDocument:getTextFromPositions(pos0, pos1)
-    local text_range = self._document:getTextFromPositions(pos0.x, pos0.y, pos1.x, pos1.y)
+function CreDocument:getTextFromPositions(pos0, pos1, do_not_draw_selection)
+    local drawSelection, drawSegmentedSelection
+    if do_not_draw_selection then
+        drawSelection, drawSegmentedSelection = false, false
+    end
+    local text_range = self._document:getTextFromPositions(pos0.x, pos0.y, pos1.x, pos1.y,
+        drawSelection, drawSegmentedSelection)
     logger.dbg("CreDocument: get text range", text_range)
     if text_range then
-        -- local line_boxes = self:getScreenBoxesFromPositions(text_range.pos0, text_range.pos1)
+        local line_boxes = self:getScreenBoxesFromPositions(text_range.pos0, text_range.pos1, true)
         return {
             text = text_range.text,
             pos0 = text_range.pos0,
             pos1 = text_range.pos1,
-            --sboxes = line_boxes,     -- boxes on screen
+            sboxes = line_boxes, -- boxes on screen
         }
     end
 end
@@ -619,20 +702,54 @@ function CreDocument:getScreenBoxesFromPositions(pos0, pos1, get_segments)
     local line_boxes = {}
     if pos0 and pos1 then
         local word_boxes = self._document:getWordBoxesFromPositions(pos0, pos1, get_segments)
-        for i = 1, #word_boxes do
-            local line_box = word_boxes[i]
-            table.insert(line_boxes, Geom:new{
-                x = line_box.x0, y = line_box.y0,
-                w = line_box.x1 - line_box.x0,
-                h = line_box.y1 - line_box.y0,
-            })
+        if word_boxes then
+            for i = 1, #word_boxes do
+                local line_box = word_boxes[i]
+                table.insert(line_boxes, Geom:new{
+                    x = line_box.x0, y = line_box.y0,
+                    w = line_box.x1 - line_box.x0,
+                    h = line_box.y1 - line_box.y0,
+                })
+            end
         end
     end
     return line_boxes
 end
 
+function CreDocument:getNearestWordAndBoxFromPosition(pos, cpp_direction)
+    local nearest = self._document:getNearestWordFromPosition(pos.x, pos.y, cpp_direction)
+    if not nearest or not nearest.text then return nil end
+    logger.dbg("CreDocument: get nearest word", nearest)
+    local wordbox = {
+        page = self._document:getCurrentPage(),
+        word = nearest.text,
+        pos0 = nearest.pos0,
+        pos1 = nearest.pos1,
+    }
+    if nearest.pos0 and nearest.pos1 then
+        local word_boxes = self._document:getWordBoxesFromPositions(nearest.pos0, nearest.pos1, true)
+        if word_boxes then
+            for i = 1, #word_boxes do
+                local v = word_boxes[i]
+                word_boxes[i] = { x = v.x0,        y = v.y0,
+                                  w = v.x1 - v.x0, h = v.y1 - v.y0 }
+            end
+            wordbox.sbox = Geom.boundingBox(word_boxes)
+            if wordbox.sbox then
+                return wordbox
+            end
+        end
+    end
+    return nil
+end
+
+function CreDocument:getNearestWordFromPosition(pos, direction)
+    return self._document:getNearestWordFromPosition(pos.x, pos.y, direction)
+end
+
 function CreDocument:compareXPointers(xp1, xp2)
     -- Returns 1 if XPointers are ordered (if xp2 is after xp1), -1 if not, 0 if same
+    -- Returns nil if any of XPointers are invalid
     return self._document:compareXPointers(xp1, xp2)
 end
 
@@ -660,6 +777,37 @@ function CreDocument:getNextVisibleChar(xp)
     return self._document:getNextVisibleChar(xp)
 end
 
+function CreDocument:getSelectedWordContext(word, nb_words, pos0, pos1, restore_selection)
+    local pos_start = pos0
+    local pos_end = pos1
+
+    for i=0, nb_words do
+        local start = self:getPrevVisibleWordStart(pos_start)
+        if start then pos_start = start
+        else break end
+    end
+
+    for i=0, nb_words do
+        local ending = self:getNextVisibleWordEnd(pos_end)
+        if ending then pos_end = ending
+        else break end
+    end
+
+    local prev = self:getTextFromXPointers(pos_start, pos0)
+    local next = self:getTextFromXPointers(pos1, pos_end)
+
+    if restore_selection then
+        -- If pos0..pos1 was highlighted by crengine, getTextFromXPointers()
+        -- will have cleared this original selection, and crengine would then
+        -- not draw it any longer on next refresh.
+        -- If requested because it was highlighted, have crengine know again
+        -- about what should be selected and drawn.
+        self:getTextFromXPointers(pos0, pos1, true)
+    end
+
+    return prev, next
+end
+
 function CreDocument:drawCurrentView(target, x, y, rect, pos)
     if self.buffer and (self.buffer.w ~= rect.w or self.buffer.h ~= rect.h) then
         self.buffer:free()
@@ -682,16 +830,16 @@ function CreDocument:drawCurrentView(target, x, y, rect, pos)
     -- We also honor the current smooth scaling setting,
     -- as well as the global SW dithering setting.
 
-    --local start_ts = FFIUtil.getTimestamp()
+    --local start_time = time.now()
     self._drawn_images_count, self._drawn_images_surface_ratio =
         self._document:drawCurrentPage(self.buffer, self.render_color, Screen.night_mode and self._nightmode_images, self._smooth_scaling, Screen.sw_dithering)
-    --local end_ts = FFIUtil.getTimestamp()
-    --print(string.format("CreDocument:drawCurrentView: Rendering took %9.3f ms", (end_ts - start_ts) * 1000))
+    --local end_time = time.now()
+    --print(string.format("CreDocument:drawCurrentView: Rendering took %9.3f ms", time.to_ms(end_time - start_time))
 
-    --start_ts = FFIUtil.getTimestamp()
+    --start = time.now()
     target:blitFrom(self.buffer, x, y, 0, 0, rect.w, rect.h)
-    --end_ts = FFIUtil.getTimestamp()
-    --print(string.format("CreDocument:drawCurrentView: Blitting took  %9.3f ms", (end_ts - start_ts) * 1000))
+    --end_time = time.now()
+    --print(string.format("CreDocument:drawCurrentView: Blitting took  %9.3f ms", time.to_ms(end_time - start_time))
 end
 
 function CreDocument:drawCurrentViewByPos(target, x, y, rect, pos)
@@ -735,6 +883,26 @@ end
 
 function CreDocument:getXPointer()
     return self._document:getXPointer()
+end
+
+function CreDocument:getPageXPointer(page)
+    return self._document:getPageXPointer(page)
+end
+
+function CreDocument:getEPubCFI()
+    return self._document:getEPubCFI()
+end
+
+function CreDocument:getPageEPubCFI(page)
+    return self._document:getPageEPubCFI(page)
+end
+
+function CreDocument:getEPubCFIFromXPointer(xp)
+    return self._document:getEPubCFIFromXPointer(xp)
+end
+
+function CreDocument:getEPubCFIRangeFromXPointers(start_xp, end_xp)
+    return self._document:getEPubCFIRangeFromXPointers(start_xp, end_xp)
 end
 
 function CreDocument:isXPointerInDocument(xp)
@@ -785,6 +953,10 @@ function CreDocument:getFontFace()
     return self._document:getFontFace()
 end
 
+function CreDocument:getEmbeddedFontList()
+    return self._document:getEmbeddedFontList()
+end
+
 function CreDocument:getCurrentPos()
     return self._document:getCurrentPos()
 end
@@ -793,8 +965,8 @@ function CreDocument:getPageLinks(internal_links_only)
     return self._document:getPageLinks(internal_links_only)
 end
 
-function CreDocument:getLinkFromPosition(pos)
-    return self._document:getLinkFromPosition(pos.x, pos.y)
+function CreDocument:getLinkFromPosition(pos, with_forTextSelection)
+    return self._document:getLinkFromPosition(pos.x, pos.y, with_forTextSelection)
 end
 
 function CreDocument:isLinkToFootnote(source_xpointer, target_xpointer, flags, max_text_size)
@@ -818,8 +990,13 @@ function CreDocument:getTextFromXPointer(xp)
     end
 end
 
-function CreDocument:getTextFromXPointers(pos0, pos1)
-    return self._document:getTextFromXPointers(pos0, pos1)
+function CreDocument:getTextFromXPointers(pos0, pos1, draw_selection)
+    local draw_segmented_selection = draw_selection -- always use segmented selections
+    return self._document:getTextFromXPointers(pos0, pos1, draw_selection, draw_segmented_selection)
+end
+
+function CreDocument:extendXPointersToSentenceSegment(pos0, pos1)
+    return self._document:extendXPointersToSentenceSegment(pos0, pos1)
 end
 
 function CreDocument:getHTMLFromXPointer(xp, flags, from_final_parent)
@@ -832,6 +1009,10 @@ function CreDocument:getHTMLFromXPointers(xp0, xp1, flags, from_root_node)
     if xp0 and xp1 then
         return self._document:getHTMLFromXPointers(xp0, xp1, flags, from_root_node)
     end
+end
+
+function CreDocument:getStylesheetsMatchingRulesets(node_dataindex, with_main_stylesheet)
+    return self._document:getStylesheetsMatchingRulesets(node_dataindex, with_main_stylesheet)
 end
 
 function CreDocument:getNormalizedXPointer(xp)
@@ -881,8 +1062,8 @@ function CreDocument:setFontFace(new_font_face)
         -- See: crengine/src/lvfntman.cpp LVFontDef::CalcMatch():
         -- it will compute a score for each font, where it adds:
         --  + 25600 if standard font family matches (inherit serif sans-serif
-        --     cursive fantasy monospace) (note that crengine registers all fonts as
-        --     "sans-serif", except if their name is "Times" or "Times New Roman")
+        --     cursive fantasy monospace) (note that crengine registers all fonts
+        --     as "sans-serif", except monospace fonts)
         --  + 6400 if they don't and none are monospace (ie:serif vs sans-serif,
         --      prefer a sans-serif to a monospace if looking for a serif)
         --  +256000 if font names match
@@ -893,20 +1074,42 @@ function CreDocument:setFontFace(new_font_face)
         --  +25601: uses existing real font-family, but use our font even
         --          for font-family: monospace
         -- +256001: prefer our font to any existing font-family font
-        self._document:setAsPreferredFontWithBias(new_font_face, 1)
-        -- +1 +128x5 +256x5: we want our main font, even if it has no italic
-        -- nor bold variant (eg FreeSerif), to win over all other fonts that
-        -- have an italic or bold variant:
+        -- cre.setAsPreferredFontWithBias(new_font_face, 1)
+        -- Rather +1 +128x5 +256x5: we want our main font, even if it has no italic
+        -- nor bold variant (eg FreeSerif), to win over all other fonts that have
+        -- an italic or bold variant:
         --   italic_match = 5 * (256 for real italic, or 128 for fake italic
         --   weight_match = 5 * (256 - weight_diff * 256 / 800)
         -- so give our font a bias enough to win over real italic or bold fonts
         -- (all others params (size, family, name), used for computing the match
         -- score, have a factor of 100 or 1000 vs the 5 used for italic & weight,
         -- so it shouldn't hurt much).
-        -- Note that this is mostly necessary when forcing a not found name,
-        -- as we do in the Ignore font-family style tweak.
-        self._document:setAsPreferredFontWithBias(new_font_face, 1 + 128*5 + 256*5)
+        -- Note that this is mostly necessary when a font name is given and we
+        -- don't have the font.
+        cre.setAsPreferredFontWithBias(new_font_face, 1 + 128*5 + 256*5)
+
+        -- The above call has reset all other biases, so re-set our other ones
+        self:setOtherFontBiases()
     end
+end
+
+function CreDocument:setOtherFontBiases()
+    -- Make sure the user selected (or the default) monospace font is used even
+    -- if other monospace fonts were registered (same factor as above so its
+    -- synthetic bold or italic are used, in case some other monospace font
+    -- has real bold or italic variants)
+    local monospace_font = G_reader_settings:readSetting("monospace_font") or self.monospace_font
+    cre.setAsPreferredFontWithBias(monospace_font, 1 + 128*5 + 256*5, false)
+end
+
+function CreDocument:setMonospaceFontScaling(value)
+    logger.dbg("CreDocument: set monospace font scaling", value)
+    self._document:setIntProperty("font.monospace.size.scale.percent", value or 100)
+end
+
+function CreDocument:setAdjustedFallbackFontSizes(toggle)
+    logger.dbg("CreDocument: set adjusted fallback font sizes", toggle)
+    self._document:setIntProperty("crengine.font.fallback.sizes.adjusted", toggle and 1 or 0)
 end
 
 function CreDocument:setupFallbackFontFaces()
@@ -935,6 +1138,28 @@ function CreDocument:setupFallbackFontFaces()
     local s_fallbacks = table.concat(fallbacks, "|")
     logger.dbg("CreDocument: set fallback font faces:", s_fallbacks)
     self._document:setStringProperty("crengine.font.fallback.faces", s_fallbacks)
+end
+
+function CreDocument:setFontFamilyFontFaces(font_family_fonts, ignore_font_names)
+    if not font_family_fonts then
+        font_family_fonts = {}
+    end
+    -- crengine expects font names concatenated in the order they appear in the
+    -- enum css_font_family_t (include/cssdef.h) (with css_ff_inherit ignored,
+    -- the first slot carries ignore_font_names if not empty
+    local fonts = {}
+    table.insert(fonts, ignore_font_names and "not-empty" or "")
+    table.insert(fonts, font_family_fonts["serif"] or "")
+    table.insert(fonts, font_family_fonts["sans-serif"] or "")
+    table.insert(fonts, font_family_fonts["cursive"] or "")
+    table.insert(fonts, font_family_fonts["fantasy"] or "")
+    table.insert(fonts, font_family_fonts["monospace"] or "")
+    table.insert(fonts, font_family_fonts["math"] or "")
+    table.insert(fonts, font_family_fonts["emoji"] or "")
+    table.insert(fonts, font_family_fonts["fangsong"] or "")
+    local s_font_family_faces = table.concat(fonts, "|")
+    logger.dbg("CreDocument: set font-family font faces:", s_font_family_faces)
+    self._document:setStringProperty("crengine.font.family.faces", s_font_family_faces)
 end
 
 -- To use the new crengine language typography facilities (hyphenation, line breaking,
@@ -1005,7 +1230,7 @@ function CreDocument:setRenderDPI(value)
 end
 
 function CreDocument:setRenderScaleFontWithDPI(toggle)
-    -- wheter to scale font with DPI, or keep the current size
+    -- whether to scale font with DPI, or keep the current size
     logger.dbg("CreDocument: set render scale font with dpi", toggle)
     self._document:setIntProperty("crengine.render.scale.font.with.dpi", toggle)
 end
@@ -1067,9 +1292,12 @@ function CreDocument:setInterlineSpacePercent(percent)
     self._document:setDefaultInterlineSpace(percent)
 end
 
-function CreDocument:toggleFontBolder(toggle)
-    logger.dbg("CreDocument: toggle font bolder", toggle)
-    self._document:setIntProperty("font.face.weight.embolden", toggle)
+function CreDocument:setFontBaseWeight(weight)
+    -- In frontend, we use: 0, 1, -0.5, a delta from the regular weight of 400.
+    -- crengine expects for these: 400, 500, 350
+    local cre_weight = math.floor(400 + weight*100)
+    logger.dbg("CreDocument: set font base weight", weight, "=", cre_weight)
+    self._document:setIntProperty("font.face.base.weight", cre_weight)
 end
 
 function CreDocument:getGammaLevel()
@@ -1091,6 +1319,11 @@ function CreDocument:setFontKerning(mode)
     self._document:setIntProperty("font.kerning.mode", mode)
 end
 
+function CreDocument:setFontFractionalPositioning(strength)
+    logger.dbg("CreDocument: set font fractionalbpositioning", strength)
+    self._document:setIntProperty("font.fractional.positioning", strength)
+end
+
 function CreDocument:setWordSpacing(values)
     -- values should be a table of 2 numbers (e.g.: { 90, 75 })
     -- - space width scale percent (hard scale the width of each space char in
@@ -1106,6 +1339,11 @@ end
 function CreDocument:setWordExpansion(value)
     logger.dbg("CreDocument: set word expansion", value)
     self._document:setIntProperty("crengine.style.max.added.letter.spacing.percent", value or 0)
+end
+
+function CreDocument:setCJKWidthScaling(value)
+    logger.dbg("CreDocument: set cjk width scaling", value)
+    self._document:setIntProperty("crengine.style.cjk.width.scale.percent", value or 100)
 end
 
 function CreDocument:setStyleSheet(new_css_file, appended_css_content )
@@ -1181,6 +1419,11 @@ function CreDocument:setBatteryState(state)
     self._document:setBatteryState(state)
 end
 
+function CreDocument:setPageInfoOverride(pageinfo)
+    logger.dbg("CreDocument: set page info", pageinfo)
+    self._document:setPageInfoOverride(pageinfo)
+end
+
 function CreDocument:isXPointerInCurrentPage(xp)
     logger.dbg("CreDocument: check xpointer in current page", xp)
     return self._document:isXPointerInCurrentPage(xp)
@@ -1201,10 +1444,25 @@ function CreDocument:setBackgroundImage(img_path) -- use nil to unset
     self._document:setBackgroundImage(img_path)
 end
 
-function CreDocument:findText(pattern, origin, reverse, caseInsensitive)
-    logger.dbg("CreDocument: find text", pattern, origin, reverse, caseInsensitive)
-    return self._document:findText(
-        pattern, origin, reverse, caseInsensitive and 1 or 0)
+function CreDocument:checkRegex(pattern)
+    logger.dbg("CreDocument: check regex ", pattern)
+    return self._document:checkRegex(pattern)
+end
+
+function CreDocument:getAndClearRegexSearchError()
+    local retval = self._document:getAndClearRegexSearchError()
+    logger.dbg("CreDocument: getAndClearRegexSearchError", retval)
+    return retval
+end
+
+function CreDocument:findText(pattern, origin, direction, case_insensitive, page, regex, max_hits, search_flags)
+    logger.dbg("CreDocument: find text", pattern, origin, direction == 1, case_insensitive, regex, max_hits, search_flags)
+    return self._document:findText(pattern, origin, direction == 1, case_insensitive, regex, max_hits, search_flags)
+end
+
+function CreDocument:findAllText(pattern, case_insensitive, nb_context_words, max_hits, regex, search_flags)
+    logger.dbg("CreDocument: find all text", pattern, case_insensitive, regex, max_hits, true, nb_context_words, search_flags)
+    return self._document:findAllText(pattern, case_insensitive, regex, max_hits, true, nb_context_words, search_flags)
 end
 
 function CreDocument:enableInternalHistory(toggle)
@@ -1224,12 +1482,36 @@ function CreDocument:setCallback(func)
     return self._document:setCallback(func)
 end
 
+function CreDocument:canBePartiallyRerendered()
+    return self._document:canBePartiallyRerendered()
+end
+
+function CreDocument:isPartialRerenderingEnabled()
+    return self._document:isPartialRerenderingEnabled()
+end
+
+function CreDocument:enablePartialRerendering(enable)
+    return self._document:enablePartialRerendering(enable)
+end
+
+function CreDocument:getPartialRerenderingsCount()
+    return self._document:getPartialRerenderingsCount()
+end
+
+function CreDocument:isRerenderingDelayed()
+    return self._document:isRerenderingDelayed()
+end
+
 function CreDocument:isBuiltDomStale()
     return self._document:isBuiltDomStale()
 end
 
 function CreDocument:hasCacheFile()
     return self._document:hasCacheFile()
+end
+
+function CreDocument:isCacheFileStale()
+    return self._document:isCacheFileStale()
 end
 
 function CreDocument:invalidateCacheFile()
@@ -1258,6 +1540,35 @@ end
 
 function CreDocument:buildAlternativeToc()
     self._document:buildAlternativeToc()
+end
+
+function CreDocument:buildSyntheticPageMapIfNoneDocumentProvided(chars_per_synthetic_page)
+    -- for backward compatibility with legacy user patches
+    -- https://github.com/koreader/koreader/issues/9020#issuecomment-2033259217
+    if not self._document:hasPageMapDocumentProvided() then
+        self._document:buildSyntheticPageMap(chars_per_synthetic_page or 1024)
+    end
+end
+
+function CreDocument:buildSyntheticPageMap(chars_per_synthetic_page)
+    self._document:buildSyntheticPageMap(chars_per_synthetic_page or 1024)
+end
+
+function CreDocument:getSyntheticPageMapCharsPerPage()
+    -- returns 0 if no synthetic pagemap
+    return self._document:getSyntheticPageMapCharsPerPage()
+end
+
+function CreDocument:isPageMapSynthetic()
+    return self._document:isPageMapSynthetic()
+end
+
+function CreDocument:hasPageMapDocumentProvided()
+    return self._document:hasPageMapDocumentProvided()
+end
+
+function CreDocument:isPageMapDocumentProvided()
+    return self._document:isPageMapDocumentProvided()
 end
 
 function CreDocument:hasPageMap()
@@ -1298,16 +1609,23 @@ function CreDocument:register(registry)
     registry:addProvider("chm", "application/vnd.ms-htmlhelp", self, 90)
     registry:addProvider("doc", "application/msword", self, 90)
     registry:addProvider("docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document", self, 90)
+    registry:addProvider("docx", "application/docx", self, 90) -- Alternative mimetype for OPDS.
+    registry:addProvider("docm", "application/vnd.ms-word.document.macroEnabled.12", self, 90)
     registry:addProvider("epub", "application/epub+zip", self, 100)
+    registry:addProvider("epub", "application/epub", self, 100) -- Alternative mimetype for OPDS.
     registry:addProvider("epub3", "application/epub+zip", self, 100)
     registry:addProvider("fb2", "application/fb2", self, 90)
+    registry:addProvider("fb2", "application/x-fictionbook+xml", self, 90) -- Alternative mimetype for OPDS.
+    registry:addProvider("fb2", "text/fb2+xml", self, 90) -- Alternative mimetype for OPDS.
     registry:addProvider("fb2.zip", "application/zip", self, 90)
     registry:addProvider("fb2.zip", "application/fb2+zip", self, 90) -- Alternative mimetype for OPDS.
     registry:addProvider("fb3", "application/fb3", self, 90)
     registry:addProvider("htm", "text/html", self, 100)
     registry:addProvider("html", "text/html", self, 100)
     registry:addProvider("htm.zip", "application/zip", self, 100)
+    registry:addProvider("htmlz", "application/html+zip", self, 100) -- For calibre OPDS.
     registry:addProvider("html.zip", "application/zip", self, 100)
+    registry:addProvider("html.zip", "application/html+zip", self, 100) -- Alternative mimetype for OPDS.
     registry:addProvider("log", "text/plain", self)
     registry:addProvider("log.zip", "application/zip", self)
     registry:addProvider("md", "text/plain", self)
@@ -1318,10 +1636,13 @@ function CreDocument:register(registry)
     registry:addProvider("pdb", "application/vnd.palm", self, 90)
     -- Palmpilot Resource File
     registry:addProvider("prc", "application/vnd.palm", self)
+    registry:addProvider("rtf", "application/rtf", self, 90)
+    registry:addProvider("rtf.zip", "application/rtf+zip", self, 90) -- Alternative mimetype for OPDS.
+    registry:addProvider("svg", "image/svg+xml", self, 90)
     registry:addProvider("tcr", "application/tcr", self)
     registry:addProvider("txt", "text/plain", self, 90)
     registry:addProvider("txt.zip", "application/zip", self, 90)
-    registry:addProvider("rtf", "application/rtf", self, 90)
+    registry:addProvider("txt.zip", "application/txt+zip", self, 90) -- Alternative mimetype for OPDS.
     registry:addProvider("xhtml", "application/xhtml+xml", self, 100)
     registry:addProvider("xml", "application/xml", self, 90)
     registry:addProvider("zip", "application/zip", self, 10)
@@ -1351,7 +1672,7 @@ function CreDocument:setupCallCache()
     local do_log = false
 
     -- Beware below for luacheck warnings "shadowing upvalue argument 'self'":
-    -- the 'self' we got and use here, and the one we may get implicitely
+    -- the 'self' we got and use here, and the one we may get implicitly
     -- as first parameter of the methods we define or redefine, are actually
     -- the same, but luacheck doesn't know that and would logically complain.
     -- So, we define our helpers (self._callCache*) as functions and not methods:
@@ -1359,84 +1680,90 @@ function CreDocument:setupCallCache()
 
     -- reset full cache
     self._callCacheReset = function()
-        self._call_cache = {}
-        self._call_cache_tags_lru = {}
+        -- "Global" cache, a simple key, value store for *this* document
+        self._global_call_cache = {}
+        -- "Tags" cache, an LRU cache of per-tag simple key, value stores. 10 slots.
+        if self._tag_list_call_cache then
+            self._tag_list_call_cache:clear()
+        else
+            self._tag_list_call_cache = lru.new(10, nil, false)
+        end
+        -- i.e., the only thing that follows any sort of LRU eviction logic is the *list* of tag caches.
+        -- Each individual cache itself is just a simple key, value store (i.e., a hash map).
+        -- Points to said per-tag cache for the current tag.
+        self._tag_call_cache = nil
+        -- Stores the key for said current tag
+        self._current_call_cache_tag = nil
     end
+    --[[
+    --- @note: If explicitly destroying the references to the caches is necessary to get their content collected by the GC,
+    ---        then you have a ref leak to this Document instance somewhere,
+    ---        c.f., https://github.com/koreader/koreader/pull/7634#discussion_r627820424
+    ---        Keep in mind that a *lot* of ReaderUI modules keep a ref to document, so it may be fairly remote!
+    ---        A good contender for issues like these would be references being stored in the class object instead
+    ---        of in instance objects because of inheritance rules. c.f., https://github.com/koreader/koreader/pull/9586,
+    ---        which got rid of a giant leak of every ReaderUI module via the active_widgets array...
+    ---        A simple testing methodology is to create a dummy buffer alongside self.buffer in drawCurrentView,
+    ---        push it to the global cache via _callCacheSet, and trace the BlitBuffer gc method in ffi/blitbuffer.lua.
+    ---        You'll probably want to stick a pair of collectgarbage() calls somewhere in the UI loop
+    ---        (e.g., at the coda of UIManager:close) to trip a GC pass earlier than the one in DocumentRegistry:openDocument.
+    ---        (Keep in mind that, in UIManager:close, widget is still in scope inside the function,
+    ---        so you'll have to close another widget to truly collect it (here, ReaderUI)).
+    self._callCacheDestroy = function()
+        self._global_call_cache = nil
+        self._tag_list_call_cache = nil
+        self._tag_call_cache = nil
+        self._current_call_cache_tag = nil
+    end
+    --]]
     -- global cache
     self._callCacheGet = function(key)
-        return self._call_cache[key]
+        return self._global_call_cache[key]
     end
     self._callCacheSet = function(key, value)
-        self._call_cache[key] = value
+        self._global_call_cache[key] = value
     end
 
-    -- nb of by-tag sub-caches to keep
-    self._call_cache_keep_tags_nb = 10
     -- current tag (page, pos) sub-cache
     self._callCacheSetCurrentTag = function(tag)
-        if not self._call_cache[tag] then
-            self._call_cache[tag] = {}
+        -- If it already exists, return it and make it the MRU
+        self._tag_call_cache = self._tag_list_call_cache:get(tag)
+        if not self._tag_call_cache then
+            -- Otherwise, create it and insert it in the list cache, evicting the LRU tag cache if necessary.
+            self._tag_call_cache = {}
+            self._tag_list_call_cache:set(tag, self._tag_call_cache)
         end
-        self._call_cache_current_tag = tag
-        -- clean up LRU tag list
-        if self._call_cache_tags_lru[1] ~= tag then
-            for i = #self._call_cache_tags_lru, 1, -1 do
-                if self._call_cache_tags_lru[i] == tag then
-                    table.remove(self._call_cache_tags_lru, i)
-                elseif i > self._call_cache_keep_tags_nb then
-                    self._call_cache[self._call_cache_tags_lru[i]] = nil
-                    table.remove(self._call_cache_tags_lru, i)
-                end
-            end
-            table.insert(self._call_cache_tags_lru, 1, tag)
-        end
+        self._current_call_cache_tag = tag
     end
     self._callCacheGetCurrentTag = function(tag)
-        return self._call_cache_current_tag
+        return self._current_call_cache_tag
     end
     -- per current tag cache
     self._callCacheTagGet = function(key)
-        if self._call_cache_current_tag and self._call_cache[self._call_cache_current_tag] then
-            return self._call_cache[self._call_cache_current_tag][key]
+        if self._tag_call_cache then
+            return self._tag_call_cache[key]
         end
     end
     self._callCacheTagSet = function(key, value)
-        if self._call_cache_current_tag and self._call_cache[self._call_cache_current_tag] then
-            self._call_cache[self._call_cache_current_tag][key] = value
+        if self._tag_call_cache then
+            self._tag_call_cache[key] = value
         end
     end
     self._callCacheReset()
-
-    -- serialize function arguments as a single string, to be used as a table key
-    local asString = function(...)
-        local sargs = {} -- args as string
-        for i, arg in ipairs({...}) do
-            local sarg
-            if type(arg) == "table" then
-                -- We currently don't get nested tables, and only keyword tables
-                local items = {}
-                for k, v in pairs(arg) do
-                    table.insert(items, tostring(k)..tostring(v))
-                end
-                table.sort(items)
-                sarg = table.concat(items, "|")
-            else
-                sarg = tostring(arg)
-            end
-            table.insert(sargs, sarg)
-        end
-        return table.concat(sargs, "|")
-    end
 
     local no_op = function() end
     local addStatMiss = no_op
     local addStatHit = no_op
     local dumpStats = no_op
+    local now = no_op
     if do_stats then
         -- cache statistics
         self._call_cache_stats = {}
+        now = function()
+            return time.now()
+        end
         addStatMiss = function(name, starttime, not_cached)
-            local duration = FFIUtil.getTimestamp() - starttime
+            local duration = time.to_s(time.since(starttime))
             if not self._call_cache_stats[name] then
                 self._call_cache_stats[name] = {0, 0.0, 1, duration, not_cached}
             else
@@ -1446,8 +1773,7 @@ function CreDocument:setupCallCache()
             end
         end
         addStatHit = function(name, starttime)
-            local duration = FFIUtil.getTimestamp() - starttime
-            if not duration then duration = 0.0 end
+            local duration = time.to_s(time.since(starttime))
             if not self._call_cache_stats[name] then
                 self._call_cache_stats[name] = {1, duration, 0, 0.0}
             else
@@ -1464,12 +1790,12 @@ function CreDocument:setupCallCache()
             local util = require("util")
             local res = {}
             table.insert(res, "CRE call cache content:")
-            table.insert(res, string.format("     all: %d items", util.tableSize(self._call_cache)))
-            table.insert(res, string.format("  global: %d items", util.tableSize(self._call_cache) - #self._call_cache_tags_lru))
-            table.insert(res, string.format("    tags: %d items", #self._call_cache_tags_lru))
-            for i=1, #self._call_cache_tags_lru do
-                table.insert(res, string.format("          '%s': %d items", self._call_cache_tags_lru[i],
-                        util.tableSize(self._call_cache[self._call_cache_tags_lru[i]])))
+            table.insert(res, string.format("     all: %d items", util.tableSize(self._global_call_cache) + self._tag_list_call_cache:used_slots()))
+            table.insert(res, string.format("  global: %d items", util.tableSize(self._global_call_cache)))
+            table.insert(res, string.format("    tags: %d items", self._tag_list_call_cache:used_slots()))
+            for tag, tag_cache in self._tag_list_call_cache:pairs() do
+                table.insert(res, string.format("          '%s': %d items", tag,
+                        util.tableSize(tag_cache)))
             end
             local hit_keys = {}
             local nohit_keys = {}
@@ -1527,7 +1853,7 @@ function CreDocument:setupCallCache()
                     total_duration = total_duration + missed_duration + hits_duration
                 end
             end
-            local pct_duration_saved = 100.0 * total_duration_saved / (total_duration+total_duration_saved)
+            local pct_duration_saved = 100.0 * total_duration_saved / (total_duration + total_duration_saved)
             table.insert(res, string.format("  cpu time used: %.3fs, saved: %.3fs (%d%% saved)", total_duration, total_duration_saved, pct_duration_saved))
             return table.concat(res, "\n")
         end
@@ -1551,6 +1877,8 @@ function CreDocument:setupCallCache()
 
             -- Assume all set* may change rendering
             if name == "setBatteryState" then no_wrap = true -- except this one
+            elseif name == "setPageInfoOverride" then no_wrap = true -- and this one
+            elseif name == "setViewMode" then no_wrap = true -- and this one
             elseif name:sub(1,3) == "set" then add_reset = true
             elseif name:sub(1,6) == "toggle" then add_reset = true
             elseif name:sub(1,6) == "update" then add_reset = true
@@ -1558,6 +1886,7 @@ function CreDocument:setupCallCache()
             elseif name == "zoomFont" then add_reset = true -- not used by koreader
             elseif name == "resetCallCache" then add_reset = true
             elseif name == "cacheFlows" then add_reset = true
+            elseif name == "buildSyntheticPageMap" then add_reset = true
 
             -- These may have crengine do native highlight or unhighlight
             -- (we could keep the original buffer and use a scratch buffer while
@@ -1566,6 +1895,7 @@ function CreDocument:setupCallCache()
             elseif name == "highlightXPointer" then add_buffer_trash = true
             elseif name == "getWordFromPosition" then add_buffer_trash = true
             elseif name == "getTextFromPositions" then add_buffer_trash = true
+            elseif name == "getTextFromXPointers" then add_buffer_trash = true
             elseif name == "findText" then add_buffer_trash = true
             elseif name == "resetBufferCache" then add_buffer_trash = true
 
@@ -1594,7 +1924,6 @@ function CreDocument:setupCallCache()
             elseif name == "getHTMLFromXPointers" then no_wrap = true
             elseif name == "getImageFromPosition" then no_wrap = true
             elseif name == "getTextFromXPointer" then no_wrap = true
-            elseif name == "getTextFromXPointers" then no_wrap = true
             elseif name == "getPageOffsetX" then no_wrap = true
             elseif name == "getNextVisibleWordStart" then no_wrap = true
             elseif name == "getNextVisibleWordEnd" then no_wrap = true
@@ -1610,13 +1939,17 @@ function CreDocument:setupCallCache()
             elseif name == "getPageFlow" then no_wrap = true
             elseif name == "getPageNumberInFlow" then no_wrap = true
             elseif name == "getTotalPagesLeft" then no_wrap = true
+            elseif name == "getDocumentRenderingHash" then no_wrap = true
+            elseif name == "getPartialRerenderingsCount" then no_wrap = true
 
             -- Some get* have different results by page/pos
             elseif name == "getLinkFromPosition" then cache_by_tag = true
             elseif name == "getPageLinks" then cache_by_tag = true
             elseif name == "getScreenBoxesFromPositions" then cache_by_tag = true
             elseif name == "getScreenPositionFromXPointer" then cache_by_tag = true
+            elseif name == "getNearestWordFromPosition" then cache_by_tag = true
             elseif name == "getXPointer" then cache_by_tag = true
+            elseif name == "getEPubCFI" then cache_by_tag = true
             elseif name == "isXPointerInCurrentPage" then cache_by_tag = true
             elseif name == "getPageMapCurrentPageLabel" then cache_by_tag = true
             elseif name == "getPageMapVisiblePageLabels" then cache_by_tag = true
@@ -1631,13 +1964,13 @@ function CreDocument:setupCallCache()
             if add_reset then
                 self[name] = function(...)
                     -- logger.dbg("callCache:", name, "called with", select(2,...))
-                    if do_log then logger.dbg("callCache:", name, "reseting cache") end
+                    if do_log then logger.dbg("callCache:", name, "resetting cache") end
                     self._callCacheReset()
                     return func(...)
                 end
             elseif add_buffer_trash then
                 self[name] = function(...)
-                    if do_log then logger.dbg("callCache:", name, "reseting buffer") end
+                    if do_log then logger.dbg("callCache:", name, "resetting buffer") end
                     self._callCacheSet("current_buffer_tag", nil)
                     return func(...)
                 end
@@ -1657,8 +1990,8 @@ function CreDocument:setupCallCache()
             elseif cache_by_tag then
                 is_cached = true
                 self[name] = function(...)
-                    local starttime = FFIUtil.getTimestamp()
-                    local cache_key = name .. asString(select(2, ...))
+                    local starttime = now()
+                    local cache_key = name .. buffer.encode({select(2, ...)})
                     local results = self._callCacheTagGet(cache_key)
                     if results then
                         if do_log then logger.dbg("callCache:", name, "cache hit:", cache_key) end
@@ -1678,8 +2011,8 @@ function CreDocument:setupCallCache()
             elseif cache_global then
                 is_cached = true
                 self[name] = function(...)
-                    local starttime = FFIUtil.getTimestamp()
-                    local cache_key = name .. asString(select(2, ...))
+                    local starttime = now()
+                    local cache_key = name .. buffer.encode({select(2, ...)})
                     local results = self._callCacheGet(cache_key)
                     if results then
                         if do_log then logger.dbg("callCache:", name, "cache hit:", cache_key) end
@@ -1698,7 +2031,7 @@ function CreDocument:setupCallCache()
             if do_stats_include_not_cached and not is_cached then
                 local func2 = self[name] -- might already be wrapped
                 self[name] = function(...)
-                    local starttime = FFIUtil.getTimestamp()
+                    local starttime = now()
                     local results = { func2(...) }
                     addStatMiss(name, starttime, true) -- not_cached = true
                     return unpack(results)
@@ -1707,36 +2040,36 @@ function CreDocument:setupCallCache()
         end
     end
     -- We override a bit more specifically the one responsible for drawing page
-    self.drawCurrentView = function(_self, target, x, y, rect, pos)
+    self.drawCurrentView = function(this, target, x, y, rect, pos)
         local do_draw = false
-        local current_tag = self._callCacheGetCurrentTag()
-        local current_buffer_tag = self._callCacheGet("current_buffer_tag")
-        if _self.buffer and (_self.buffer.w ~= rect.w or _self.buffer.h ~= rect.h) then
+        local current_tag = this._callCacheGetCurrentTag()
+        local current_buffer_tag = this._callCacheGet("current_buffer_tag")
+        if this.buffer and (this.buffer.w ~= rect.w or this.buffer.h ~= rect.h) then
             do_draw = true
-        elseif not _self.buffer then
+        elseif not this.buffer then
             do_draw = true
         elseif not current_buffer_tag then
             do_draw = true
         elseif current_buffer_tag ~= current_tag then
             do_draw = true
         end
-        local starttime = FFIUtil.getTimestamp()
+        local starttime = now()
         if do_draw then
             if do_log then logger.dbg("callCache: ########## drawCurrentView: full draw") end
-            CreDocument.drawCurrentView(_self, target, x, y, rect, pos)
+            CreDocument.drawCurrentView(this, target, x, y, rect, pos)
             addStatMiss("drawCurrentView", starttime)
-            self._callCacheSet("current_buffer_tag", current_tag)
+            this._callCacheSet("current_buffer_tag", current_tag)
         else
             if do_log then logger.dbg("callCache: ---------- drawCurrentView: light draw") end
-            target:blitFrom(_self.buffer, x, y, 0, 0, rect.w, rect.h)
+            target:blitFrom(this.buffer, x, y, 0, 0, rect.w, rect.h)
             addStatHit("drawCurrentView", starttime)
         end
     end
     -- Dump statistics on close
     if do_stats then
-        self.close = function(_self)
-            CreDocument.close(_self)
+        self.close = function(this)
             dumpStats()
+            CreDocument.close(this)
         end
     end
 end

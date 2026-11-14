@@ -4,15 +4,19 @@
 --]]
 
 local BD = require("ui/bidi")
+local CalibreExtensions = require("extensions")
 local CalibreMetadata = require("metadata")
+local CalibreSearch = require("search")
 local ConfirmBox = require("ui/widget/confirmbox")
 local Device = require("device")
 local FFIUtil = require("ffi/util")
-local InputContainer = require("ui/widget/container/inputcontainer")
 local InputDialog = require("ui/widget/inputdialog")
 local InfoMessage = require("ui/widget/infomessage")
 local NetworkMgr = require("ui/network/manager")
+local ReadCollection = require("readcollection")
+local Trapper = require("ui/trapper")
 local UIManager = require("ui/uimanager")
+local WidgetContainer = require("ui/widget/container/widgetcontainer")
 local lfs = require("libs/libkoreader-lfs")
 local logger = require("logger")
 local rapidjson = require("rapidjson")
@@ -23,16 +27,99 @@ local T = FFIUtil.template
 
 require("ffi/zeromq_h")
 
--- supported formats
-local extensions = require("extensions")
+-- calibre broadcast ports used to find calibre server
+local BROADCAST_PORTS = {54982, 48123, 39001, 44044, 59678}
+-- calibre companion local port
+local COMPANION_PORT = 8134
+-- requests opcodes
+local OPCODES = {
+    OK                        = 0,
+    SET_CALIBRE_DEVICE_INFO   = 1,
+    SET_CALIBRE_DEVICE_NAME   = 2,
+    GET_DEVICE_INFORMATION    = 3,
+    TOTAL_SPACE               = 4,
+    FREE_SPACE                = 5,
+    GET_BOOK_COUNT            = 6,
+    SEND_BOOKLISTS            = 7,
+    SEND_BOOK                 = 8,
+    GET_INITIALIZATION_INFO   = 9,
+    BOOK_DONE                 = 11,
+    NOOP                      = 12,
+    DELETE_BOOK               = 13,
+    GET_BOOK_FILE_SEGMENT     = 14,
+    GET_BOOK_METADATA         = 15,
+    SEND_BOOK_METADATA        = 16,
+    DISPLAY_MESSAGE           = 17,
+    CALIBRE_BUSY              = 18,
+    SET_LIBRARY_INFO          = 19,
+    ERROR                     = 20,
+    GET_COLLECTIONS           = 21,
+    UPDATE_COLLECTIONS        = 22,
+}
+
+-- Mark some strings for translation.
+-- luacheck: push ignore 511
+if false then
+    -- @translators tcp socket error on host:port
+    _("no route to host")
+    -- @translators tcp socket error on host:port
+    _("host not found")
+    -- @translators tcp socket error on host:port
+    _("connection refused")
+    -- @translators tcp socket error on host:port
+    _("timeout")
+    -- @translators tcp socket error on host:port
+    _("closed")
+    -- @translators calibre server address type
+    _("discovered")
+    -- @translators calibre server address type
+    _("specified")
+    -- @translators calibre connection error
+    _("handshake timeout")
+    -- @translators calibre connection error
+    _("invalid password")
+end
+-- luacheck: pop
+
+-- Supported formats list.
+local extensions = CalibreExtensions:get()
+
+-- Get all the required lengths of all extensions.
+-- In calibre 9.14, this length is the amount protected against being shortend at the end of the path
+-- and is defined as "dotless extension".
 local function getExtensionPathLengths()
     local t = {}
     for _, v in ipairs(extensions) do
-        -- magic number from calibre, see
-        -- https://github.com/koreader/koreader/pull/6177#discussion_r430753964
-        t[v] = 37
+        -- Set the required length to length of the actual extension.
+        t[v] = string.len(v)
     end
     return t
+end
+local extension_path_lengths = getExtensionPathLengths()
+
+-- Validates a peer-supplied lpath: relative, no traversal/Windows syntax/NUL, and a supported extension when check_extension is set.
+local function isSafeLpath(lpath, check_extension)
+    if type(lpath) ~= "string" or lpath == "" or lpath:find("\0", 1, true) then
+        return false
+    end
+    if lpath:sub(1, 1) == "/" or lpath:find("\\", 1, true) or lpath:match("^%a:") then
+        return false
+    end
+    local filename
+    for component in lpath:gmatch("[^/]+") do
+        if component == ".." then
+            return false
+        end
+        filename = component
+    end
+    if not filename then
+        return false
+    end
+    if check_extension then
+        local ext = filename:match("%.([^%.]+)$")
+        return ext ~= nil and extension_path_lengths[ext:lower()] or false
+    end
+    return true
 end
 
 -- get real free space on disk or fallback to 1GB
@@ -43,63 +130,30 @@ end
 -- update the view of the dir if we are currently browsing it.
 local function updateDir(dir)
     local FileManager = require("apps/filemanager/filemanager")
-    if FileManager:getCurrentDir() == dir then
-        -- getCurrentDir() will return nil (well, nothing, technically) if there isn't an FM instance, so,
-        -- unless we were passed a nil, this is technically redundant.
-        if FileManager.instance then
-            FileManager.instance:reinit(dir)
-        end
+    local fc = FileManager.instance and FileManager.instance.file_chooser
+    if fc and fc.path == dir then
+        fc:refreshPath()
     end
 end
 
-local CalibreWireless = InputContainer:new{
+local CalibreWireless = WidgetContainer:extend{
     id = "KOReader",
     model = require("device").model,
     version = require("version"):getCurrentRevision(),
-    -- calibre companion local port
-    port = 8134,
-    -- calibre broadcast ports used to find calibre server
-    broadcast_ports = {54982, 48123, 39001, 44044, 59678},
-    opcodes = {
-        NOOP                      = 12,
-        OK                        = 0,
-        ERROR                     = 20,
-        BOOK_DONE                 = 11,
-        CALIBRE_BUSY              = 18,
-        SET_LIBRARY_INFO          = 19,
-        DELETE_BOOK               = 13,
-        DISPLAY_MESSAGE           = 17,
-        FREE_SPACE                = 5,
-        GET_BOOK_FILE_SEGMENT     = 14,
-        GET_BOOK_METADATA         = 15,
-        GET_BOOK_COUNT            = 6,
-        GET_DEVICE_INFORMATION    = 3,
-        GET_INITIALIZATION_INFO   = 9,
-        SEND_BOOKLISTS            = 7,
-        SEND_BOOK                 = 8,
-        SEND_BOOK_METADATA        = 16,
-        SET_CALIBRE_DEVICE_INFO   = 1,
-        SET_CALIBRE_DEVICE_NAME   = 2,
-        TOTAL_SPACE               = 4,
-    },
-    calibre = {},
+    calibre = nil, -- hash
 }
 
 function CalibreWireless:init()
-    -- reversed operator codes and names dictionary
-    self.opnames = {}
-    for name, code in pairs(self.opcodes) do
-        self.opnames[code] = name
-    end
+    self.calibre = {}
 end
 
-function CalibreWireless:find_calibre_server()
+local function find_calibre_server()
     local socket = require("socket")
     local udp = socket.udp4()
     udp:setoption("broadcast", true)
-    udp:setsockname("*", 8134)
+    udp:setsockname("*", COMPANION_PORT)
     udp:settimeout(3)
-    for _, port in ipairs(self.broadcast_ports) do
+    for _, port in ipairs(BROADCAST_PORTS) do
         -- broadcast anything to calibre ports and listen to the reply
         local _, err = udp:sendto("hello", "255.255.255.255", port)
         if not err then
@@ -107,60 +161,40 @@ function CalibreWireless:find_calibre_server()
             if dgram and host then
                 -- replied diagram has greet message from calibre and calibre hostname
                 -- calibre opds port and calibre socket port we will later connect to
-                local _, _, _, replied_port = dgram:match("(.-)%(on (.-)%);(.-),(.-)$")
+                local _, _, replied_port = dgram:match("calibre wireless device client %(on (.-)%);(%d+),(%d+)$")
+                udp:close()
                 return host, replied_port
             end
         end
     end
+    udp:close()
 end
 
-function CalibreWireless:checkCalibreServer(host, port)
+local function check_host_port(host, port)
     local socket = require("socket")
+    -- luacheck: ignore 311
+    local ok, err = socket.dns.getaddrinfo(host)
+    if not ok then
+        return false, "host not found"
+    end
+    local ip = ok[1].addr
     local tcp = socket.tcp()
     tcp:settimeout(5)
-    local client = tcp:connect(host, port)
-    -- In case of error, the method returns nil followed by a string describing the error. In case of success, the method returns 1.
-    if client then
-        tcp:close()
-        return true
-    end
-    return false
+    -- In case of error, the method returns nil followed by a string
+    -- describing the error. In case of success, the method returns 1.
+    ok, err = tcp:connect(ip, port)
+    tcp:close()
+    return ok, err
 end
 
 -- Standard JSON/control opcodes receive callback
-function CalibreWireless:JSONReceiveCallback(host, port)
+function CalibreWireless:JSONReceiveCallback()
     -- NOTE: Closure trickery because we need a reference to *this* self *inside* the callback,
     --       which will be called as a function from another object (namely, StreamMessageQueue).
     local this = self
     return function(t)
         local data = table.concat(t)
         this:onReceiveJSON(data)
-        if not this.connect_message then
-            this.password_check_callback = function()
-                local msg
-                if this.invalid_password then
-                    msg = _("Invalid password")
-                    this.invalid_password = nil
-                    this:disconnect()
-                elseif this.disconnected_by_server then
-                    msg = _("Disconnected by calibre")
-                    this.disconnected_by_server = nil
-                else
-                    msg = T(_("Connected to calibre server at %1"),
-                        BD.ltr(T("%1:%2", this.calibre_socket.host, this.calibre_socket.port)))
-                end
-                UIManager:show(InfoMessage:new{
-                    text = msg,
-                    timeout = 2,
-                })
-            end
-            this.connect_message = true
-            UIManager:scheduleIn(1, this.password_check_callback)
-            if this.failed_connect_callback then
-                -- Don't disconnect if we connect in 10 seconds
-                UIManager:unschedule(this.failed_connect_callback)
-            end
-        end
     end
 end
 
@@ -173,19 +207,15 @@ function CalibreWireless:initCalibreMQ(host, port)
             receiveCallback = self:JSONReceiveCallback(),
         }
         self.calibre_socket:start()
-        self.calibre_messagequeue = UIManager:insertZMQ(self.calibre_socket)
+        UIManager:insertZMQ(self.calibre_socket)
     end
-    logger.info("connected to calibre", host, port)
 end
 
--- will callback initCalibreMQ if inbox is confirmed to be set
-function CalibreWireless:setInboxDir(host, port)
+function CalibreWireless:setInboxDir(cb)
     local force_chooser_dir
     if Device:isAndroid() then
         force_chooser_dir = Device.home_dir
     end
-
-    local calibre_device = self
 
     require("ui/downloadmgr"):new{
         onConfirm = function(inbox)
@@ -194,12 +224,11 @@ function CalibreWireless:setInboxDir(host, port)
                 if not driver then return end
                 return not driver:lower():match("koreader") and not driver:lower():match("folder")
             end
-            local save_and_resume = function()
+            local save_and_cb = function()
                 logger.info("set inbox directory", inbox)
                 G_reader_settings:saveSetting("inbox_dir", inbox)
-                if host and port then
-                    CalibreMetadata:init(inbox)
-                    calibre_device:initCalibreMQ(host, port)
+                if cb then
+                    cb(inbox)
                 end
             end
             -- probably not a good idea to mix calibre drivers because
@@ -213,71 +242,173 @@ Mixing calibre libraries is not recommended unless you know what you're doing.
 Do you want to continue? ]]), driver),
 
                     ok_text = _("Continue"),
-                    ok_callback = function()
-                        save_and_resume()
-                    end,
+                    ok_callback = save_and_cb
                 })
             else
-                save_and_resume()
+                save_and_cb()
             end
         end,
     }:chooseDir(force_chooser_dir)
 end
 
 function CalibreWireless:connect()
-    if NetworkMgr:willRerunWhenConnected(function() self:connect() end) then
+    if self.calibre_socket ~= nil then
         return
     end
 
-    self.connect_message = false
-    local host, port
-    if G_reader_settings:hasNot("calibre_wireless_url") then
-        host, port = self:find_calibre_server()
-    else
-        local calibre_url = G_reader_settings:readSetting("calibre_wireless_url")
-        host, port = calibre_url["address"], calibre_url["port"]
-        if not self:checkCalibreServer(host, port) then
-            host = nil
-        else
-            self.failed_connect_callback = function()
-                UIManager:show(InfoMessage:new{
-                    text = _("Cannot connect to calibre server."),
-                })
-                self:disconnect()
-            end
-            -- wait 10 seconds to connect to calibre
-            UIManager:scheduleIn(10, self.failed_connect_callback)
-        end
-    end
-    if host and port then
-        local inbox_dir = G_reader_settings:readSetting("inbox_dir")
-        if inbox_dir then
-            CalibreMetadata:init(inbox_dir)
-            self:initCalibreMQ(host, port)
-        else
-            self:setInboxDir(host, port)
-        end
-    else
-        logger.info("cannot connect to calibre server")
-        UIManager:show(InfoMessage:new{
-            text = _("Cannot connect to calibre server."),
-        })
+    -- Ensure we're running in a coroutine.
+    local co = coroutine.running()
+    if not co then
+        Trapper:wrap(function() self:connect() end)
         return
     end
+    local re = function(res) coroutine.resume(co, res) end
+
+    -- Setup inbox directory.
+    local inbox_dir = G_reader_settings:readSetting("inbox_dir")
+    if not inbox_dir or lfs.attributes(inbox_dir, "mode") ~= "directory" then
+        self:setInboxDir(re)
+        inbox_dir = coroutine.yield()
+    end
+
+    -- Ensure network is online.
+    if NetworkMgr:willRerunWhenConnected(re) then
+        coroutine.yield()
+        if not NetworkMgr:isConnected() then
+            return
+        end
+    end
+
+    local address_type, host, port, ok, err
+
+    -- Setup server address.
+    local calibre_url = G_reader_settings:readSetting("calibre_wireless_url")
+    if calibre_url then
+        host, port = calibre_url["address"], calibre_url["port"]
+        address_type = "specified"
+        ok = true
+    else
+        logger.info("calibre: searching for a server")
+        Trapper:info(_("Searching for a calibre server… (tap to cancel)"))
+        ok, host, port = Trapper:dismissableRunInSubprocess(find_calibre_server)
+        if not ok then
+            -- Canceled.
+            return
+        end
+        if not host or not port then
+            Trapper:info(_("Couldn't discover a calibre instance on the local network"))
+            return
+        end
+        address_type = "discovered"
+    end
+
+    local server_info = BD.ltr(T("%1:%2", host, port))
+
+    -- Yield for `timeout` seconds, return:
+    -- - `true` if resumed because of some server activity
+    -- - `false` on abort / cancelation / disconnection
+    -- - `nil` on timeout
+    local resume_in = function(timeout)
+        UIManager:scheduleIn(timeout, re)
+        local result = coroutine.yield()
+        UIManager:unschedule(re)
+        return result
+    end
+
+    if ok then
+        -- Start connection.
+        logger.info(string.format("calibre: connecting to %s:%s (%s)", host, port, address_type))
+        -- @translators %1: address (host:port), %2: address type (discovered, specified, unavailable)
+        Trapper:info(T(_("Connecting to calibre server at %1 (%2, tap to cancel)"), server_info, _(address_type)))
+        self.re = re
+        self.invalid_password = false
+        self.disconnected_by_server = false
+        if pcall(self.initCalibreMQ, self, host, port) then
+            CalibreMetadata:init(inbox_dir)
+            -- And wait for initial requests: GET_INITIALIZATION_INFO, followed by
+            -- GET_DEVICE_INFORMATION (or a specific DISPLAY_MESSAGE on password error).
+            for _, timeout in ipairs{5, 1} do
+                ok = resume_in(timeout)
+                if not ok then
+                    break
+                end
+            end
+        else
+            ok = nil
+        end
+        if ok == false then
+            -- Connection was canceled by the user.
+            self:disconnect(true)
+            return
+        end
+        if self.invalid_password then
+            ok, err = false, "invalid password"
+        elseif not ok then
+            -- Manually open a TCP connection to get a more informative error.
+            ok, err = check_host_port(host, port)
+            if ok then
+                ok, err = false, "handshake timeout"
+            else
+                err = err:lower()
+            end
+        end
+    end
+
+    if not ok then
+        logger.warn("calibre: connection failed,", err)
+        -- @translators %1: address (host:port), %2: error
+        Trapper:info(T(_("Cannot connect to calibre server at %1 (%2)"), server_info, _(err)))
+        self:disconnect(not self.invalid_password)
+        return
+    end
+
+    Trapper:clear()
+
+    logger.info("calibre: connected")
+
+    -- Heartbeat monitoring…
+    while ok and not self.disconnected_by_server do
+        ok = resume_in(5 * 60)
+    end
+
+    local msg
+    if self.disconnected_by_server then
+        logger.info("disconnected by calibre")
+        msg = _("Disconnected by calibre")
+    elseif ok == nil then
+        logger.info("calibre: no activity")
+        msg = _("Disconnected from calibre (no activity)")
+    end
+    if msg then
+        UIManager:show(InfoMessage:new{ text = msg, timeout = 2 })
+        self:disconnect(not self.disconnected_by_server)
+    end
+
 end
 
-function CalibreWireless:disconnect()
-    logger.info("disconnect from calibre")
-    self.connect_message = false
-    if self.calibre_socket then
-        self.calibre_socket:stop()
-        self.calibre_socket = nil
+function CalibreWireless:disconnect(no_parting_noop)
+    if self.calibre_socket == nil then
+        return
     end
-    if self.calibre_messagequeue then
-        UIManager:removeZMQ(self.calibre_messagequeue)
-        self.calibre_messagequeue = nil
+    logger.info("calibre: disconnecting")
+
+    self.re(false)
+    self.re = nil
+
+    if not no_parting_noop then
+        self:sendJsonData('NOOP', {})
     end
+
+    UIManager:removeZMQ(self.calibre_socket)
+    self.calibre_socket:stop()
+    self.calibre_socket = nil
+    self.invalid_password = false
+    self.disconnected_by_server = false
+
     CalibreMetadata:clean()
+
+    -- Assume the library content was modified, as such, invalidate our Search metadata cache.
+    CalibreSearch:invalidateCache()
 end
 
 function CalibreWireless:reconnect()
@@ -295,7 +426,7 @@ function CalibreWireless:onReceiveJSON(data)
     -- 34[0, {"key0":value, "key1": value}]
     -- the JSON string has a leading length string field followed by the actual
     -- JSON data in which the first element is always the operator code which can
-    -- be looked up in the opnames dictionary
+    -- be looked up in the opcodes dictionary
     while self.buffer ~= nil do
         --logger.info("buffer", self.buffer)
         local index = self.buffer:find('%[') or 1
@@ -316,29 +447,36 @@ function CalibreWireless:onReceiveJSON(data)
             --logger.dbg("received json table", json)
             local opcode = json[1]
             local arg = json[2]
-            if self.opnames[opcode] == 'GET_INITIALIZATION_INFO' then
+            if opcode == OPCODES.GET_INITIALIZATION_INFO then
                 self:getInitInfo(arg)
-            elseif self.opnames[opcode] == 'GET_DEVICE_INFORMATION' then
+            elseif opcode == OPCODES.GET_DEVICE_INFORMATION then
                 self:getDeviceInfo(arg)
-            elseif self.opnames[opcode] == 'SET_CALIBRE_DEVICE_INFO' then
+            elseif opcode == OPCODES.SET_CALIBRE_DEVICE_INFO then
                 self:setCalibreInfo(arg)
-            elseif self.opnames[opcode] == 'FREE_SPACE' then
+            elseif opcode == OPCODES.FREE_SPACE then
                 self:getFreeSpace(arg)
-            elseif self.opnames[opcode] == 'SET_LIBRARY_INFO' then
+            elseif opcode == OPCODES.SET_LIBRARY_INFO then
                 self:setLibraryInfo(arg)
-            elseif self.opnames[opcode] == 'GET_BOOK_COUNT' then
+            elseif opcode == OPCODES.GET_BOOK_COUNT then
                 self:getBookCount(arg)
-            elseif self.opnames[opcode] == 'SEND_BOOK' then
+            elseif opcode == OPCODES.SEND_BOOK then
                 self:sendBook(arg)
-            elseif self.opnames[opcode] == 'DELETE_BOOK' then
+            elseif opcode == OPCODES.SEND_BOOK_METADATA then
+                self:sendBookMetadata(arg)
+            elseif opcode == OPCODES.DELETE_BOOK then
                 self:deleteBook(arg)
-            elseif self.opnames[opcode] == 'GET_BOOK_FILE_SEGMENT' then
+            elseif opcode == OPCODES.GET_BOOK_FILE_SEGMENT then
                 self:sendToCalibre(arg)
-            elseif self.opnames[opcode] == 'DISPLAY_MESSAGE' then
+            elseif opcode == OPCODES.DISPLAY_MESSAGE then
                 self:serverFeedback(arg)
-            elseif self.opnames[opcode] == 'NOOP' then
+            elseif opcode == OPCODES.GET_COLLECTIONS then
+                self:getCollections(arg)
+            elseif opcode == OPCODES.UPDATE_COLLECTIONS then
+                self:updateCollections(arg)
+            elseif opcode == OPCODES.NOOP then
                 self:noop(arg)
             end
+            self.re(true)
         else
             logger.warn("failed to decode json data", err)
         end
@@ -346,7 +484,7 @@ function CalibreWireless:onReceiveJSON(data)
 end
 
 function CalibreWireless:sendJsonData(opname, data)
-    local json, err = rapidjson.encode(rapidjson.array({self.opcodes[opname], data}))
+    local json, err = rapidjson.encode(rapidjson.array({OPCODES[opname], data}))
     if json then
         -- length of json data should be before the real json data
         self.calibre_socket:send(tostring(#json)..json)
@@ -392,7 +530,7 @@ function CalibreWireless:getInitInfo(arg)
         coverHeight = 240,
         deviceKind = self.model,
         deviceName = T("%1 (%2)", self.id, self.model),
-        extensionPathLengths = getExtensionPathLengths(),
+        extensionPathLengths = extension_path_lengths,
         passwordHash = getPasswordHash(),
         maxBookContentPacketLen = 4096,
         useUuidFileNames = false,
@@ -416,6 +554,7 @@ function CalibreWireless:setPassword()
         buttons = {{
             {
                 text = _("Cancel"),
+                id = "close",
                 callback = function()
                     UIManager:close(password_dialog)
                 end,
@@ -491,7 +630,6 @@ function CalibreWireless:noop(arg)
     if arg.ejecting then
         self:sendJsonData('OK', {})
         self.disconnected_by_server = true
-        self:disconnect()
         return
     end
     -- calibre announces the count of books that need more metadata
@@ -520,23 +658,15 @@ end
 function CalibreWireless:sendBook(arg)
     logger.dbg("SEND_BOOK", arg)
     local inbox_dir = G_reader_settings:readSetting("inbox_dir")
-    local filename = inbox_dir .. "/" .. arg.lpath
-    local fits = getFreeSpace(inbox_dir) >= (arg.length + 128 * 1024)
-    local to_write_bytes = arg.length
-    local calibre_device = self
-    local calibre_socket = self.calibre_socket
-    local outfile
-    if fits then
-        logger.dbg("write to file", filename)
-        util.makePath((util.splitFilePathName(filename)))
-        outfile = io.open(filename, "wb")
-    else
-        local msg = T(_("Can't receive file %1/%2: %3\nNo space left on device"),
-            arg.thisBook + 1, arg.totalBooks, BD.filepath(filename))
+    -- Refuse anything that could escape the inbox: calibre >= 4.18 understands
+    -- ERROR replies, older versions are told via the UI, and their file content
+    -- is simply discarded below.
+    local refuse = function(msg)
+        logger.warn("calibre:", msg)
         if self:isCalibreAtLeast(4, 18, 0) then
             -- report the error back to calibre
             self:sendJsonData('ERROR', {message = msg})
-            return
+            return true
         else
             -- report the error in the client
             UIManager:show(InfoMessage:new{
@@ -544,6 +674,70 @@ function CalibreWireless:sendBook(arg)
                 timeout = 2,
             })
             self.error_on_copy = true
+            return false
+        end
+    end
+
+    local filename
+    local fits = false
+    local to_write_bytes = tonumber(arg.length) or 0
+    local this_book = tonumber(arg.thisBook) or 0
+    local total_books = tonumber(arg.totalBooks) or 0
+    local calibre_device = self
+    local calibre_socket = self.calibre_socket
+    local outfile
+
+    if not isSafeLpath(arg.lpath, true) then
+        if refuse(T(_("Can't receive file %1/%2: %3\nInvalid file name"), this_book + 1, total_books, BD.filepath(arg.lpath or ""))) then
+            return
+        end
+    elseif type(arg.metadata) ~= "table" then
+        if refuse(T(_("Can't receive file %1/%2: %3\nInvalid book metadata"), this_book + 1, total_books, BD.filepath(arg.lpath or ""))) then
+            return
+        end
+    elseif not inbox_dir or lfs.attributes(inbox_dir, "mode") ~= "directory" then
+        if refuse(T(_("Can't receive file %1/%2: %3\nInbox directory not found"), this_book + 1, total_books, BD.filepath(arg.lpath))) then
+            return
+        end
+    else
+        filename = inbox_dir .. "/" .. arg.lpath
+        fits = getFreeSpace(inbox_dir) >= (to_write_bytes + 128 * 1024)
+        if fits then
+            logger.dbg("write to file", filename)
+            local dir = util.splitFilePathName(filename)
+            if dir == "" then
+                dir = inbox_dir
+            end
+            util.makePath(dir)
+            -- Containment check: the directory we are about to write into must
+            -- resolve inside the inbox, protecting against symlinked components.
+            local real_dir, real_inbox = FFIUtil.realpath(dir), FFIUtil.realpath(inbox_dir)
+            if real_dir and real_inbox then
+                real_dir = real_dir:gsub("\\", "/"):gsub("/+$", "")
+                real_inbox = real_inbox:gsub("\\", "/"):gsub("/+$", "")
+            end
+            local contained = real_dir and real_inbox
+                and (real_dir == real_inbox or real_dir:sub(1, #real_inbox + 1) == real_inbox .. "/")
+            if not contained then
+                logger.warn("calibre: refusing to receive file outside of inbox", filename)
+                if refuse(T(_("Can't receive file %1/%2: %3\nPath is outside of the inbox directory"), this_book + 1, total_books, BD.filepath(arg.lpath))) then
+                    return
+                end
+                fits = false
+            else
+                outfile = io.open(filename, "wb")
+                if not outfile then
+                    logger.warn("calibre: cannot open file for writing", filename)
+                    if refuse(T(_("Can't receive file %1/%2: %3\nCannot write file"), this_book + 1, total_books, BD.filepath(arg.lpath))) then
+                        return
+                    end
+                    fits = false
+                end
+            end
+        else
+            if refuse(T(_("Can't receive file %1/%2: %3\nNo space left on device"), this_book + 1, total_books, BD.filepath(filename))) then
+                return
+            end
         end
     end
     -- switching to raw data receiving mode
@@ -562,10 +756,12 @@ function CalibreWireless:sendBook(arg)
                 outfile:close()
                 logger.dbg("complete writing file", filename)
                 -- add book to local database/table
+                -- pin the lpath we validated and wrote to, calibre's metadata may differ
+                arg.metadata.lpath = arg.lpath
                 CalibreMetadata:addBook(arg.metadata)
                 UIManager:show(InfoMessage:new{
                     text = T(_("Received file %1/%2: %3"),
-                        arg.thisBook + 1, arg.totalBooks, BD.filepath(filename)),
+                        this_book + 1, total_books, BD.filepath(filename)),
                     timeout = 2,
                 })
                 CalibreMetadata:saveBookList()
@@ -577,17 +773,16 @@ function CalibreWireless:sendBook(arg)
             calibre_device.buffer = data:sub(#to_write_data + 1) or ""
             --logger.info("device buffer", calibre_device.buffer)
             if calibre_device.buffer ~= "" then
-                UIManager:scheduleIn(0.1, function()
-                    -- since data is already copied to buffer
-                    -- onReceiveJSON parameter should be nil
-                    calibre_device:onReceiveJSON()
-                end)
+                -- since data is already copied to buffer
+                -- onReceiveJSON parameter should be nil
+                calibre_device:onReceiveJSON()
             end
         end
+        self.re(true)
     end
     self:sendJsonData('OK', {})
     -- end of the batch
-    if (arg.thisBook + 1) == arg.totalBooks then
+    if (this_book + 1) == total_books then
         if not self.error_on_copy then return end
         self.error_on_copy = nil
         UIManager:show(ConfirmBox:new{
@@ -607,17 +802,30 @@ function CalibreWireless:sendBook(arg)
     end
 end
 
+function CalibreWireless:sendBookMetadata(arg)
+    logger.dbg("SEND_BOOK_METADATA", arg)
+
+    CalibreMetadata:updateBook(arg.data)
+
+    if (arg.index + 1) == arg.count then
+        CalibreMetadata:saveBookList()
+    end
+end
+
 function CalibreWireless:deleteBook(arg)
     logger.dbg("DELETE_BOOK", arg)
     self:sendJsonData('OK', {})
     local inbox_dir = G_reader_settings:readSetting("inbox_dir")
-    if not inbox_dir then return end
+    if not inbox_dir or type(arg.lpaths) ~= "table" then return end
     -- remove all books requested by calibre
     local titles = ""
     for i, v in ipairs(arg.lpaths) do
         local book_uuid, index = CalibreMetadata:getBookUuid(v)
         if not index then
             logger.warn("requested to delete a book no longer on device", arg.lpaths[i])
+        elseif not isSafeLpath(v) then
+            -- Do not let a malformed request delete anything outside of the inbox.
+            logger.warn("requested to delete a book with an unsafe path", v)
         else
             titles = titles .. "\n" .. CalibreMetadata.books[index].title
             util.removeFile(inbox_dir.."/"..v)
@@ -654,6 +862,10 @@ end
 function CalibreWireless:sendToCalibre(arg)
     logger.dbg("GET_BOOK_FILE_SEGMENT", arg)
     local inbox_dir = G_reader_settings:readSetting("inbox_dir")
+    if not inbox_dir or not isSafeLpath(arg.lpath) then
+        self:sendJsonData("NOOP", {})
+        return
+    end
     local path = inbox_dir .. "/" .. arg.lpath
 
     local file_size = lfs.attributes(path, "size")
@@ -680,11 +892,98 @@ function CalibreWireless:sendToCalibre(arg)
 end
 
 function CalibreWireless:isCalibreAtLeast(x, y, z)
-    local v = self.calibre.version
+    local v = self.calibre and self.calibre.version
+    -- Unknown version (e.g., no handshake yet): be conservative.
+    if type(v) ~= "table" or type(v[1]) ~= "number" then
+        return false
+    end
     local function semanticVersion(a, b, c)
         return ((a * 100000) + (b * 1000)) + c
     end
-    return semanticVersion(v[1], v[2], v[3]) >= semanticVersion(x, y, z)
+    return semanticVersion(v[1], v[2] or 0, v[3] or 0) >= semanticVersion(x, y, z)
+end
+
+function CalibreWireless:getCollections(arg)
+    local collections = {}
+    for collection_name, collection in pairs(ReadCollection.coll) do
+        local files = rapidjson.array()
+        for file in pairs(collection) do
+            table.insert(files, file)
+        end
+        collections[collection_name] = files
+    end
+    self:sendJsonData("OK", {collections = collections})
+end
+
+function CalibreWireless:updateCollections(arg)
+    if not arg or type(arg) ~= "table" then
+        logger.warn("CalibreWireless: invalid UPDATE_COLLECTIONS payload")
+        return
+    end
+
+    local updated_collections = {}
+
+    -- Remove collections first so that membership changes cannot recreate
+    -- a collection which Calibre explicitly wants removed.
+    if arg.remove_collections then
+        for _, coll_name in ipairs(arg.remove_collections) do
+            if ReadCollection.coll[coll_name] then
+                ReadCollection:removeCollection(coll_name)
+                updated_collections[coll_name] = true
+            end
+        end
+    end
+
+    -- Explicit collection additions are needed for empty collections.
+    if arg.add_collections then
+        for _, coll_name in ipairs(arg.add_collections) do
+            if not ReadCollection.coll[coll_name] then
+                ReadCollection:addCollection(coll_name)
+                updated_collections[coll_name] = true
+            end
+        end
+    end
+
+    -- Add individual book memberships.
+    if arg.add then
+        for coll_name, files in pairs(arg.add) do
+            local coll = ReadCollection.coll[coll_name]
+            if coll then
+                for _, file in ipairs(files) do
+                    if lfs.attributes(file, "mode") == "file"
+                        and not ReadCollection:isFileInCollection(file, coll_name)
+                    then
+                        ReadCollection:addItem(file, coll_name)
+                        updated_collections[coll_name] = true
+                    end
+                end
+            else
+                logger.warn("CalibreWireless: collection missing for add:", coll_name)
+            end
+        end
+    end
+
+    -- Remove individual book memberships.
+    if arg.remove then
+        for coll_name, files in pairs(arg.remove) do
+            local coll = ReadCollection.coll[coll_name]
+            if coll then
+                for _, file in ipairs(files) do
+                    if ReadCollection:removeItem(file, coll_name, true) then
+                        updated_collections[coll_name] = true
+                    end
+                end
+            else
+                logger.warn("CalibreWireless: collection missing for remove:", coll_name)
+            end
+        end
+    end
+
+    if next(updated_collections) then
+        ReadCollection:write(updated_collections)
+    end
+
+    self:sendJsonData("OK", {})
 end
 
 return CalibreWireless

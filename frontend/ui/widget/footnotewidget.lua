@@ -13,37 +13,17 @@ local InputContainer = require("ui/widget/container/inputcontainer")
 local LineWidget = require("ui/widget/linewidget")
 local ScrollHtmlWidget = require("ui/widget/scrollhtmlwidget")
 local Size = require("ui/size")
-local TimeVal = require("ui/timeval")
 local UIManager = require("ui/uimanager")
 local VerticalGroup = require("ui/widget/verticalgroup")
 local VerticalSpan = require("ui/widget/verticalspan")
 local _ = require("gettext")
 local Screen = Device.screen
 local T = require("ffi/util").template
-
--- If we wanted to use the default font set for the book,
--- we'd need to add a few functions to crengine and cre.cpp
--- to get the font files paths (for each font, regular, italic,
--- bold...) so we can pass them to MuPDF with:
---   @font-face {
---       font-family: 'KOReader Footnote Font';
---       src: url("%1");
---   }
---   @font-face {
---       font-family: 'KOReader Footnote Font';
---       src: url("%2");
---       font-style: italic;
---   }
---   body {
---       font-family: 'KOReader Footnote Font';
---   }
--- But it looks quite fine if we use "Noto Sans": the difference in font look
--- (Sans, vs probably Serif in the book) will help noticing this is a KOReader
--- UI element, and somehow justify the difference in looks.
+local time = require("ui/time")
 
 -- Note: we can't use < or > in comments in the CSS, or MuPDF complains with:
 --   error: css syntax error: unterminated comment.
--- So, HTML tags in comments are written upppercase (eg: <li> => LI)
+-- So, HTML tags in comments are written uppercase (eg: <li> => LI)
 
 -- Independent string for @page, so we can T() it individually,
 -- without needing to escape % in DEFAULT_CSS
@@ -53,17 +33,18 @@ local PAGE_CSS = [[
     font-family: '%5';
 }
 %6
+%7
+%8
 ]]
 
 -- Make default MuPDF styles (source/html/html-layout.c) a bit
 -- more similar to our epub.css ones, and more condensed to fit
--- in a small bottom pannel
+-- in a small bottom panel
 local DEFAULT_CSS = [[
 body {
     margin: 0;                  /* MuPDF: margin: 1em */
     padding: 0;
-    line-height: 1.3;
-    text-align: justify;
+    line-height: 1.3;           /* MuPDF defaults to 1.2 */
 }
 /* We keep left and right margin the same so it also displays as expected in RTL */
 h1, h2, h3, h4, h5, h6 { margin: 0; } /* MuPDF: margin: XXem 0 , vary with level */
@@ -90,6 +71,10 @@ body > li { list-style-type: none; }
 
 /* Remove any (possibly multiple) backlinks in Wikipedia EPUBs footnotes */
 .noprint { display: none; }
+
+/* Let MuPDF know about crengine internal block elements,
+ * so it doesn't render them inline */
+autoBoxing, floatBox, tabularBox { display: block; }
 
 /* Style some FB2 tags not known to MuPDF */
 strike, strikethrough { text-decoration: line-through; }
@@ -131,15 +116,16 @@ body > section > title {
 -- body { background-color: #eeeeee; }
 
 -- Widget to display footnote HTML content
-local FootnoteWidget = InputContainer:new{
+local FootnoteWidget = InputContainer:extend{
     html = nil,
     css = nil,
-    -- font_face can't really be overriden, it needs to be known by MuPDF
+    -- font_face can't really be overridden, it needs to be known by MuPDF
     font_face = "Noto Sans",
     -- For the doc_* values, we expect to be provided with the real
     -- (already scaled) sizes in screen pixels
     doc_font_size = Screen:scaleBySize(18),
-    doc_margins = {
+    doc_font_name = nil,
+    doc_margins = { -- const
         left = Screen:scaleBySize(20),
         right = Screen:scaleBySize(20),
         top = Screen:scaleBySize(10),
@@ -148,7 +134,9 @@ local FootnoteWidget = InputContainer:new{
     follow_callback = nil,
     on_tap_close_callback = nil,
     close_callback = nil,
+    navigate_footnote_callback = nil,
     dialog = nil,
+    covers_footer = true,
 }
 
 function FootnoteWidget:init()
@@ -162,6 +150,12 @@ function FootnoteWidget:init()
             w = Screen:getWidth(),
             h = Screen:getHeight(),
         }
+
+        local hold_pan_rate = G_reader_settings:readSetting("hold_pan_rate")
+        if not hold_pan_rate then
+            hold_pan_rate = Screen.low_pan_rate and 5.0 or 30.0
+        end
+
         self.ges_events = {
             TapClose = {
                 GestureRange:new{
@@ -183,8 +177,9 @@ function FootnoteWidget:init()
             },
             HoldPanText = {
                 GestureRange:new{
-                    ges = "hold",
+                    ges = "hold_pan",
                     range = range,
+                    rate = hold_pan_rate,
                 },
             },
             HoldReleaseText = {
@@ -195,9 +190,13 @@ function FootnoteWidget:init()
                 -- callback function when HoldReleaseText is handled as args
                 args = function(text, hold_duration)
                     if self.dialog then
-                        local lookup_target = hold_duration < TimeVal:new{ sec = 3, usec = 0 } and "LookupWord" or "LookupWikipedia"
+                        local dict_close_callback = function()
+                            self.htmlwidget.htmlbox_widget:scheduleClearHighlightAndRedraw()
+                        end
+
+                        local lookup_target = hold_duration < time.s(3) and "LookupWord" or "LookupWikipedia"
                         self.dialog:handleEvent(
-                            Event:new(lookup_target, text)
+                            Event:new(lookup_target, text, nil, nil, nil, nil, dict_close_callback)
                         )
                     end
                 end
@@ -205,10 +204,13 @@ function FootnoteWidget:init()
         }
     end
     if Device:hasKeys() then
-        self.key_events = {
-            Close = { {"Back"}, doc = "cancel" },
-            Follow = { {"Press"}, doc = "follow link" },
-        }
+        self.key_events.Close = { { Device.input.group.Back } }
+        self.key_events.Follow = { { "Press" } }
+        if Device:hasScreenKB() or Device:hasKeyboard() then
+            local modifier = Device:hasScreenKB() and "ScreenKB" or "Shift"
+            self.key_events.NextFootnote = { { modifier, Device.input.group.PgFwd  } }
+            self.key_events.PrevFootnote = { { modifier, Device.input.group.PgBack } }
+        end
     end
 
     -- Workaround bugs in MuPDF:
@@ -233,6 +235,44 @@ function FootnoteWidget:init()
         font_size = self.doc_font_size + (G_reader_settings:readSetting("footnote_popup_relative_font_size") or -2)
     end
 
+    local font_css = ""
+    if G_reader_settings:isTrue("footnote_popup_use_book_font") then
+        local cre = require("document/credocument"):engineInit()
+        -- Note: we can't provide any base weight (as supported by crengine), as MuPDF
+        -- will use the bold font for anything with a weight > 400. We can only use the
+        -- font as-is, without its natural weight tweaked.
+        local seen_font_path = {}
+        for i=1, 4 do
+            local bold = i >= 3
+            local italic = i == 2 or i ==4
+            -- We assume the font is not from a collection, and ignore the index.
+            local font_path = cre.getFontFaceFilenameAndFaceIndex(self.doc_font_name, bold, italic)
+            -- crengine returns the regular filename when requesting a bold that
+            -- it has synthesized; but MuPDF would consider it as real bold and
+            -- would use it as-is: by not providing the fake bold font file path,
+            -- we let MuPDF itself synthesize the bold (and also italic if none
+            -- provided). So, keep track of what's been seen and used.
+            if font_path and not seen_font_path[font_path] then
+                seen_font_path[font_path] = true
+                font_css = font_css .. T("\n@font-face { font-family: 'KOReaderFootnoteFont'; src: url('%1')%2%3}",
+                            font_path,
+                            bold and "; font-weight: bold" or "",
+                            italic and "; font-style: italic" or "")
+            end
+        end
+        if font_css ~= "" then
+            -- If not using our standard font, override "line-height:1.3" (which is fine
+            -- with Noto Sans) to use something smaller (looks like MuPDF's default is 1.2
+            -- and we can't make it use the font natural line height...)
+            font_css = font_css .. "\nbody { font-family: 'KOReaderFootnoteFont'; line-height: 1.2 !important; }\n"
+        end
+    end
+
+    local text_align_css = ""
+    if G_reader_settings:nilOrTrue("footnote_popup_justify") then
+        text_align_css = "body { text-align: justify; }\n"
+    end
+
     -- We want to display the footnote text with the same margins as
     -- the document, but keep the scrollbar in the right margin, so
     -- both small footnotes (without scrollbar) and longer ones (with
@@ -245,8 +285,9 @@ function FootnoteWidget:init()
     if BD.mirroredUILayout() then
         html_left_margin, html_right_margin = html_right_margin, html_left_margin
     end
+
     local css = T(PAGE_CSS, "0", html_right_margin, "0", html_left_margin, -- top right bottom left
-                    self.font_face, DEFAULT_CSS)
+                    self.font_face, font_css, DEFAULT_CSS, text_align_css)
     if self.css then -- add any provided css
         css = css .. "\n" .. self.css
     end
@@ -277,8 +318,11 @@ function FootnoteWidget:init()
     local padding_bottom = Size.padding.large
     local htmlwidget_height = self.height - padding_top - padding_bottom
 
+    -- We always get balanced XHTML from crengine for HTML snippets, so we
+    -- pass is_xhtml=true to avoid side effects from MuPDF's HTML5 parser.
     self.htmlwidget = ScrollHtmlWidget:new{
         html_body = self.html,
+        is_xhtml = true,
         css = css,
         default_font_size = font_size,
         width = htmlwidget_width,
@@ -286,6 +330,7 @@ function FootnoteWidget:init()
         scroll_bar_width = scroll_bar_width,
         text_scroll_span = text_scroll_span,
         dialog = self.dialog,
+        highlight_text_selection = true,
     }
 
     -- We only want a top border, so use a LineWidget for that
@@ -368,6 +413,18 @@ function FootnoteWidget:onFollow()
         end
         return self.follow_callback()
     end
+end
+
+function FootnoteWidget:onNextFootnote()
+    if not self.navigate_footnote_callback then return false end
+    self.navigate_footnote_callback(1)
+    return true
+end
+
+function FootnoteWidget:onPrevFootnote()
+    if not self.navigate_footnote_callback then return false end
+    self.navigate_footnote_callback(-1)
+    return true
 end
 
 function FootnoteWidget:onTapClose(arg, ges)

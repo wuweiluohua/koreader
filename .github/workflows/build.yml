@@ -1,34 +1,102 @@
-name: test
+# This workflow is managed by gh actions-lock.
 
-on: [push, pull_request]
+name: Build
+
+permissions:
+  contents: read
+
+on:
+  workflow_call:
+    inputs: &INPUTS
+      # Mandatory.
+      jobs:
+        description: 'Run the specified jobs'
+        required: true
+        type: string
+      # Optional.
+      artifacts:
+        description: 'Generate artifacts'
+        default: false
+        required: false
+        type: boolean
+      cache_epoch:
+        description: 'Cache keys prefix'
+        default: 'acai9ooN'
+        type: string
+      cache_size:
+        description: 'Default cache size'
+        default: '512M'
+        type: string
+      fail_fast:
+        description: 'Stop remaining jobs on failure'
+        default: false
+        required: false
+        type: boolean
+      ffi_cdecls_check:
+        description: 'Check FFI cdecls are up-to-date'
+        default: false
+        required: false
+        type: boolean
+      tests:
+        description: 'Run tests'
+        default: false
+        required: false
+        type: boolean
+  workflow_dispatch:
+    inputs: *INPUTS
+
+defaults:
+  run:
+    shell: stdbuf --error=L --output=L bash --noprofile --norc -eo pipefail {0}
 
 jobs:
-  build:
-    runs-on: ${{ matrix.os }}
 
-    strategy:
-      matrix:
-        os: [macos-latest]
-
+  prepare:
+    name: Prepare
+    runs-on: ubuntu-26.04
     steps:
-      - name: XCode version
-        run: xcode-select -p
-
-      - name: Check out Git repository
-        uses: actions/checkout@v2
+      - name: Checkout
+        uses: actions/checkout@v7.0.1
         with:
-          fetch-depth: 0
+          clean: false
+          fetch-depth: 1
+          show-progress: false
+          sparse-checkout: .ci
+      - name: Checkout base
+        run: git submodule update --depth 1 --init base
+      - name: Generate outputs
+        id: generate
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -o noglob
+          ./.ci/build_matrix_generate.sh '${{ toJSON(inputs) }}' ${{ github.ref_type == 'branch' && github.ref || 'master' }} ${{ github.base_ref }}
+    outputs:
+      jobs: ${{ steps.generate.outputs.jobs }}
 
-      - name: Homebrew install dependencies
-        # Compared to the README, adds ccache for faster compilation times and removes sh5sum to prevent some conflict with coreutils
-        # Compared to the emulator, adds p7zip and removes sdl2.
-        run: brew install ccache nasm ragel binutils coreutils libtool autoconf automake cmake makedepend lua@5.1 luarocks gettext gnu-getopt pkg-config wget bison p7zip
+  emulator:
+    needs: prepare
+    if: |
+      !cancelled() &&
+      fromJSON(needs.prepare.outputs.jobs).emulator != '[]'
+    name: Emulator
+    uses: $/.github/workflows/build_matrix.yml
+    with:
+      cache_epoch: ${{ inputs.cache_epoch }}
+      fail_fast: ${{ inputs.fail_fast || true }}
+      jobs: ${{ fromJSON(needs.prepare.outputs.jobs).emulator }}
 
-      - name: Building in progress…
-        run: export MACOSX_DEPLOYMENT_TARGET=10.14 PATH="$(brew --prefix)/opt/gettext/bin:$(brew --prefix)/opt/gnu-getopt/bin:$(brew --prefix)/opt/bison/bin:${PATH}" && ./kodev release macos
+  platform:
+    needs: [prepare, emulator]
+    if: |
+      !cancelled() &&
+      fromJSON(needs.prepare.outputs.jobs).platform != '[]' &&
+      contains('skipped success', needs.emulator.result)
+    name: Platform
+    uses: $/.github/workflows/build_matrix.yml
+    with:
+      cache_epoch: ${{ inputs.cache_epoch }}
+      fail_fast: ${{ inputs.fail_fast }}
+      jobs: ${{ fromJSON(needs.prepare.outputs.jobs).platform }}
 
-      - name: Uploading artifacts
-        uses: actions/upload-artifact@v2
-        with:
-          name: osx-artifacts
-          path: '*.7z'
+# vim: foldmethod=marker foldlevel=0

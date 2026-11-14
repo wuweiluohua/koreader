@@ -2,13 +2,13 @@ local BD = require("ui/bidi")
 local Device = require("device")
 local Geom = require("ui/geometry")
 local IconWidget = require("ui/widget/iconwidget")
-local InputContainer = require("ui/widget/container/inputcontainer")
 local RightContainer = require("ui/widget/container/rightcontainer")
 local VerticalGroup = require("ui/widget/verticalgroup")
 local VerticalSpan = require("ui/widget/verticalspan")
+local WidgetContainer = require("ui/widget/container/widgetcontainer")
 local Screen = Device.screen
 
-local ReaderDogear = InputContainer:new{}
+local ReaderDogear = WidgetContainer:extend{}
 
 function ReaderDogear:init()
     -- This image could be scaled for DPI (with scale_for_dpi=true, scale_factor=0.7),
@@ -17,9 +17,10 @@ function ReaderDogear:init()
     -- to not overwrite the book text.
     -- For other documents, there is no easy way to know if valuable content
     -- may be hidden by the icon (kopt's page_margin is quite obscure).
-    self.dogear_min_size = math.ceil(math.min(Screen:getWidth(), Screen:getHeight()) / 40)
-    self.dogear_max_size = math.ceil(math.min(Screen:getWidth(), Screen:getHeight()) / 32)
+    self.dogear_min_size = math.ceil(math.min(Screen:getWidth(), Screen:getHeight()) * (1/40))
+    self.dogear_max_size = math.ceil(math.min(Screen:getWidth(), Screen:getHeight()) * (1/32))
     self.dogear_size = nil
+    self.icon = nil
     self.dogear_y_offset = 0
     self.top_pad = nil
     self:setupDogear()
@@ -35,16 +36,17 @@ function ReaderDogear:setupDogear(new_dogear_size)
         if self[1] then
             self[1]:free()
         end
+        self.icon = IconWidget:new{
+            icon = "dogear.alpha",
+            rotation_angle = BD.mirroredUILayout() and 90 or 0,
+            width = self.dogear_size,
+            height = self.dogear_size,
+            alpha = true, -- Keep the alpha layer intact
+        }
         self.top_pad = VerticalSpan:new{width = self.dogear_y_offset}
         self.vgroup = VerticalGroup:new{
             self.top_pad,
-            IconWidget:new{
-                icon = "dogear.alpha",
-                rotation_angle = BD.mirroredUILayout() and 90 or 0,
-                width = self.dogear_size,
-                height = self.dogear_size,
-                alpha = true, -- Keep the alpha layer intact
-            }
+            self.icon,
         }
         self[1] = RightContainer:new{
             dimen = Geom:new{w = Screen:getWidth(), h = self.dogear_y_offset + self.dogear_size},
@@ -54,24 +56,17 @@ function ReaderDogear:setupDogear(new_dogear_size)
 end
 
 function ReaderDogear:onReadSettings(config)
-    if not self.ui.document.info.has_pages then
+    if self.ui.rolling then
         -- Adjust to CreDocument margins (as done in ReaderTypeset)
-        local h_margins = config:readSetting("copt_h_page_margins")
-                       or G_reader_settings:readSetting("copt_h_page_margins")
-                       or DCREREADER_CONFIG_H_MARGIN_SIZES_MEDIUM
-        local t_margin = config:readSetting("copt_t_page_margin")
-                      or G_reader_settings:readSetting("copt_t_page_margin")
-                      or DCREREADER_CONFIG_T_MARGIN_SIZES_LARGE
-        local b_margin = config:readSetting("copt_b_page_margin")
-                      or G_reader_settings:readSetting("copt_b_page_margin")
-                      or DCREREADER_CONFIG_B_MARGIN_SIZES_LARGE
-        local margins = { h_margins[1], t_margin, h_margins[2], b_margin }
+        local configurable = self.ui.document.configurable
+        local margins = { configurable.h_page_margins[1], configurable.t_page_margin,
+                          configurable.h_page_margins[2], configurable.b_page_margin }
         self:onSetPageMargins(margins)
     end
 end
 
 function ReaderDogear:onSetPageMargins(margins)
-    if self.ui.document.info.has_pages then
+    if not self.ui.rolling then
         -- we may get called by readerfooter (when hiding the footer)
         -- on pdf documents and get margins=nil
         return
@@ -86,7 +81,7 @@ function ReaderDogear:onSetPageMargins(margins)
 end
 
 function ReaderDogear:updateDogearOffset()
-    if self.ui.document.info.has_pages then
+    if not self.ui.rolling then
         return
     end
     self.dogear_y_offset = 0
@@ -101,10 +96,14 @@ function ReaderDogear:updateDogearOffset()
     end
 end
 
-function ReaderDogear:onUpdatePos()
+function ReaderDogear:onReaderReady()
+    self:updateDogearOffset()
+end
+
+function ReaderDogear:onDocumentRerendered()
     -- Catching the top status bar toggling with :onSetStatusLine()
-    -- would be too early. But "UpdatePos" is sent after it has
-    -- been applied
+    -- would be too early. But "DocumentRerendered" is sent after
+    -- it has been applied
     self:updateDogearOffset()
 end
 
@@ -114,11 +113,13 @@ function ReaderDogear:onChangeViewMode()
 end
 
 function ReaderDogear:resetLayout()
-    local new_screen_width = Screen:getWidth()
-    if new_screen_width == self._last_screen_width then return end
-    self._last_screen_width = new_screen_width
+    -- NOTE: RightContainer aligns to the right of its *own* width...
+    self[1].dimen.w = Screen:getWidth()
+end
 
-    self[1].dimen.w = new_screen_width
+function ReaderDogear:getRefreshRegion()
+    -- We can't use self.dimen because of the width/height quirks of Left/RightContainer, so use the IconWidget's...
+    return self.icon.dimen
 end
 
 function ReaderDogear:onSetDogearVisibility(visible)

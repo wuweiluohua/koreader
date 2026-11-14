@@ -9,24 +9,21 @@ local function dpi() return Screen:getDPI() end
 
 local function custom() return G_reader_settings:readSetting("custom_screen_dpi") end
 
-local function setDPI(_dpi)
-    local InfoMessage = require("ui/widget/infomessage")
+local function setDPI(dpi_val)
     local UIManager = require("ui/uimanager")
-    UIManager:show(InfoMessage:new{
-        text = _dpi and T(_("DPI set to %1. This will take effect after restarting."), _dpi)
-               or _("DPI set to auto. This will take effect after restarting."),
-    })
+    local text = dpi_val and T(_("DPI set to %1. This will take effect after restarting."), dpi_val)
+               or _("DPI set to auto. This will take effect after restarting.")
     -- If this is set to nil, reader.lua doesn't call setScreenDPI
-    G_reader_settings:saveSetting("screen_dpi", _dpi)
+    G_reader_settings:saveSetting("screen_dpi", dpi_val)
     -- Passing a nil properly resets to defaults/auto
-    Device:setScreenDPI(_dpi)
+    Device:setScreenDPI(dpi_val)
+    UIManager:askForRestart(text)
 end
 
 local function spinWidgetSetDPI(touchmenu_instance)
     local SpinWidget = require("ui/widget/spinwidget")
     local UIManager = require("ui/uimanager")
     local items = SpinWidget:new{
-        width = math.floor(Screen:getWidth() * 0.6),
         value = custom() or dpi(),
         value_min = 90,
         value_max = 900,
@@ -58,6 +55,7 @@ return {
             text = dpi_auto and T(_("Auto DPI (%1)"), dpi_auto) or _("Auto DPI"),
             help_text = _("The DPI of your screen is automatically detected so items can be drawn with the right amount of pixels. This will usually display at (roughly) the same size on different devices, while remaining sharp. Increasing the DPI setting will result in larger text and icons, while a lower DPI setting will look smaller on the screen."),
             checked_func = isAutoDPI,
+            radio = true,
             callback = function() setDPI() end
         },
         {
@@ -67,6 +65,7 @@ return {
                 local _dpi, _custom = dpi(), custom()
                 return _dpi and _dpi <= 140 and _dpi ~= _custom
             end,
+            radio = true,
             callback = function() setDPI(dpi_small) end
         },
         {
@@ -76,6 +75,7 @@ return {
                 local _dpi, _custom = dpi(), custom()
                 return _dpi and _dpi > 140 and _dpi <= 200 and _dpi ~= _custom
             end,
+            radio = true,
             callback = function() setDPI(dpi_medium) end
         },
         {
@@ -85,6 +85,7 @@ return {
                 local _dpi, _custom = dpi(), custom()
                 return _dpi and _dpi > 200 and _dpi <= 280 and _dpi ~= _custom
             end,
+            radio = true,
             callback = function() setDPI(dpi_large) end
         },
         {
@@ -94,6 +95,7 @@ return {
                 local _dpi, _custom = dpi(), custom()
                 return _dpi and _dpi > 280 and _dpi <= 400 and _dpi ~= _custom
             end,
+            radio = true,
             callback = function() setDPI(dpi_xlarge) end
         },
         {
@@ -103,6 +105,7 @@ return {
                 local _dpi, _custom = dpi(), custom()
                 return _dpi and _dpi > 400 and _dpi <= 560 and _dpi ~= _custom
             end,
+            radio = true,
             callback = function() setDPI(dpi_xxlarge) end
         },
         {
@@ -112,6 +115,7 @@ return {
                 local _dpi, _custom = dpi(), custom()
                 return _dpi and _dpi > 560 and _dpi ~= _custom
             end,
+            radio = true,
             callback = function() setDPI(dpi_xxxlarge) end
         },
         {
@@ -128,6 +132,7 @@ return {
                 local _dpi, _custom = dpi(), custom()
                 return _custom and _dpi == _custom
             end,
+            radio = true,
             callback = function(touchmenu_instance)
                 if custom() then
                     setDPI(custom() or dpi_auto)

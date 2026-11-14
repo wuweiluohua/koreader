@@ -1,6 +1,7 @@
 local BD = require("ui/bidi")
 local Blitbuffer = require("ffi/blitbuffer")
 local Button = require("ui/widget/button")
+local ButtonDialog = require("ui/widget/buttondialog")
 local CenterContainer = require("ui/widget/container/centercontainer")
 local ConfirmBox = require("ui/widget/confirmbox")
 local Device = require("device")
@@ -10,39 +11,33 @@ local GestureRange = require("ui/gesturerange")
 local Geom = require("ui/geometry")
 local InfoMessage = require("ui/widget/infomessage")
 local InputContainer = require("ui/widget/container/inputcontainer")
+local InputDialog = require("ui/widget/inputdialog")
 local Menu = require("ui/widget/menu")
 local Size = require("ui/size")
+local TextWidget = require("ui/widget/textwidget")
 local UIManager = require("ui/uimanager")
 local logger = require("logger")
-local util  = require("util")
+local util = require("util")
 local _ = require("gettext")
+local N_ = _.ngettext
 local Screen = Device.screen
 local T = require("ffi/util").template
 
-local ReaderToc = InputContainer:new{
+local ReaderToc = InputContainer:extend{
     toc = nil,
     toc_depth = nil,
     ticks = nil,
     ticks_flattened = nil,
     ticks_flattened_filtered = nil,
-    toc_indent = "    ",
-    collapsed_toc = {},
+    collapsed_toc = nil, -- table
     collapse_depth = 2,
-    expanded_nodes = {},
-    toc_menu_title = _("Table of contents"),
-    alt_toc_menu_title = _("Table of contents *"),
+    expanded_nodes = nil, -- table
     toc_items_per_page_default = 14,
+    toc_items_per_page_landscape_default = 10,
+    alt_toc_symbol = "\u{E298}" -- two-folders in circle (custom toc uses a pen in square symbol)
 }
 
 function ReaderToc:init()
-    if Device:hasKeyboard() then
-        self.key_events = {
-            ShowToc = {
-                { "T" },
-                doc = "show Table of Content menu" },
-        }
-    end
-
     if G_reader_settings:hasNot("toc_items_per_page") then
         -- The TOC items per page and items' font size can now be
         -- configured. Previously, the ones set for the file browser
@@ -59,6 +54,27 @@ function ReaderToc:init()
 
     self:resetToc()
     self.ui.menu:registerToMainMenu(self)
+
+    -- NOP our own gesture handling
+    self.ges_events = nil
+end
+
+function ReaderToc:onGesture() end
+
+-- function ReaderToc:registerKeyEvents()
+--     Now handled by hotkeys.koplugin:
+--     onShowToc = { { "T" }, { "Shift", "Up" } }
+-- end
+
+function ReaderToc:getTitle()
+    local title = _("Table of contents")
+    -- Handmade ToC has precedence over alternative ToC
+    if self.ui.handmade:isHandmadeTocEnabled() then
+        title = title .. " " .. self.ui.handmade.custom_toc_symbol
+    elseif self.ui.document:isTocAlternativeToc() then
+        title = title .. " " .. self.alt_toc_symbol
+    end
+    return title
 end
 
 function ReaderToc:onReadSettings(config)
@@ -76,7 +92,7 @@ end
 function ReaderToc:cleanUpTocTitle(title, replace_empty)
     title = title:gsub("\13", "")
     if replace_empty and title:match("^%s*$") then
-        title = "\xE2\x80\x93" -- U+2013 En-Dash
+        title = "\u{2013}" -- En-Dash
     end
     return title
 end
@@ -87,6 +103,7 @@ end
 
 function ReaderToc:resetToc()
     self.toc = nil
+    self.toc_menu_items_built = false
     self.toc_depth = nil
     self.ticks = nil
     self.ticks_flattened = nil
@@ -96,12 +113,17 @@ function ReaderToc:resetToc()
     self.expanded_nodes = {}
 end
 
+ReaderToc.onUsePageLabelsUpdated = ReaderToc.resetToc
+
 function ReaderToc:onUpdateToc()
     self:resetToc()
     self.ui:handleEvent(Event:new("TocReset"))
+    return true
+end
 
-    --- @note: Let this propagate, plugins/statistics uses it to react to changes in document pagination
-    --return true
+-- Be sure to update the ToC after a CRE rerendering
+function ReaderToc:onDocumentRerendered()
+    self:onUpdateToc()
 end
 
 function ReaderToc:onPageUpdate(pageno)
@@ -160,7 +182,7 @@ function ReaderToc:validateAndFixToc()
     local first = 1
     local last = #toc
 
-    -- For testing: shuffle a bit a valid TOC and make it randomely invalid
+    -- For testing: shuffle a bit a valid TOC and make it randomly invalid
     -- for i = first, last do
     --     toc[i].page = toc[i].page + math.random(10) - 5
     -- end
@@ -169,22 +191,39 @@ function ReaderToc:validateAndFixToc()
     logger.dbg("validateAndFixToc(): quick scan")
     local has_bogus
     local cur_page = 0
+    local max_depth = 0
+    local cur_seq_by_level = {}
     for i = first, last do
-        local page = toc[i].page
+        local item = toc[i]
+        local page = item.page
         if page < cur_page then
             has_bogus = true
             break
         end
         cur_page = page
+        -- Use this loop to compute max_depth here (if has_bogus,
+        -- we will recompute it in the loop below)
+        local depth = item.depth
+        if depth > max_depth then
+            max_depth = depth
+        end
+        -- Also use this loop to compute seq_in_level for each
+        -- item, needed by BookMap with alternative theme
+        local seq = (cur_seq_by_level[depth] or 0) + 1
+        item.seq_in_level = seq
+        cur_seq_by_level[depth] = seq
     end
     if not has_bogus then -- no TOC items, or all are valid
         logger.dbg("validateAndFixToc(): TOC is fine")
+        self.toc_depth = max_depth
         return
     end
     logger.dbg("validateAndFixToc(): TOC needs fixing")
 
     -- Bad ordering previously noticed: try to fix the wrong items' page
     -- by setting it to the previous or next good item page.
+    max_depth = 0 -- recompute this
+    cur_seq_by_level = {}
     local nb_bogus = 0
     local nb_fixed_pages = 0
     -- We fix only one bogus item per loop, taking the option that
@@ -197,7 +236,17 @@ function ReaderToc:validateAndFixToc()
     -- (These cases are met in the following code with cur_page=57 and page=6)
     cur_page = 0
     for i = first, last do
-        local page = toc[i].fixed_page or toc[i].page
+        local item = toc[i]
+        -- Recompute max_depth and item's seq_in_level
+        local depth = item.depth
+        if depth > max_depth then
+            max_depth = depth
+        end
+        local seq = (cur_seq_by_level[depth] or 0) + 1
+        item.seq_in_level = seq
+        cur_seq_by_level[depth] = seq
+        -- Look for bogus page
+        local page = item.fixed_page or item.page
         if page >= cur_page then
             cur_page = page
         else
@@ -251,7 +300,7 @@ function ReaderToc:validateAndFixToc()
                     logger.dbg("  fix next", j, toc[j].page, "=>", fixed_page)
                 end
             end
-            cur_page = toc[i].fixed_page or toc[i].page
+            cur_page = item.fixed_page or item.page
         end
     end
     if nb_bogus > 0 then
@@ -264,6 +313,72 @@ function ReaderToc:validateAndFixToc()
         end
     end
     logger.info(string.format("TOC had %d bogus page numbers: fixed %d items to keep them ordered.", nb_bogus, nb_fixed_pages))
+    self.toc_depth = max_depth
+end
+
+function ReaderToc:completeTocWithChapterLengths()
+    local toc = self.toc
+    local first = 1
+    local last = #toc
+    if last == 0 then
+        return
+    end
+    local prev_item_by_level = {}
+    for i = first, last do
+        local item = toc[i]
+        local page = item.page
+        local depth = item.depth
+        for j=#prev_item_by_level, depth, -1 do
+            local prev_item = prev_item_by_level[j]
+            if prev_item then
+                prev_item.chapter_length = page - prev_item.page
+            end
+            prev_item_by_level[j] = nil
+        end
+        prev_item_by_level[depth] = item
+    end
+    -- Set the length of the last ones
+    local page = self.ui.document:getPageCount() + 1
+    for j=#prev_item_by_level, 0, -1 do
+        local prev_item = prev_item_by_level[j]
+        if prev_item then
+            prev_item.chapter_length = page - prev_item.page
+        end
+    end
+end
+
+function ReaderToc:completeTocWithChapterLengthsFromPagemap()
+    local toc = self.toc
+    local first = 1
+    local last = #toc
+    if last == 0 then
+        return
+    end
+    local prev_item_by_level = {}
+    for i = first, last do
+        local item = toc[i]
+        local page, chapter_starts_new_ref_page = self:getPagePagemapIndex(item.page)
+        local extra_page = chapter_starts_new_ref_page and 0 or 1
+        local depth = item.depth
+        for j=#prev_item_by_level, depth, -1 do
+            local prev_item = prev_item_by_level[j]
+            if prev_item then
+                local prev_page = self:getPagePagemapIndex(prev_item.page)
+                prev_item.chapter_length = page and prev_page and (page - prev_page + extra_page) or "\u{2013}"
+            end
+            prev_item_by_level[j] = nil
+        end
+        prev_item_by_level[depth] = item
+    end
+    -- Set the length of the last ones
+    local page = self.ui.pagemap:getPageLabelProps() -- last label index
+    for j=#prev_item_by_level, 0, -1 do
+        local prev_item = prev_item_by_level[j]
+        if prev_item then
+            local prev_page = self:getPagePagemapIndex(prev_item.page)
+            prev_item.chapter_length = page and prev_page and (page - prev_page + 1) or "\u{2013}"
+        end
+    end
 end
 
 function ReaderToc:getTocIndexByPage(pn_or_xp, skip_ignored_ticks)
@@ -273,7 +388,7 @@ function ReaderToc:getTocIndexByPage(pn_or_xp, skip_ignored_ticks)
     if type(pn_or_xp) == "string" then
         return self:getAccurateTocIndexByXPointer(pn_or_xp, skip_ignored_ticks)
     end
-    local prev_index = 1
+    local prev_index = 0
     for _k,_v in ipairs(self.toc) do
         if not skip_ignored_ticks or not self.toc_ticks_ignored_levels[_v.depth] then
             if _v.page == pageno then
@@ -288,7 +403,7 @@ function ReaderToc:getTocIndexByPage(pn_or_xp, skip_ignored_ticks)
             prev_index = _k
         end
     end
-    return prev_index
+    return prev_index > 0 and prev_index or nil
 end
 
 function ReaderToc:getAccurateTocIndexByXPointer(xptr, skip_ignored_ticks)
@@ -336,6 +451,27 @@ function ReaderToc:getTocTitleByPage(pn_or_xp)
     else
         return ""
     end
+end
+
+function ReaderToc:getFullTocTitleByPage(pn_or_xp)
+    local chapters = {}
+    local toc_ticks_ignored_levels_orig = {}
+    local toc_chapter_title_bind_to_ticks_orig = self.toc_chapter_title_bind_to_ticks -- backup the flag
+    self.toc_chapter_title_bind_to_ticks = true -- honor self.toc_ticks_ignored_levels
+    local max_depth = self:getMaxDepth()
+    for depth = max_depth, 1, -1 do
+        toc_ticks_ignored_levels_orig[depth] = self.toc_ticks_ignored_levels[depth] -- backup the level
+        -- ignore the level if it should be ignored due to original settings
+        self.toc_ticks_ignored_levels[depth] = self.toc_ticks_ignored_levels[depth] and toc_chapter_title_bind_to_ticks_orig
+        local chapter = self:getTocTitleByPage(pn_or_xp)
+        if chapter ~= "" and chapter ~= chapters[1] then
+            table.insert(chapters, 1, chapter)
+        end
+        self.toc_ticks_ignored_levels[depth] = true -- ignore the level on next iterations
+    end
+    self.toc_chapter_title_bind_to_ticks = toc_chapter_title_bind_to_ticks_orig -- restore the flag
+    table.move(toc_ticks_ignored_levels_orig, 1, max_depth, 1, self.toc_ticks_ignored_levels) -- restore all levels
+    return chapters
 end
 
 function ReaderToc:getTocTitleOfCurrentPage()
@@ -520,50 +656,121 @@ function ReaderToc:isChapterEnd(cur_pageno)
     return _end
 end
 
-function ReaderToc:getChapterPagesLeft(pageno)
-    if self.ui.document:hasHiddenFlows() then
-        -- Count pages until new chapter
-        local pages_left = 0
-        local test_page = self.ui.document:getNextPage(pageno)
-        while test_page > 0 do
-            pages_left = pages_left + 1
-            if self:isChapterStart(test_page) then
-                return pages_left - 1
+function ReaderToc:getPagePagemapIndex(pageno)
+    -- for chapters, pageno is a rendered page number where the chapter title is displayed
+    if pageno then
+        local xp = self.ui.document:getPageXPointer(pageno)
+        if xp then
+            -- reference page (label) of the top of the displayed page
+            -- (the label itself may be displayed in one of the previous pages)
+            local label = self.ui.pagemap:getXPointerPageLabel(xp, true)
+            -- label_pn - rendered page number where the label is displayed
+            local index, label_pn = self.ui.pagemap:getPageLabelProps(label)
+            if index then
+                return index, label_pn == pageno -- true if chapter starts at new ref page
             end
-            test_page = self.ui.document:getNextPage(test_page)
         end
-    else
-        local next_chapter = self:getNextChapter(pageno)
-        if next_chapter then
-            next_chapter = next_chapter - pageno - 1
-        end
-        return next_chapter
     end
+end
+
+function ReaderToc:getPreviousChapterPagemapIndex(pageno)
+    local chapter_pn = self:isChapterStart(pageno) and pageno or self:getPreviousChapter(pageno)
+    return self:getPagePagemapIndex(chapter_pn) or 1
+end
+
+function ReaderToc:getNextChapterPagemapIndex(pageno)
+    local chapter_pn = self:getNextChapter(pageno)
+    if chapter_pn then
+        return self:getPagePagemapIndex(chapter_pn) -- chapter_idx, chapter_starts_new_ref_page
+    else -- last chapter
+        return self.ui.pagemap:getPageLabelProps() -- last index
+    end
+end
+
+function ReaderToc:getChapterPageCount(pageno)
+    if self.ui.pagemap and self.ui.pagemap:wantsPageLabels() then
+        local prev_chapter_idx = self:getPreviousChapterPagemapIndex(pageno)
+        if prev_chapter_idx then
+            local next_chapter_idx, chapter_starts_new_ref_page = self:getNextChapterPagemapIndex(pageno)
+            if next_chapter_idx then
+                return next_chapter_idx - prev_chapter_idx + (chapter_starts_new_ref_page and 0 or 1)
+            end
+        end
+    end
+
+    local next_chapter = self:getNextChapter(pageno) or self.ui.document:getPageCount() + 1
+    local previous_chapter = self:isChapterStart(pageno) and pageno or self:getPreviousChapter(pageno) or 1
+    local page_count = next_chapter - previous_chapter
+    if self.ui.document:hasHiddenFlows() and self.ui.document:getPageFlow(pageno) == 0 then
+        -- If current page in a hidden flow, return the full amount of pages in this chapter.
+        -- Otherwise, count only pages in the main flow
+        for page = previous_chapter, next_chapter - 1 do
+            if self.ui.document:getPageFlow(page) ~= 0 then
+                page_count = page_count - 1
+            end
+        end
+    end
+    return page_count
+end
+
+function ReaderToc:getChapterPagesLeft(pageno, screen_pages)
+    if not screen_pages and self.ui.pagemap and self.ui.pagemap:wantsPageLabels() then
+        local page_idx = self:getPagePagemapIndex(pageno)
+        if page_idx then
+            local next_chapter_idx, chapter_starts_new_ref_page = self:getNextChapterPagemapIndex(pageno)
+            if next_chapter_idx then
+                return next_chapter_idx - page_idx - (chapter_starts_new_ref_page and 1 or 0)
+            end
+        end
+    end
+
+    local next_chapter = self:getNextChapter(pageno)
+    if not next_chapter then
+        -- (ReaderFooter deals itself with nil and pageno in last chapter)
+        return
+    end
+    local pages_left = next_chapter - pageno - 1
+    if self.ui.document:hasHiddenFlows() and self.ui.document:getPageFlow(pageno) == 0 then
+        for page = pageno, next_chapter - 1 do
+            if self.ui.document:getPageFlow(page) ~= 0 then
+                pages_left = pages_left - 1
+            end
+        end
+    end
+    return pages_left
 end
 
 function ReaderToc:getChapterPagesDone(pageno)
     if self:isChapterStart(pageno) then return 0 end
-    if self.ui.document:hasHiddenFlows() then
-        -- Count pages until chapter start
-        local pages_done = 0
-        local test_page = self.ui.document:getPrevPage(pageno)
-        while test_page > 0 do
-            pages_done = pages_done + 1
-            if self:isChapterStart(test_page) then
-                return pages_done
+
+    if self.ui.pagemap and self.ui.pagemap:wantsPageLabels() then
+        local page_idx = self:getPagePagemapIndex(pageno)
+        if page_idx then
+            local prev_chapter_idx = self:getPreviousChapterPagemapIndex(pageno)
+            if prev_chapter_idx then
+                return page_idx - prev_chapter_idx
             end
-            test_page = self.ui.document:getPrevPage(test_page)
         end
-    else
-        local previous_chapter = self:getPreviousChapter(pageno)
-        if previous_chapter then
-            previous_chapter = pageno - previous_chapter
-        end
-        return previous_chapter
     end
+
+    local previous_chapter = self:getPreviousChapter(pageno)
+    if not previous_chapter then
+        -- (ReaderFooter deals itself with nil and pageno not yet in first chapter)
+        return
+    end
+    local pages_done = pageno - previous_chapter
+    if self.ui.document:hasHiddenFlows() and self.ui.document:getPageFlow(pageno) == 0 then
+        for page = previous_chapter, pageno - 1 do
+            if self.ui.document:getPageFlow(page) ~= 0 then
+                pages_done = pages_done - 1
+            end
+        end
+    end
+    return pages_done
 end
 
 function ReaderToc:updateCurrentNode()
+    if self.search_string ~= nil and self.search_string ~= "*" then return end
     if #self.collapsed_toc > 0 and self.pageno then
         for i, v in ipairs(self.collapsed_toc) do
             if v.page >= self.pageno then
@@ -584,10 +791,10 @@ end
 function ReaderToc:expandParentNode(index)
     if index then
         local nodes_to_expand = {}
-        local depth = self.toc[index].depth
+        local depth = self.filtered_toc[index].depth
         for i = index - 1, 1, -1 do
-            if depth > self.toc[i].depth then
-                depth = self.toc[i].depth
+            if depth > self.filtered_toc[i].depth then
+                depth = self.filtered_toc[i].depth
                 table.insert(nodes_to_expand, i)
             end
             if depth == 1 then break end
@@ -598,56 +805,50 @@ function ReaderToc:expandParentNode(index)
     end
 end
 
+function ReaderToc:getItemsPerPage(is_portrait)
+    if is_portrait == nil then
+        local screen_size = Screen:getSize()
+        is_portrait = screen_size.h > screen_size.w
+    end
+    if is_portrait then
+        return G_reader_settings:readSetting("toc_items_per_page") or self.toc_items_per_page_default
+    end
+    return G_reader_settings:readSetting("toc_items_per_page_landscape")
+        or G_reader_settings:readSetting("toc_items_per_page") or self.toc_items_per_page_landscape_default
+end
+
 function ReaderToc:onShowToc()
-    self:fillToc()
-    -- build menu items
-    if #self.toc > 0 and not self.toc[1].text then
-        for _, v in ipairs(self.toc) do
-            v.text = self.toc_indent:rep(v.depth-1)..self:cleanUpTocTitle(v.title, true)
-            v.mandatory = v.page
-            if self.ui.document:hasHiddenFlows() then
-                local flow = self.ui.document:getPageFlow(v.page)
-                if v.orig_page then -- bogus page fixed: show original page number
-                    -- This is an ugly piece of code, which can result in an ugly TOC,
-                    -- but it shouldn't be needed very often, only when bogus page numbers
-                    -- are fixed, and then showing everything gets complicated
-                    local orig_flow = self.ui.document:getPageFlow(v.orig_page)
-                    if flow == 0 and orig_flow == flow then
-                        v.mandatory = T("(%1) %2", self.ui.document:getPageNumberInFlow(v.orig_page), self.ui.document:getPageNumberInFlow(v.page))
-                    elseif flow == 0 and orig_flow ~= flow then
-                        v.mandatory = T("[%1]%2", self.ui.document:getPageNumberInFlow(v.orig_page), self.ui.document:getPageFlow(v.orig_page))
-                    elseif flow > 0 and orig_flow == flow then
-                        v.mandatory = T("[(%1) %2]%3", self.ui.document:getPageNumberInFlow(v.orig_page),
-                                                       self.ui.document:getPageNumberInFlow(v.page), self.ui.document:getPageFlow(v.page))
-                    else
-                        v.mandatory = T("([%1]%2) [%3]%4", self.ui.document:getPageNumberInFlow(v.orig_page), self.ui.document:getPageFlow(v.orig_page),
-                                                           self.ui.document:getPageNumberInFlow(v.page), self.ui.document:getPageFlow(v.page))
-                    end
-                else
-                    -- Plain numbers for the linear entries,
-                    -- for non-linear entries we use the same syntax as in the Go to dialog
-                    if flow == 0 then
-                        v.mandatory = self.ui.document:getPageNumberInFlow(v.page)
-                    else
-                        v.mandatory = T("[%1]%2", self.ui.document:getPageNumberInFlow(v.page), self.ui.document:getPageFlow(v.page))
-                    end
-                end
-            elseif v.orig_page then -- bogus page fixed: show original page number
-                v.mandatory = T("(%1) %2", v.orig_page, v.page)
-            end
-            if self.ui.pagemap and self.ui.pagemap:wantsPageLabels() then
-                v.mandatory = self.ui.pagemap:getXPointerPageLabel(v.xpointer)
-            end
-        end
+    local screen_size = Screen:getSize()
+    if self.view:shouldInvertBiDiLayoutMirroring() then
+        BD.invert()
     end
 
-    local items_per_page = G_reader_settings:readSetting("toc_items_per_page") or self.toc_items_per_page_default
+    local items_per_page = self:getItemsPerPage(screen_size.h > screen_size.w)
     local items_font_size = G_reader_settings:readSetting("toc_items_font_size") or Menu.getItemFontSize(items_per_page)
-    local items_show_separator = G_reader_settings:isTrue("toc_items_show_separator")
+    local items_show_chapter_length = G_reader_settings:isTrue("toc_items_show_chapter_length")
+    local items_with_dots = G_reader_settings:nilOrTrue("toc_items_with_dots")
+
+    self:fillToc()
+    -- build menu items
+    if #self.toc > 0 and not self.toc_menu_items_built then
+        self.toc_menu_items_built = true
+        if items_show_chapter_length then
+            if self.ui.pagemap and self.ui.pagemap:wantsPageLabels() then
+                self:completeTocWithChapterLengthsFromPagemap()
+            else
+                self:completeTocWithChapterLengths()
+            end
+        end
+        -- Have the width of 4 spaces be the unit of indentation
+        self.toc_indent = TextWidget.getTextWidth("    ", Font:getFace("smallinfofont", items_font_size))
+        self:updateChaptersDisplayedTitlePageNumber()
+    end
+
     -- Estimate expand/collapse icon size
-    -- *2/5 to acount for Menu top title and bottom icons, and add some space between consecutive icons
-    local icon_size = math.floor(Screen:getHeight() / items_per_page * 2/5)
+    -- *2/5 to account for Menu top title and bottom icons, and add some space between consecutive icons
+    local icon_size = math.floor(screen_size.h / items_per_page * 2/5)
     local button_width = icon_size * 2
+    -- no_focus: expand/collapse is on the left/right keys, so the buttons don't need to take focus.
     self.expand_button = Button:new{
         icon = "control.expand",
         icon_rotation_angle = BD.mirroredUILayout() and 180 or 0,
@@ -655,7 +856,10 @@ function ReaderToc:onShowToc()
         icon_width = icon_size,
         icon_height = icon_size,
         bordersize = 0,
+        no_focus = true,
         show_parent = self,
+        callback = function(index) self:expandToc(index) end,
+        onTapSelectButton = function() end, -- pass through taps to onMenuSelect
     }
 
     self.collapse_button = Button:new{
@@ -664,7 +868,10 @@ function ReaderToc:onShowToc()
         icon_width = icon_size,
         icon_height = icon_size,
         bordersize = 0,
+        no_focus = true,
         show_parent = self,
+        callback = function(index) self:collapseToc(index) end,
+        onTapSelectButton = function() end, -- pass through taps to onMenuSelect
     }
 
     -- update collapsible state
@@ -674,16 +881,14 @@ function ReaderToc:onShowToc()
             local v = self.toc[i]
             -- node v has child node(s)
             if v.depth < depth then
-                v.state = self.expand_button:new{
-                    callback = function() self:expandToc(i) end,
-                    indent = self.toc_indent:rep(v.depth-1),
-                }
+                v.state = self.expand_button:new{}
             end
             if v.depth < self.collapse_depth then
                 table.insert(self.collapsed_toc, 1, v)
             end
             depth = v.depth
         end
+        self.filtered_toc = self.toc
     end
     local can_collapse = self:getMaxDepth() > 1
 
@@ -692,28 +897,32 @@ function ReaderToc:onShowToc()
     --       This yields *slightly* better alignment between state & mandatory (in terms of effective margins).
     local button_size = self.expand_button:getSize()
     local toc_menu = Menu:new{
-        title = _("Table of Contents"),
-        item_table = self.collapsed_toc,
-        state_size = can_collapse and button_size or nil,
+        title = self:getTitle(),
+        subtitle = self.search_string and T(_("Query: %1"), self.search_string)
+                                       or T(_("Current page: %1"), self.ui.bookinfo:expandString("%c")),
+        state_w = can_collapse and button_size.w or 0,
         ui = self.ui,
         is_borderless = true,
         is_popout = false,
-        width = Screen:getWidth(),
-        height = Screen:getHeight(),
-        cface = Font:getFace("x_smallinfofont"),
         single_line = true,
         align_baselines = true,
+        with_dots = items_with_dots,
         items_per_page = items_per_page,
         items_font_size = items_font_size,
         items_padding = can_collapse and math.floor(Size.padding.fullscreen / 2) or nil, -- c.f., note above. Menu's default is twice that.
-        line_color = items_show_separator and Blitbuffer.COLOR_DARK_GRAY or Blitbuffer.COLOR_WHITE,
+        line_color = Blitbuffer.COLOR_WHITE,
+        title_bar_fm_style = true,
+        title_bar_left_icon = "appbar.menu",
+        onLeftButtonTap = function()
+            self:showTocDialog()
+        end,
         on_close_ges = {
             GestureRange:new{
                 ges = "two_finger_swipe",
                 range = Geom:new{
                     x = 0, y = 0,
-                    w = Screen:getWidth(),
-                    h = Screen:getHeight(),
+                    w = screen_size.w,
+                    h = screen_size.h,
                 },
                 direction = BD.flipDirectionIfMirroredUILayout("west")
             }
@@ -721,7 +930,7 @@ function ReaderToc:onShowToc()
     }
 
     local menu_container = CenterContainer:new{
-        dimen = Screen:getSize(),
+        dimen = screen_size,
         covers_fullscreen = true, -- hint for UIManager:_repaint()
         toc_menu,
     }
@@ -738,7 +947,7 @@ function ReaderToc:onShowToc()
             end
         end
         if do_toggle_state then
-            item.state.callback()
+            item.state.callback(item.index)
         else
             toc_menu:close_callback()
             self.ui.link:addCurrentLocationToStack()
@@ -751,21 +960,117 @@ function ReaderToc:onShowToc()
     end
 
     function toc_menu:onMenuHold(item)
-        -- Trim toc_indent
-        local trimmed_text = util.ltrim(item.text)
-        -- Match the items' width
-        local infomessage = InfoMessage:new{
-            width = Screen:getWidth() - (Size.padding.fullscreen * (can_collapse and 4 or 3)),
-            alignment = "center",
-            show_icon = false,
-            text = trimmed_text,
-        }
-        UIManager:show(infomessage)
+        if not Device:isTouchDevice() and (item.state and item.state.callback) then
+            -- non touch to expand toc
+            item.state.callback(item.index)
+        else
+            if self.ui.handmade:isHandmadeHiddenFlowsEnabled() and self.ui.handmade:isHandmadeHiddenFlowsEditEnabled() then
+                local chapter_start = item.page
+                local chapter_end
+                if item.chapter_length then
+                    chapter_end = chapter_start + item.chapter_length - 1
+                else
+                    local next_start = self.ui.toc:getNextChapter(chapter_start)
+                    chapter_end = next_start and next_start - 1 or self.ui.document:getPageCount()
+                end
+                local toc_hide_dialog
+                local function updateToc()
+                    UIManager:close(toc_hide_dialog)
+                    self.ui.toc:updateChaptersDisplayedTitlePageNumber()
+                    self:switchItemTable(nil, nil, -1)
+                end
+                toc_hide_dialog = ButtonDialog:new{
+                    title = item.text,
+                    title_align = "center",
+                    width_factor = 0.8,
+                    buttons = {
+                        {
+                            {
+                                text = _("Include all chapters in regular flow"),
+                                enabled = self.ui.document:hasHiddenFlows(),
+                                callback = function()
+                                    self.ui.handmade:includeAllPagesInRegularFlow()
+                                    updateToc()
+                                end,
+                            },
+                        },
+                        {
+                            {
+                                text = _("Include chapter in regular flow"),
+                                enabled = self.ui.document:hasHiddenFlows(),
+                                callback = function()
+                                    self.ui.handmade:includePagesInRegularOrHiddenFlow(chapter_start, chapter_end)
+                                    updateToc()
+                                end,
+                            },
+                        },
+                        {
+                            {
+                                text = _("Include chapter in hidden flow"),
+                                callback = function()
+                                    self.ui.handmade:includePagesInRegularOrHiddenFlow(chapter_start, chapter_end, true)
+                                    updateToc()
+                                end,
+                            },
+                        },
+                    },
+                }
+                UIManager:show(toc_hide_dialog)
+            else
+                -- Match the items' width
+                UIManager:show(InfoMessage:new{
+                    width = screen_size.w - (Size.padding.fullscreen * (can_collapse and 4 or 3)),
+                    alignment = "center",
+                    show_icon = false,
+                    text = item.text,
+                    face = Font:getFace("infofont", self.items_font_size),
+                })
+            end
+        end
+        return true
+    end
+
+    -- Tree-view idiom: right arrow key expands the focused node, left collapses
+    -- it (swapped in mirrored UI layout). Replaces the horizontal focus moves,
+    -- no-ops in this single-column menu; hasFewKeys devices use these keys otherwise.
+    -- Runs again whenever the focus keys are rebuilt, e.g. when a hot-plugged
+    -- keyboard brings a D-Pad along.
+    toc_menu.focus_keys_callback = function(menu)
+        if not Device:hasDPad() or Device:hasFewKeys() then
+            menu.key_events.ExpandCurrentNode = nil
+            menu.key_events.CollapseCurrentNode = nil
+            return
+        end
+        menu:releaseFocusKeys("FocusLeft", "FocusRight")
+        local mirrored = BD.mirroredUILayout()
+        local expand_key = mirrored and "Left" or "Right"
+        local collapse_key = mirrored and "Right" or "Left"
+        menu.key_events.ExpandCurrentNode = { { expand_key } }
+        menu.key_events.CollapseCurrentNode = { { collapse_key } }
+    end
+    toc_menu:focus_keys_callback()
+
+    toc_menu.onExpandCurrentNode = function(menu)
+        local focused_widget = menu:getFocusItem()
+        local item = focused_widget and focused_widget.entry
+        if item and item.state and item.state.icon == "control.expand" then
+            self:expandToc(item.index, true)
+        end
+        return true
+    end
+
+    toc_menu.onCollapseCurrentNode = function(menu)
+        local focused_widget = menu:getFocusItem()
+        local item = focused_widget and focused_widget.entry
+        if item and item.state and item.state.icon == "control.collapse" then
+            self:collapseToc(item.index, true)
+        end
         return true
     end
 
     toc_menu.close_callback = function()
         UIManager:close(menu_container)
+        BD.resetInvert()
     end
 
     toc_menu.show_parent = menu_container
@@ -773,16 +1078,22 @@ function ReaderToc:onShowToc()
     self.toc_menu = toc_menu
 
     self:updateCurrentNode()
-    -- auto expand the parent node of current page
-    local idx = self:getTocIndexByPage(self.pageno)
-    if idx then
-        self:expandParentNode(idx)
-        -- Also do it for other toc items on current page
-        idx = idx + 1
-        while self.toc[idx] and self.toc[idx].page == self.pageno do
+    if self.search_string == nil then
+        -- auto expand the parent node of current page
+        local idx = self:getTocIndexByPage(self.pageno)
+        if idx then
             self:expandParentNode(idx)
+            -- Also do it for other toc items on current page
             idx = idx + 1
+            while self.toc[idx] and self.toc[idx].page == self.pageno do
+                self:expandParentNode(idx)
+                idx = idx + 1
+            end
         end
+    end
+
+    if self.collapsed_toc.current then
+        self:refocusTocNode(self.collapsed_toc[self.collapsed_toc.current])
     end
 
     -- auto goto page of the current toc entry
@@ -793,13 +1104,250 @@ function ReaderToc:onShowToc()
     return true
 end
 
--- expand TOC node of index in raw toc table
-function ReaderToc:expandToc(index)
-    for k, v in ipairs(self.expanded_nodes) do
-        if v == index then return end
+function ReaderToc:updateChaptersDisplayedTitlePageNumber()
+    local items_show_chapter_length = G_reader_settings:isTrue("toc_items_show_chapter_length")
+    local has_hidden_flows = self.ui.document:hasHiddenFlows()
+    for k, v in ipairs(self.toc) do
+        v.index = k
+        v.indent = self.toc_indent * (v.depth-1)
+        v.text = self:cleanUpTocTitle(v.title, true)
+        if items_show_chapter_length then
+            v.post_text = T("(%1)", v.chapter_length)
+        else
+            v.post_text = nil
+        end
+        v.bidi_wrap_func = BD.auto
+        v.mandatory = v.page
+        if has_hidden_flows then
+            local flow = self.ui.document:getPageFlow(v.page)
+            if v.orig_page then -- bogus page fixed: show original page number
+                -- This is an ugly piece of code, which can result in an ugly TOC,
+                -- but it shouldn't be needed very often, only when bogus page numbers
+                -- are fixed, and then showing everything gets complicated
+                local orig_flow = self.ui.document:getPageFlow(v.orig_page)
+                if flow == 0 and orig_flow == flow then
+                    v.mandatory = T("(%1) %2", self.ui.document:getPageNumberInFlow(v.orig_page), self.ui.document:getPageNumberInFlow(v.page))
+                elseif flow == 0 and orig_flow ~= flow then
+                    v.mandatory = T("[%1]%2", self.ui.document:getPageNumberInFlow(v.orig_page), self.ui.document:getPageFlow(v.orig_page))
+                elseif flow > 0 and orig_flow == flow then
+                    v.mandatory = T("[(%1) %2]%3", self.ui.document:getPageNumberInFlow(v.orig_page),
+                                                   self.ui.document:getPageNumberInFlow(v.page), self.ui.document:getPageFlow(v.page))
+                else
+                    v.mandatory = T("([%1]%2) [%3]%4", self.ui.document:getPageNumberInFlow(v.orig_page), self.ui.document:getPageFlow(v.orig_page),
+                                                       self.ui.document:getPageNumberInFlow(v.page), self.ui.document:getPageFlow(v.page))
+                end
+            else
+                -- Plain numbers for the linear entries,
+                -- for non-linear entries we use the same syntax as in the Go to dialog
+                if flow == 0 then
+                    v.mandatory = self.ui.document:getPageNumberInFlow(v.page)
+                else
+                    v.mandatory = T("[%1]%2", self.ui.document:getPageNumberInFlow(v.page), self.ui.document:getPageFlow(v.page))
+                end
+            end
+        elseif v.orig_page then -- bogus page fixed: show original page number
+            v.mandatory = T("(%1) %2", v.orig_page, v.page)
+        end
+        if self.ui.pagemap and self.ui.pagemap:wantsPageLabels() then
+            v.mandatory = self.ui.pagemap:getXPointerPageLabel(v.xpointer)
+        end
     end
-    table.insert(self.expanded_nodes, index)
-    local cur_node = self.toc[index]
+end
+
+function ReaderToc:showTocDialog()
+    local dialog
+    local buttons = {
+        {{
+            text = self.search_string and _("Show full ToC") or "\u{f002} " .. _("Search"), -- 'magnifying glass' sign
+            align = "left",
+            enabled = #self.toc > 0,
+            callback = function()
+                UIManager:close(dialog)
+                self:searchToc()
+            end,
+        }},
+        {}, -- separator
+        {{
+            text_func = function()
+                return T(_("Entries per page: %1"), self:getItemsPerPage())
+            end,
+            align = "left",
+            callback = function()
+                UIManager:close(dialog)
+                local DoubleSpinWidget = require("ui/widget/doublespinwidget")
+                UIManager:show(DoubleSpinWidget:new{
+                    title_text =  _("Entries per page"),
+                    width_factor = 0.6,
+                    left_text = _("Portrait"),
+                    left_value = self:getItemsPerPage(true),
+                    left_min = 5,
+                    left_max = 50,
+                    left_default = self.toc_items_per_page_default,
+                    right_text = _("Landscape"),
+                    right_value = self:getItemsPerPage(false),
+                    right_min = 5,
+                    right_max = 30,
+                    right_default = self.toc_items_per_page_landscape_default,
+                    callback = function(left_value, right_value)
+                        G_reader_settings:saveSetting("toc_items_per_page", left_value)
+                        G_reader_settings:saveSetting("toc_items_per_page_landscape", right_value)
+                        -- We need to reset the TOC so cached expand/collapsed icons
+                        -- instances (as item.state), which were sized for a previous
+                        -- value or items_per_page, are forgotten.
+                        self:resetToc()
+                        self.toc_menu.close_callback()
+                        self:onShowToc()
+                    end,
+                })
+            end,
+        }},
+        {{
+            text_func = function()
+                local curr_font_size = G_reader_settings:readSetting("toc_items_font_size")
+                    or Menu.getItemFontSize(self:getItemsPerPage())
+                return T(_("Entry font size: %1"), curr_font_size)
+            end,
+            align = "left",
+            callback = function()
+                UIManager:close(dialog)
+                local default_font_size = Menu.getItemFontSize(self:getItemsPerPage())
+                local curr_font_size = G_reader_settings:readSetting("toc_items_font_size") or default_font_size
+                local SpinWidget = require("ui/widget/spinwidget")
+                UIManager:show(SpinWidget:new{
+                    title_text = _("Entry font size"),
+                    value = curr_font_size,
+                    value_min = 10,
+                    value_max = 72,
+                    default_value = default_font_size,
+                    callback = function(spin)
+                        G_reader_settings:saveSetting("toc_items_font_size", spin.value)
+                        self.toc_menu.close_callback()
+                        self:onShowToc()
+                    end
+                })
+            end,
+        }},
+        {{
+            text = _("Show chapter length"),
+            align = "left",
+            checked_func = function()
+                return not G_reader_settings:nilOrFalse("toc_items_show_chapter_length")
+            end,
+            no_refresh_checkmark = true,
+            callback = function()
+                UIManager:close(dialog)
+                G_reader_settings:flipNilOrFalse("toc_items_show_chapter_length")
+                self.toc_menu_items_built = false
+                self.toc_menu.close_callback()
+                self:onShowToc()
+            end,
+        }},
+        {{
+            text = _("Show dot leaders"),
+            align = "left",
+            checked_func = function()
+                return G_reader_settings:nilOrTrue("toc_items_with_dots")
+            end,
+            no_refresh_checkmark = true,
+            callback = function()
+                UIManager:close(dialog)
+                G_reader_settings:flipNilOrTrue("toc_items_with_dots")
+                self.toc_menu.close_callback()
+                self:onShowToc()
+            end,
+        }},
+    }
+    dialog = ButtonDialog:new{
+        shrink_unneeded_width = true,
+        buttons = buttons,
+        anchor = function()
+            return self.toc_menu.title_bar.left_button.image.dimen
+        end,
+    }
+    UIManager:show(dialog)
+end
+
+function ReaderToc:searchToc()
+    if self.search_string then -- restore full ToC
+        self.search_string = nil
+        self.toc_menu_items_built = false
+        self.expanded_nodes = {}
+        self.collapsed_toc = {}
+        self.toc_menu.close_callback()
+        self:onShowToc()
+        return
+    end
+
+    local input_dialog
+    input_dialog = InputDialog:new{
+        title =  _("Enter text to search for"),
+        buttons = {{
+            {
+                text = _("Cancel"),
+                id = "close",
+                callback = function()
+                    UIManager:close(input_dialog)
+                end,
+            },
+            {
+                text = _("Search"),
+                callback = function()
+                    local str = input_dialog:getInputText()
+                    if str == "" then return end
+                    UIManager:close(input_dialog)
+                    local collapsed_toc, expanded_nodes = {}, {}
+                    local depth = 0
+                    for i = #self.toc, 1, -1 do
+                        local v = self.toc[i]
+                        if v.depth < depth or str == "*" or util.stringSearch(v.title, str) ~= 0 then
+                            if v.depth < depth then
+                                v.state = self.collapse_button:new{}
+                                expanded_nodes[i] = true
+                            end
+                            table.insert(collapsed_toc, 1, v)
+                            depth = v.depth
+                        end
+                    end
+                    if #collapsed_toc > 0 then
+                        self.search_string = str
+                        self.filtered_toc = {}
+                        for i, v in ipairs(collapsed_toc) do
+                            v.index = i
+                            self.filtered_toc[i] = v
+                        end
+                        self.collapsed_toc = collapsed_toc
+                        self.expanded_nodes = expanded_nodes
+                        self.toc_menu.close_callback()
+                        self:onShowToc()
+                    else
+                        UIManager:show(InfoMessage:new{ text = _("No results in table of contents") })
+                    end
+                end,
+            },
+        }},
+    }
+    UIManager:show(input_dialog)
+    input_dialog:onShowKeyboard()
+end
+
+-- Keep the focus on the toggled node across the menu rebuild.
+function ReaderToc:refocusTocNode(node)
+    if not Device:hasDPad() then return end
+    for i, v in ipairs(self.collapsed_toc) do
+        if v == node then
+            self.toc_menu.itemnumber = i
+            break
+        end
+    end
+end
+
+-- expand TOC node of index in raw toc table
+-- refocus: keep the focus even on touch-capable devices (set by key-driven callers)
+function ReaderToc:expandToc(index, refocus)
+    if self.expanded_nodes[index] == true then return end
+
+    self.expanded_nodes[index] = true
+    local cur_node = self.filtered_toc[index]
     local cur_depth = cur_node.depth
     local collapsed_index = nil
     for i, v in ipairs(self.collapsed_toc) do
@@ -812,8 +1360,8 @@ function ReaderToc:expandToc(index)
     -- either the toc entry of index has no child nodes
     -- or it's parent nodes are not expanded yet
     if not collapsed_index then return end
-    for i = index + 1, #self.toc do
-        local v = self.toc[i]
+    for i = index + 1, #self.filtered_toc do
+        local v = self.filtered_toc[i]
         if v.depth == cur_depth + 1 then
             collapsed_index = collapsed_index + 1
             table.insert(self.collapsed_toc, collapsed_index, v)
@@ -822,23 +1370,22 @@ function ReaderToc:expandToc(index)
         end
     end
     -- change state of current node to expanded
-    cur_node.state = self.collapse_button:new{
-        callback = function() self:collapseToc(index) end,
-        indent = self.toc_indent:rep(cur_depth-1),
-    }
+    if cur_node.state then cur_node.state:free() end
+    cur_node.state = self.collapse_button:new{}
     self:updateCurrentNode()
+    if refocus or not Device:isTouchDevice() then
+        self:refocusTocNode(cur_node)
+    end
     self.toc_menu:switchItemTable(nil, self.collapsed_toc, -1)
 end
 
 -- collapse TOC node of index in raw toc table
-function ReaderToc:collapseToc(index)
-    for k, v in ipairs(self.expanded_nodes) do
-        if v == index then
-            table.remove(self.expanded_nodes, k)
-            break
-        end
+-- refocus: see expandToc
+function ReaderToc:collapseToc(index, refocus)
+    if self.expanded_nodes[index] == true then
+        self.expanded_nodes[index] = nil
     end
-    local cur_node = self.toc[index]
+    local cur_node = self.filtered_toc[index]
     local cur_depth = cur_node.depth
     local i = 1
     local is_child_node = false
@@ -848,6 +1395,13 @@ function ReaderToc:collapseToc(index)
             is_child_node = false
         end
         if is_child_node then
+            if v.state then
+                v.state:free()
+                v.state = self.expand_button:new{}
+                if self.expanded_nodes[v.index] == true then
+                    self.expanded_nodes[v.index] = nil
+                end
+            end
             table.remove(self.collapsed_toc, i)
         else
             i = i + 1
@@ -858,11 +1412,12 @@ function ReaderToc:collapseToc(index)
         end
     end
     -- change state of current node to collapsed
-    cur_node.state = self.expand_button:new{
-        callback = function() self:expandToc(index) end,
-        indent = self.toc_indent:rep(cur_depth-1),
-    }
+    cur_node.state:free()
+    cur_node.state = self.expand_button:new{}
     self:updateCurrentNode()
+    if refocus or not Device:isTouchDevice() then
+        self:refocusTocNode(cur_node)
+    end
     self.toc_menu:switchItemTable(nil, self.collapsed_toc, -1)
 end
 
@@ -870,7 +1425,7 @@ function ReaderToc:addToMainMenu(menu_items)
     -- insert table to main reader menu
     menu_items.table_of_contents = {
         text_func = function()
-            return self.ui.document:isTocAlternativeToc() and self.alt_toc_menu_title or self.toc_menu_title
+            return self:getTitle()
         end,
         callback = function()
             self:onShowToc()
@@ -883,16 +1438,26 @@ function ReaderToc:addToMainMenu(menu_items)
     -- Alternative ToC (only available with CRE documents)
     if self.ui.document:canHaveAlternativeToc() then
         menu_items.toc_alt_toc = {
-            text = _("Alternative table of contents"),
-            help_text = _([[
+            text = _("Alternative table of contents") .. " " .. self.alt_toc_symbol,
+            help_text_func = function()
+                local help_text = _([[
 An alternative table of contents can be built from document headings <H1> to <H6>.
 If the document contains no headings, or all are ignored, the alternative ToC will be built from document fragments and will point to the start of each individual HTML file in the EPUB.
 
 Some of the headings can be ignored, and hints can be set to other non-heading elements in a user style tweak, so they can be used as ToC items.
-See Style tweaks → Miscellaneous → Alternative ToC hints.]]),
+See Style tweaks → Miscellaneous → Alternative ToC hints.]])
+                if self.ui.handmade:isHandmadeTocEnabled() then
+                    help_text = _([[To use the alternative ToC, disable your custom table of contents first.]]) .. "\n\n" .. help_text
+                end
+                return help_text
+            end,
+            enabled_func = function()
+                return not self.ui.handmade:isHandmadeTocEnabled()
+            end,
             checked_func = function()
                 return self.ui.document:isTocAlternativeToc()
             end,
+            check_callback_closes_menu = true,
             callback = function(touchmenu_instance)
                 if self.ui.document:isTocAlternativeToc() then
                     UIManager:show(ConfirmBox:new{
@@ -938,7 +1503,7 @@ See Style tweaks → Miscellaneous → Alternative ToC hints.]]),
         end
         return {
             text_func = function()
-                return T(_("%1 entries at ToC depth %2"), #ticks[level], level)
+                return T(N_("1 entry at ToC depth %2", "%1 entries at ToC depth %2", #ticks[level]), #ticks[level], level)
             end,
             checked_func = function()
                 return not self.toc_ticks_ignored_levels[level]
@@ -960,7 +1525,7 @@ See Style tweaks → Miscellaneous → Alternative ToC hints.]]),
                     nb_ticks = nb_ticks + #ticks[level]
                 end
             end
-            return T(_("Progress bars: %1 ticks"), nb_ticks)
+            return T(N_("Progress bars: 1 tick", "Progress bars: %1 ticks", nb_ticks), nb_ticks)
         end,
         help_text = _([[The progress bars in the footer and the skim dialog can become cramped when the table of contents is complex. This allows you to restrict the number of tick marks.]]),
         enabled_func = function()
@@ -1015,62 +1580,6 @@ Enabling this option will restrict display to the chapter titles of progress bar
             })
             return toc_ticks_levels
         end,
-    }
-    menu_items.toc_items_per_page = {
-        text = _("ToC entries per page"),
-        keep_menu_open = true,
-        callback = function()
-            local SpinWidget = require("ui/widget/spinwidget")
-            local curr_perpage = G_reader_settings:readSetting("toc_items_per_page") or self.toc_items_per_page_default
-            local items = SpinWidget:new{
-                width = math.floor(Screen:getWidth() * 0.6),
-                value = curr_perpage,
-                value_min = 6,
-                value_max = 24,
-                default_value = self.toc_items_per_page_default,
-                title_text =  _("ToC entries per page"),
-                callback = function(spin)
-                    G_reader_settings:saveSetting("toc_items_per_page", spin.value)
-                    -- We need to reset the TOC so cached expand/collapsed icons
-                    -- instances (as item.state), which were sized for a previous
-                    -- value or items_per_page, are forgotten.
-                    self:resetToc()
-                end
-            }
-            UIManager:show(items)
-        end
-    }
-    menu_items.toc_items_font_size = {
-        text = _("ToC entry font size"),
-        keep_menu_open = true,
-        callback = function()
-            local SpinWidget = require("ui/widget/spinwidget")
-            local curr_perpage = G_reader_settings:readSetting("toc_items_per_page") or self.toc_items_per_page_default
-            local default_font_size = Menu.getItemFontSize(curr_perpage)
-            local curr_font_size = G_reader_settings:readSetting("toc_items_font_size") or default_font_size
-            local items_font = SpinWidget:new{
-                width = math.floor(Screen:getWidth() * 0.6),
-                value = curr_font_size,
-                value_min = 10,
-                value_max = 72,
-                default_value = default_font_size,
-                title_text =  _("ToC entry font size"),
-                callback = function(spin)
-                    G_reader_settings:saveSetting("toc_items_font_size", spin.value)
-                end
-            }
-            UIManager:show(items_font)
-        end,
-    }
-    menu_items.toc_items_show_separator = {
-        text = _("Add a separator between ToC entries"),
-        keep_menu_open = true,
-        checked_func = function()
-            return G_reader_settings:isTrue("toc_items_show_separator")
-        end,
-        callback = function()
-            G_reader_settings:flipNilOrFalse("toc_items_show_separator")
-        end
     }
 end
 

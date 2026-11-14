@@ -13,27 +13,41 @@ position, Hold will toggle between full opacity and 0.7 transparency.
 This container's content is expected to not change its width and height.
 ]]
 
+local BD = require("ui/bidi")
 local Blitbuffer = require("ffi/blitbuffer")
 local Device = require("device")
 local Geom = require("ui/geometry")
 local GestureRange = require("ui/gesturerange")
 local InputContainer = require("ui/widget/container/inputcontainer")
 local Math = require("optmath")
+local Size = require("ui/size")
 local UIManager = require("ui/uimanager")
 local Screen = Device.screen
 local logger = require("logger")
 
-local MovableContainer = InputContainer:new{
+local MovableContainer = InputContainer:extend{
     -- Alpha value for subwidget transparency
     -- 0 = fully invisible, 1 = fully opaque (0.6 / 0.7 / 0.8 are some interesting values)
     alpha = nil,
 
     -- Move threshold (if move distance less than that, considered as a Hold
-    -- with no movement, used for reseting move to original position)
+    -- with no movement, used for resetting move to original position)
     move_threshold = Screen:scaleBySize(5),
 
     -- Events to ignore (ie: ignore_events={"hold", "hold_release"})
     ignore_events = nil,
+
+    -- This can be passed if a MovableContainer should be present (as a no-op),
+    -- so we don't need to change the widget layout.
+    unmovable = nil,
+    -- Whether this container should be movable with keyboard/dpad
+    is_movable_with_keys = true,
+
+    -- Initial position can be set related to an existing widget
+    -- 'anchor' should be a Geom object (a widget's 'dimen', or a point), and
+    -- can be a function returning that object
+    anchor = nil,
+    _anchor_ensured = nil,
 
     -- Current move offset (use getMovedOffset()/setMovedOffset() to access them)
     _moved_offset_x = 0,
@@ -52,7 +66,14 @@ local MovableContainer = InputContainer:new{
 }
 
 function MovableContainer:init()
-    if Device:isTouchDevice() then
+    if Device:hasKeys() and self.is_movable_with_keys then
+        if Device:hasKeyboard() or Device:hasScreenKB() then
+            local modifier = Device:hasScreenKB() and "ScreenKB" or "Shift"
+            self.key_events.MovePositionTop     = { { modifier, "Up" },    event = "MovePosition", args = true }
+            self.key_events.MovePositionBottom  = { { modifier, "Down" },  event = "MovePosition", args = false }
+        end
+    end
+    if Device:isTouchDevice() and not self.unmovable then
         local range = Geom:new{
             x = 0, y = 0,
             w = Screen:getWidth(),
@@ -74,14 +95,15 @@ function MovableContainer:init()
         -- which is somehow nice and gives a kind of magnetic move that
         -- stick the widget to some invisible rulers.
         -- (Touch is needed for accurate pan)
-        self.ges_events = {}
-        self.ges_events.MovableTouch = not ignore.touch and { GestureRange:new{ ges = "touch", range = range } } or nil
-        self.ges_events.MovableSwipe = not ignore.swipe and { GestureRange:new{ ges = "swipe", range = range } } or nil
-        self.ges_events.MovableHold = not ignore.hold and { GestureRange:new{ ges = "hold", range = range } } or nil
-        self.ges_events.MovableHoldPan = not ignore.hold_pan and { GestureRange:new{ ges = "hold_pan", range = range } } or nil
-        self.ges_events.MovableHoldRelease = not ignore.hold_release and { GestureRange:new{ ges = "hold_release", range = range } } or nil
-        self.ges_events.MovablePan = not ignore.pan and { GestureRange:new{ ges = "pan", range = range } } or nil
-        self.ges_events.MovablePanRelease = not ignore.pan_release and { GestureRange:new{ ges = "pan_release", range = range } } or nil
+        self.ges_events = {
+            MovableTouch       = not ignore.touch        and { GestureRange:new{ ges = "touch", range = range } } or nil,
+            MovableSwipe       = not ignore.swipe        and { GestureRange:new{ ges = "swipe", range = range } } or nil,
+            MovableHold        = not ignore.hold         and { GestureRange:new{ ges = "hold", range = range } } or nil,
+            MovableHoldPan     = not ignore.hold_pan     and { GestureRange:new{ ges = "hold_pan", range = range } } or nil,
+            MovableHoldRelease = not ignore.hold_release and { GestureRange:new{ ges = "hold_release", range = range } } or nil,
+            MovablePan         = not ignore.pan          and { GestureRange:new{ ges = "pan", range = range } } or nil,
+            MovablePanRelease  = not ignore.pan_release  and { GestureRange:new{ ges = "pan_release", range = range } } or nil,
+        }
     end
 end
 
@@ -99,6 +121,63 @@ function MovableContainer:setMovedOffset(offset_point)
     end
 end
 
+function MovableContainer:ensureAnchor(x, y)
+    local anchor_dimen = self.anchor
+    local prefers_pop_down
+    if type(self.anchor) == "function" then
+        anchor_dimen, prefers_pop_down = self.anchor()
+    end
+    if not anchor_dimen then
+        return
+    end
+    -- We try to find the best way to draw our content, depending on
+    -- the size of the content and the space available on the screen.
+    local content_w, content_h = self.dimen.w, self.dimen.h
+    local screen_w, screen_h = Screen:getWidth(), Screen:getHeight()
+    anchor_dimen.x = anchor_dimen.x or math.floor((screen_w - content_w) / 2) -- center by defualt
+    anchor_dimen.y = anchor_dimen.y or math.floor((screen_h - content_h) / 2)
+    anchor_dimen.w = anchor_dimen.w or 0
+    anchor_dimen.h = anchor_dimen.h or 0
+    local left, top
+    if BD.mirroredUILayout() then
+        left = anchor_dimen.x + anchor_dimen.w - content_w
+    else
+        left = anchor_dimen.x
+    end
+    if left < 0 then
+        left = 0
+    elseif left + content_w > screen_w then
+        left = screen_w - content_w
+    end
+    -- We prefer displaying above the anchor if there is room (so it looks like popping up)
+    -- except if anchor() returned prefers_pop_down
+    local h_remaining_if_above = anchor_dimen.y - content_h
+    local h_remaining_if_below = screen_h - (anchor_dimen.y + anchor_dimen.h + content_h)
+    if h_remaining_if_above >= 0 and not prefers_pop_down then
+        -- Enough room above the anchor
+        top = anchor_dimen.y - content_h
+    elseif h_remaining_if_below >= 0 then
+        -- Enough room below the anchor
+        top = anchor_dimen.y + anchor_dimen.h
+    elseif h_remaining_if_above >= 0 then
+        -- Enough room above the anchor
+        top = anchor_dimen.y - content_h
+    else -- both negative
+        if h_remaining_if_above >= h_remaining_if_below then
+            top = 0
+        else
+            top = screen_h - content_h
+        end
+    end
+    -- Ensure we show the top if we would overflow
+    if top < 0 then
+        top = 0
+    end
+    -- Make the initial offsets so that we display at left/top
+    self._moved_offset_x = left - x
+    self._moved_offset_y = top - y
+end
+
 function MovableContainer:paintTo(bb, x, y)
     if self[1] == nil then
         return
@@ -106,11 +185,17 @@ function MovableContainer:paintTo(bb, x, y)
 
     local content_size = self[1]:getSize()
     if not self.dimen then
-        self.dimen = Geom:new{w = content_size.w, h = content_size.h}
+        self.dimen = Geom:new{x = 0, y = 0, w = content_size.w, h = content_size.h}
     end
 
     self._orig_x = x
     self._orig_y = y
+    -- If there is a widget passed as anchor, we need to set our initial position
+    -- related to it. After that, we allow it to be moved like any other movable.
+    if self.anchor and not self._anchor_ensured then
+        self:ensureAnchor(x, y)
+        self._anchor_ensured = true
+    end
     -- We just need to shift painting by our _moved_offset_x/y
     self.dimen.x = x + self._moved_offset_x
     self.dimen.y = y + self._moved_offset_y
@@ -339,6 +424,35 @@ function MovableContainer:onMovablePanRelease(_, ges)
         return true
     end
     return false
+end
+
+function MovableContainer:resetEventState()
+    -- Cancel some internal moving-or-about-to-move state.
+    -- Can be called explicitly to prevent bad widget interactions.
+    self._touch_pre_pan_was_inside = false
+    self._moving = false
+end
+
+function MovableContainer:onMovePosition(move_to_top)
+    if not self.is_movable_with_keys then return false end
+    local screen_h = Screen:getHeight()
+    local dialog_h = self.dimen.h
+    local padding = Size.padding.small
+    local new_y
+    if move_to_top then
+        new_y = padding
+    else -- move to the bottom
+        new_y = screen_h - dialog_h - padding
+    end
+    -- Calculate the offset required to position the container at new_y
+    local offset = Geom:new{
+        x = self._moved_offset_x, -- keep current x offset
+        y = new_y - self._orig_y,  -- set new y offset
+    }
+    self:setMovedOffset(offset)
+    -- Force a complete screen redraw to ensure the old position is cleared
+    UIManager:setDirty("all", "ui")
+    return true
 end
 
 return MovableContainer

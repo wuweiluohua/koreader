@@ -1,59 +1,36 @@
-local InfoMessage = require("ui/widget/infomessage")
-local UIManager = require("ui/uimanager")
 local _ = require("gettext")
 
-local function activateMenu() return G_reader_settings:readSetting("activate_menu") end
+local ui = require("apps/reader/readerui").instance or require("apps/filemanager/filemanager").instance
 
 return {
     text = _("Activate menu"),
     sub_item_table = {
         {
-            text = _("Swipe and tap"),
+            text = _("With a tap"),
             checked_func = function()
-                local activate_menu = activateMenu()
-                if activate_menu == nil or activate_menu == "swipe_tap" then
-                    return true
-                else
-                    return false
-                end
+                return G_reader_settings:readSetting("activate_menu") ~= "swipe"
             end,
             callback = function()
-                G_reader_settings:saveSetting("activate_menu", "swipe_tap")
-                UIManager:show(InfoMessage:new{
-                    text = _("This will take effect on next restart."),
-                })
-            end
+                local value = G_reader_settings:readSetting("activate_menu") ~= "swipe" and "swipe" or "swipe_tap"
+                G_reader_settings:saveSetting("activate_menu", value)
+                ui.menu.activation_menu = value
+                if ui.config then
+                    ui.config.activation_menu = value
+                end
+            end,
         },
         {
-            text = _("Only swipe"),
+            text = _("With a swipe"),
             checked_func = function()
-                if activateMenu() == "swipe" then
-                    return true
-                else
-                    return false
-                end
+                return G_reader_settings:readSetting("activate_menu") ~= "tap"
             end,
             callback = function()
-                G_reader_settings:saveSetting("activate_menu", "swipe")
-                UIManager:show(InfoMessage:new{
-                    text = _("This will take effect on next restart."),
-                })
-            end
-        },
-        {
-            text = _("Only tap"),
-            checked_func = function()
-                if activateMenu() == "tap" then
-                    return true
-                else
-                    return false
+                local value = G_reader_settings:readSetting("activate_menu") ~= "tap" and "tap" or "swipe_tap"
+                G_reader_settings:saveSetting("activate_menu", value)
+                ui.menu.activation_menu = value
+                if ui.config then
+                    ui.config.activation_menu = value
                 end
-            end,
-            callback = function()
-                G_reader_settings:saveSetting("activate_menu", "tap")
-                UIManager:show(InfoMessage:new{
-                    text = _("This will take effect on next restart."),
-                })
             end,
             separator = true,
         },

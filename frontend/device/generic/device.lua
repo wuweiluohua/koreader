@@ -5,64 +5,140 @@ This module defines stubs for common methods.
 --]]
 
 local DataStorage = require("datastorage")
+local Event = require("ui/event")
+local Geom = require("ui/geometry")
+local NetInfo = require("ffi/netinfo")
+local UIManager -- Updated on UIManager init
 local logger = require("logger")
+local ffi = require("ffi")
+local time = require("ui/time")
 local util = require("util")
 local _ = require("gettext")
-local T = require("ffi/util").template
+local ffiUtil = require("ffi/util")
+local C = ffi.C
+local T = ffiUtil.template
+
+-- We'll need a bunch of stuff for getifaddrs & co in Device:retrieveNetworkInfo
+require("ffi/posix_h")
+
+ffi.cdef[[
+struct icmp_echo {
+  uint8_t type;
+  uint8_t code;
+  uint16_t checksum;
+  uint16_t id;
+  uint16_t sequence;
+};
+]]
+
+if ffi.abi("le") then
+    ffi.cdef[[
+struct ip_header
+{
+    unsigned int ihl:4;
+    unsigned int version:4;
+    uint8_t tos;
+    uint16_t tot_len;
+    uint16_t id;
+    uint16_t frag_off;
+    uint8_t ttl;
+    uint8_t protocol;
+    uint16_t check;
+    uint32_t saddr;
+    uint32_t daddr;
+  };
+]]
+else
+    ffi.cdef[[
+struct ip_header
+{
+    unsigned int version:4;
+    unsigned int ihl:4;
+    uint8_t tos;
+    uint16_t tot_len;
+    uint16_t id;
+    uint16_t frag_off;
+    uint8_t ttl;
+    uint8_t protocol;
+    uint16_t check;
+    uint32_t saddr;
+    uint32_t daddr;
+  };
+]]
+end
 
 local function yes() return true end
 local function no() return false end
 
 local Device = {
     screen_saver_mode = false,
-    charging_mode = false,
-    survive_screen_saver = false,
+    screen_saver_lock = false,
     is_cover_closed = false,
-    should_restrict_JIT = false,
     model = nil,
     powerd = nil,
     screen = nil,
-    screen_dpi_override = nil,
     input = nil,
     home_dir = nil,
     -- For Kobo, wait at least 15 seconds before calling suspend script. Otherwise, suspend might
     -- fail and the battery will be drained while we are in screensaver mode
     suspend_wait_timeout = 15,
+    -- The screensaver can opt to add additional time in case of extra anti-ghosting draws.
+    screensaver_suspend_wait_timeout = nil,
 
     -- hardware feature tests: (these are functions!)
     hasBattery = yes,
+    hasAuxBattery = no,
     hasKeyboard = no,
+    supportsExternalKeyboard = no,
+    hasOTGManagement = no,
     hasKeys = no,
+    hasScreenKB = no, -- in practice only some Kindles
+    hasSymKey = no, -- in practice only some Kindles
+    canKeyRepeat = no,
     hasDPad = no,
+    useDPadAsActionKeys = no,
+    supportsGamepad = no,
     hasExitOptions = yes,
     hasFewKeys = no,
     hasWifiToggle = yes,
+    hasSeamlessWifiToggle = yes, -- Can toggle Wi-Fi without focus loss and extra user interaction (i.e., not Android)
     hasWifiManager = no,
+    hasWifiRestore = no,
+    isDefaultFullscreen = yes,
     isHapticFeedbackEnabled = no,
+    isDeprecated = no, -- device no longer receive OTA updates
     isTouchDevice = no,
     hasFrontlight = no,
     hasNaturalLight = no, -- FL warmth implementation specific to NTX boards (Kobo, Cervantes)
     hasNaturalLightMixer = no, -- Same, but only found on newer boards
     hasNaturalLightApi = no,
-    needsTouchScreenProbe = no,
     hasClipboard = yes, -- generic internal clipboard on all devices
     hasEinkScreen = yes,
     hasExternalSD = no, -- or other storage volume that cannot be accessed using the File Manager
     canHWDither = no,
     canHWInvert = no,
+    hasKaleidoWfm = no,
+    canDoSwipeAnimation = no,
+    canModifyFBInfo = no, -- some NTX boards do wonky things with the rotate flag after a FBIOPUT_VSCREENINFO ioctl
     canUseCBB = yes, -- The C BB maintains a 1:1 feature parity with the Lua BB, except that is has NO support for BB4, and limited support for BBRGB24
     hasColorScreen = no,
     hasBGRFrameBuffer = no,
     canImportFiles = no,
     canShareText = no,
     hasGSensor = no,
-    canToggleGSensor = no,
     isGSensorLocked = no,
     canToggleMassStorage = no,
     canToggleChargingLED = no,
+    _updateChargingLED = nil,
     canUseWAL = yes, -- requires mmap'ed I/O on the target FS
     canRestart = yes,
-    canSuspend = yes,
+    canSuspend = no,
+    canStandby = no,
+    canPowerSaveWhileCharging = no,
+    total_standby_time = 0, -- total time spent in standby
+    last_standby_time = 0,
+    total_suspend_time = 0, -- total time spent in suspend
+    last_suspend_time = 0,
     canReboot = no,
     canPowerOff = no,
     canAssociateFileExtensions = no,
@@ -71,8 +147,11 @@ local Device = {
     startTextInput = function() end,
     stopTextInput = function() end,
 
+    getOTGRole = function() end,
+    setOTGRole = function(role) end,
+
     -- use these only as a last resort. We should abstract the functionality
-    -- and have device dependent implementations in the corresponting
+    -- and have device dependent implementations in the corresponding
     -- device/<devicetype>/device.lua file
     -- (these are functions!)
     isAndroid = no,
@@ -81,7 +160,7 @@ local Device = {
     isKobo = no,
     isPocketBook = no,
     isRemarkable = no,
-    isSonyPRSTUX = no,
+    isBookeen = no,
     isSDL = no,
     isEmulator = no,
     isDesktop = no,
@@ -103,6 +182,9 @@ local Device = {
     -- set to yes on devices that support over-the-air incremental updates.
     hasOTAUpdates = no,
 
+    -- For devices that have non-blocking OTA updates, this function will return true if the download is currently running.
+    hasOTARunning = no,
+
     -- set to yes on devices that have a non-blocking isWifiOn implementation
     -- (c.f., https://github.com/koreader/koreader/pull/5211#issuecomment-521304139)
     hasFastWifiStatusQuery = no,
@@ -115,7 +197,7 @@ local Device = {
     canExternalDictLookup = no,
 }
 
-function Device:new(o)
+function Device:extend(o)
     o = o or {}
     setmetatable(o, self)
     self.__index = self
@@ -143,8 +225,31 @@ function Device:invertButtons()
     end
 end
 
+function Device:invertButtonsLeft()
+    if self:hasKeys() and self.input and self.input.event_map then
+        for key, value in pairs(self.input.event_map) do
+            if value == "LPgFwd" then
+                self.input.event_map[key] = "LPgBack"
+            elseif value == "LPgBack" then
+                self.input.event_map[key] = "LPgFwd"
+            end
+        end
+    end
+end
+
+function Device:invertButtonsRight()
+    if self:hasKeys() and self.input and self.input.event_map then
+        for key, value in pairs(self.input.event_map) do
+            if value == "RPgFwd" then
+                self.input.event_map[key] = "RPgBack"
+            elseif value == "RPgBack" then
+                self.input.event_map[key] = "RPgFwd"
+            end
+        end
+    end
+end
+
 function Device:init()
-    assert(self ~= nil)
     if not self.screen then
         error("screen/framebuffer must be implemented")
     end
@@ -179,7 +284,7 @@ function Device:init()
     end
 
     logger.info("initializing for device", self.model)
-    logger.info("framebuffer resolution:", self.screen:getSize())
+    logger.info("framebuffer resolution:", self.screen:getRawSize())
 
     if not self.input then
         self.input = require("device/input"):new{device = self}
@@ -188,12 +293,18 @@ function Device:init()
         self.powerd = require("device/generic/powerd"):new{device = self}
     end
 
+    -- NOTE: This needs to run *after* implementation-specific event hooks,
+    --       especially if those require swapping/mirroring...
+    --       (e.g., Device implementations should setup their own hooks *before* calling this via Generic.init(self)).
     if self.viewport then
         logger.dbg("setting a viewport:", self.viewport)
         self.screen:setViewport(self.viewport)
-        self.input:registerEventAdjustHook(
-            self.input.adjustTouchTranslate,
-            {x = 0 - self.viewport.x, y = 0 - self.viewport.y})
+        if self.viewport.x ~= 0 or self.viewport.y ~= 0 then
+            self.input:registerEventAdjustHook(
+                self.input.adjustTouchTranslate,
+                {x = 0 - self.viewport.x, y = 0 - self.viewport.y}
+            )
+        end
     end
 
     -- Handle button mappings shenanigans
@@ -201,14 +312,83 @@ function Device:init()
         if G_reader_settings:isTrue("input_invert_page_turn_keys") then
             self:invertButtons()
         end
+        if G_reader_settings:isTrue("input_invert_left_page_turn_keys") then
+            self:invertButtonsLeft()
+        end
+        if G_reader_settings:isTrue("input_invert_right_page_turn_keys") then
+            self:invertButtonsRight()
+        end
     end
 
-    -- Honor the gyro lock
+    if self:hasDPad() and G_reader_settings:isTrue("input_use_dpad_as_action_keys") then
+        self:setUseDPadAsActionKeys(true)
+    end
+
     if self:hasGSensor() then
+        -- Setup our standard gyro event handler (EV_MSC:MSC_GYRO)
+        if G_reader_settings:nilOrFalse("input_ignore_gsensor") then
+            self.input.handleGyroEv = self.input.handleMiscGyroEv
+        end
+
+        -- Honor the gyro lock
         if G_reader_settings:isTrue("input_lock_gsensor") then
             self:lockGSensor(true)
         end
     end
+
+    -- Screen:getSize is used throughout the code, and that code usually expects getting a real Geom object...
+    -- But as implementations come from base, they just return a Geom-like table...
+    self.screen.getSize = function()
+        local rect = self.screen.getRawSize(self.screen)
+        return Geom:new{ x = rect.x, y = rect.y, w = rect.w, h = rect.h }
+    end
+
+    -- DPI
+    local dpi_override = G_reader_settings:readSetting("screen_dpi")
+    if dpi_override ~= nil then
+        self:setScreenDPI(dpi_override)
+    end
+
+    -- Night mode
+    self.orig_hw_nightmode = self.screen:getHWNightmode()
+    if G_reader_settings:isTrue("night_mode") then
+        self.screen:toggleNightMode()
+    end
+
+    -- Ensure the proper rotation on startup.
+    -- We default to the rotation KOReader closed with.
+    -- If the rotation is not locked it will be overridden by a book or the FM when opened.
+    local rotation_mode = G_reader_settings:readSetting("closed_rotation_mode")
+    if rotation_mode and rotation_mode ~= self.screen:getRotationMode() then
+        self.screen:setRotationMode(rotation_mode)
+    end
+
+    -- Dithering
+    if self:hasEinkScreen() then
+        self.screen:setupDithering()
+        if self.screen.hw_dithering and G_reader_settings:isTrue("dev_no_hw_dither") then
+            self.screen:toggleHWDithering(false)
+        end
+        if self.screen.sw_dithering and G_reader_settings:isTrue("dev_no_sw_dither") then
+            self.screen:toggleSWDithering(false)
+        end
+        -- NOTE: If device can HW dither (i.e., after setupDithering(), hw_dithering is true, but sw_dithering is false),
+        --       but HW dither is explicitly disabled, and SW dither enabled, don't leave SW dither disabled (i.e., re-enable sw_dithering)!
+        if self:canHWDither() and G_reader_settings:isTrue("dev_no_hw_dither") and G_reader_settings:nilOrFalse("dev_no_sw_dither") then
+            self.screen:toggleSWDithering(true)
+        end
+    end
+
+    -- Can't be seamless if you can't do it at all ;)
+    if not self:hasWifiToggle() then
+        self.hasSeamlessWifiToggle = no
+    end
+end
+
+-- True if the active input layer emits TextInput events for physical keys.
+-- InputText then defers insertion to onTextInput instead of using the key name.
+function Device:hasKeyboardTextInput()
+    return self.input.hw_text_layout ~= nil
 end
 
 function Device:setScreenDPI(dpi_override)
@@ -217,14 +397,30 @@ function Device:setScreenDPI(dpi_override)
     self.input.gesture_detector:init()
 end
 
+function Device:getDeviceScreenDPI()
+    return self.display_dpi
+end
+
 function Device:getPowerDevice()
     return self.powerd
 end
 
-function Device:rescheduleSuspend()
-    local UIManager = require("ui/uimanager")
+-- Used for extra anti-ghosting redraws, to account for the time spent
+-- flashing the screen before suspend.
+-- extra_flash_count: number of corrective redraws (0 = none), delay_ms: delay between each redraw.
+function Device:getScreensaverSuspendWaitTimeout(extra_flash_count, delay_ms)
+    local flash_window = (extra_flash_count and extra_flash_count > 0)
+        -- 0.5s initial delay + (count-1)*delay between flashes + 0.5s for final redraw
+        and (0.5 + (extra_flash_count - 1) * (delay_ms / 1000) + 0.5)
+        or 0
+    return self.suspend_wait_timeout + flash_window + 2 -- 2s safety margin
+end
+
+-- Only used on platforms where we handle suspend ourselves.
+-- Pass an optional timeout to override the default (e.g., to account for extra screensaver flashing).
+function Device:rescheduleSuspend(timeout)
     UIManager:unschedule(self.suspend)
-    UIManager:scheduleIn(self.suspend_wait_timeout, self.suspend)
+    UIManager:scheduleIn(timeout or self.suspend_wait_timeout, self.suspend, self)
 end
 
 -- Only used on platforms where we handle suspend ourselves.
@@ -233,72 +429,51 @@ function Device:onPowerEvent(ev)
     if self.screen_saver_mode then
         if ev == "Power" or ev == "Resume" then
             if self.is_cover_closed then
-                -- don't let power key press wake up device when the cover is in closed state
+                -- Don't let power key press wake up device when the cover is in closed state.
+                logger.dbg("Pressed power while asleep in screen saver mode with a closed sleepcover, going back to suspend...")
                 self:rescheduleSuspend()
             else
                 logger.dbg("Resuming...")
-                local UIManager = require("ui/uimanager")
                 UIManager:unschedule(self.suspend)
-                if self:hasWifiManager() and not self:isEmulator() then
-                    local network_manager = require("ui/network/manager")
-                    if network_manager.wifi_was_on and G_reader_settings:isTrue("auto_restore_wifi") then
-                        network_manager:restoreWifiAsync()
-                        network_manager:scheduleConnectivityCheck()
-                    end
-                end
                 self:resume()
-                -- Restore to previous rotation mode, if need be.
-                if self.orig_rotation_mode then
-                    self.screen:setRotationMode(self.orig_rotation_mode)
+                local widget_was_closed = Screensaver:close()
+                if widget_was_closed and self:needsScreenRefreshAfterResume() then
+                    UIManager:scheduleIn(1, function() self.screen:refreshFull(0, 0, self.screen:getWidth(), self.screen:getHeight()) end)
                 end
-                Screensaver:close()
-                if self:needsScreenRefreshAfterResume() then
-                    UIManager:scheduleIn(1, function() self.screen:refreshFull() end)
-                end
-                self.screen_saver_mode = false
                 self.powerd:afterResume()
             end
         elseif ev == "Suspend" then
-            -- Already in screen saver mode, no need to update UI/state before
-            -- suspending the hardware. This usually happens when sleep cover
-            -- is closed after the device was sent to suspend state.
-            logger.dbg("Already in screen saver mode, suspending...")
+            -- Already in screen saver mode, no need to update the UI (and state, usually) before suspending again.
+            -- This usually happens when the sleep cover is closed on an already sleeping device,
+            -- (e.g., it was previously suspended via the Power button).
+            if self.screen_saver_lock then
+                -- This can only happen when some sort of screensaver_delay is set,
+                -- and the user presses the Power button *after* already having woken up the device.
+                -- In this case, we want to go back to suspend *without* affecting the screensaver,
+                -- so we simply mimic our own behavior when *not* in screen_saver_mode ;).
+                logger.dbg("Pressed power while awake in screen saver mode, going back to suspend...")
+                -- Basically, this is the only difference.
+                -- We need it because we're actually in a sane post-Resume event state right now.
+                self.powerd:beforeSuspend()
+            else
+                logger.dbg("Already in screen saver mode, going back to suspend...")
+            end
+            -- Much like the real suspend codepath below, in case we got here via screen_saver_lock,
+            -- make sure we murder WiFi again (because restore WiFi on resume could have kicked in).
+            if self:hasWifiToggle() then
+                local network_manager = require("ui/network/manager")
+                if network_manager:isWifiOn() then
+                    network_manager:disableWifi()
+                end
+            end
             self:rescheduleSuspend()
         end
     -- else we were not in screensaver mode
     elseif ev == "Power" or ev == "Suspend" then
-        self.powerd:beforeSuspend()
-        local UIManager = require("ui/uimanager")
         logger.dbg("Suspending...")
-        -- Let Screensaver set its widget up, so we get accurate info down the line in case fallbacks kick in...
+        -- Add the current state of the SleepCover flag...
+        logger.dbg("Sleep cover is", self.is_cover_closed and "closed" or "open")
         Screensaver:setup()
-        -- Mostly always suspend in Portrait/Inverted Portrait mode...
-        -- ... except when we just show an InfoMessage or when the screensaver
-        -- is disabled, as it plays badly with Landscape mode (c.f., #4098 and #5290).
-        -- We also exclude full-screen widgets that work fine in Landscape mode,
-        -- like ReadingProgress and BookStatus (c.f., #5724)
-        if Screensaver:modeExpectsPortrait() then
-            self.orig_rotation_mode = self.screen:getRotationMode()
-            -- Leave Portrait & Inverted Portrait alone, that works just fine.
-            if bit.band(self.orig_rotation_mode, 1) == 1 then
-                -- i.e., only switch to Portrait if we're currently in *any* Landscape orientation (odd number)
-                self.screen:setRotationMode(self.screen.ORIENTATION_PORTRAIT)
-            else
-                self.orig_rotation_mode = nil
-            end
-
-            -- On eInk, if we're using a screensaver mode that shows an image,
-            -- flash the screen to white first, to eliminate ghosting.
-            if self:hasEinkScreen() and Screensaver:modeIsImage() then
-                if Screensaver:withBackground() then
-                    self.screen:clear()
-                end
-                self.screen:refreshFull()
-            end
-        else
-            -- nil it, in case user switched ScreenSaver modes during our lifetime.
-            self.orig_rotation_mode = nil
-        end
         Screensaver:show()
         -- NOTE: show() will return well before the refresh ioctl is even *sent*:
         --       the only thing it's done is *enqueued* the refresh in UIManager's stack.
@@ -308,37 +483,64 @@ function Device:onPowerEvent(ev)
         --       and on platforms where we defer to a system tool, it'd probably suspend too early!
         --       c.f., #6676
         if self:needsScreenRefreshAfterResume() then
-            self.screen:refreshFull()
+            self.screen:refreshFull(0, 0, self.screen:getWidth(), self.screen:getHeight())
         end
-        self.screen_saver_mode = true
-        UIManager:scheduleIn(0.1, function()
-            -- NOTE: This side of the check needs to be laxer, some platforms can handle Wi-Fi without WifiManager ;).
-            if self:hasWifiToggle() then
-                local network_manager = require("ui/network/manager")
-                -- NOTE: wifi_was_on does not necessarily mean that Wi-Fi is *currently* on! It means *we* enabled it.
-                --       This is critical on Kobos (c.f., #3936), where it might still be on from KSM or Nickel,
-                --       without us being aware of it (i.e., wifi_was_on still unset or false),
-                --       because suspend will at best fail, and at worst deadlock the system if Wi-Fi is on,
-                --       regardless of who enabled it!
-                if network_manager:isWifiOn() then
-                    network_manager:releaseIP()
-                    network_manager:turnOffWifi()
-                end
+        -- NOTE: In the same vein as above, make sure we update the screen *now*, before dealing with Wi-Fi.
+        UIManager:forceRePaint()
+        -- NOTE: This side of the check needs to be laxer, some platforms can handle Wi-Fi without WifiManager ;).
+        if self:hasWifiToggle() then
+            local network_manager = require("ui/network/manager")
+            -- NOTE: wifi_was_on does not necessarily mean that Wi-Fi is *currently* on! It means *we* enabled it.
+            --       This is critical on Kobos (c.f., #3936), where it might still be on from KSM or Nickel,
+            --       without us being aware of it (i.e., wifi_was_on still unset or false),
+            --       because suspend will at best fail, and at worst deadlock the system if Wi-Fi is on,
+            --       regardless of who enabled it!
+            if network_manager:isWifiOn() then
+                network_manager:disableWifi()
             end
-            UIManager:scheduleIn(self.suspend_wait_timeout, self.suspend)
-        end)
+        end
+        -- Only turn off the frontlight *after* we've displayed the screensaver and dealt with Wi-Fi,
+        -- to prevent that from affecting the smoothness of the frontlight ramp down.
+        self.powerd:beforeSuspend()
+        -- When self.screensaver_suspend_wait_timeout is nil the base timeout is used.
+        self:rescheduleSuspend(self.screensaver_suspend_wait_timeout)
     end
 end
 
 function Device:showLightDialog()
     local FrontLightWidget = require("ui/widget/frontlightwidget")
-    local UIManager = require("ui/uimanager")
     UIManager:show(FrontLightWidget:new{})
 end
 
 function Device:info()
     return self.model
 end
+
+function Device:install()
+    local ConfirmBox = require("ui/widget/confirmbox")
+    UIManager:show(ConfirmBox:new{
+        text = _("Update is ready. Install it now?"),
+        ok_text = _("Install"),
+        ok_callback = function()
+            local save_quit = function()
+                self:saveSettings()
+                UIManager:quit(85)
+            end
+            UIManager:broadcastEvent(Event:new("Exit", save_quit))
+        end,
+        cancel_text = _("Later"),
+        cancel_callback = function()
+            local InfoMessage = require("ui/widget/infomessage")
+            UIManager:show(InfoMessage:new{
+                text = _("The update will be applied the next time KOReader is started."),
+                unmovable = true,
+            })
+        end,
+        unmovable = true,
+        dismissable = false,
+    })
+end
+
 
 -- Hardware specific method to track opened/closed books (nil on book close)
 function Device:notifyBookState(title, document) end
@@ -365,9 +567,11 @@ function Device:suspend() end
 -- Hardware specific method to resume the device
 function Device:resume() end
 
+-- NOTE: These two should ideally run in the background, and only trip the action after a small delay,
+--       to give us time to quit first.
+--       e.g., os.execute("sleep 1 && shutdown -r now &")
 -- Hardware specific method to power off the device
 function Device:powerOff() end
-
 -- Hardware specific method to reboot the device
 function Device:reboot() end
 
@@ -382,9 +586,21 @@ function Device:setDateTime(year, month, day, hour, min, sec) end
 -- Device specific method if any setting needs being saved
 function Device:saveSettings() end
 
+function Device:isAlwaysFullscreen() return true end
+function Device:toggleFullscreen() end
+
 -- Simulates suspend/resume
 function Device:simulateSuspend() end
 function Device:simulateResume() end
+
+-- Put device into standby, input devices (buttons, touchscreen ...) stay enabled
+function Device:standby(max_duration) end
+
+
+-- Returns a string, used to determine the platform to fetch OTA updates
+function Device:otaModel()
+    return self.ota_model, "kotasync", self.ota_unpack_dir
+end
 
 --[[--
 Device specific method for performing haptic feedback.
@@ -396,8 +612,17 @@ function Device:performHapticFeedback(type) end
 -- Device specific method for toggling input events
 function Device:setIgnoreInput(enable) return true end
 
--- Device specific method for toggling the GSensor
-function Device:toggleGSensor(toggle) end
+-- Device agnostic method for toggling the GSensor
+-- (can be reimplemented if need be, but you really, really should try not to. c.f., Kobo, Kindle & PocketBook)
+function Device:toggleGSensor(toggle)
+    if not self:hasGSensor() then
+        return
+    end
+
+    if self.input then
+        self.input:toggleGyroEvents(toggle)
+    end
+end
 
 -- Whether or not the GSensor should be locked to the current orientation (i.e. Portrait <-> Inverted Portrait or Landscape <-> Inverted Landscape only)
 function Device:lockGSensor(toggle)
@@ -424,49 +649,335 @@ end
 -- Device specific method for toggling the charging LED
 function Device:toggleChargingLED(toggle) end
 
+-- Device specific method for setting the charging LED to the right state
+function Device:setupChargingLED() end
+
+-- Device specific method for enabling a specific amount of CPU cores
+-- (Should only be implemented on embedded platforms where we can afford to control that without screwing with the system).
+function Device:enableCPUCores(amount) end
+
+-- NOTE: For this to work, all three must be implemented, and getKeyRepeat must be run on init (c.f., Kobo)!
+-- Device specific method to get the current key repeat setup (and is responsible for setting the canKeyRepeat cap)
+function Device:getKeyRepeat() end
+-- Device specific method to disable key repeat
+function Device:disableKeyRepeat() end
+-- Device specific method to restore the initial key repeat config
+function Device:restoreKeyRepeat() end
+-- NOTE: This one is for the user-facing toggle, it *ignores* the stock delay/period combo,
+--       opting instead for a hard-coded one (as we can't guarantee that key repeat is actually setup properly or at all).
+-- Device specific method to toggle key repeat
+function Device:toggleKeyRepeat(toggle) end
+
+function Device:setUseDPadAsActionKeys(bool)
+    if bool == nil then bool = false end
+    self.useDPadAsActionKeys = function() return bool end
+end
+
 --[[
 prepare for application shutdown
 --]]
 function Device:exit()
+    -- Save any implementation-specific settings
+    self:saveSettings()
+
+    -- Save current rotation (or the original rotation if ScreenSaver temporarily modified it) to remember it for next startup
+    G_reader_settings:saveSetting("closed_rotation_mode", self.orig_rotation_mode or self.screen:getRotationMode())
+
+    -- Restore initial HW inversion state
+    self.screen:setHWNightmode(self.orig_hw_nightmode)
+
+    -- Tear down the fb backend
     self.screen:close()
-    require("ffi/input"):closeAll()
+
+    -- Flush settings to disk
+    G_reader_settings:close()
+
+    -- I/O teardown
+    self.input:teardown()
+end
+
+-- Lifted from busybox's libbb/inet_cksum.c
+local function inet_cksum(ptr, nleft)
+    local addr = ffi.new("const uint16_t *", ptr)
+
+    local sum = ffi.new("unsigned int", 0)
+    while nleft > 1 do
+        sum = sum + addr[0]
+        addr = addr + 1
+        nleft = nleft - 2
+    end
+
+    if nleft == 1 then
+        local u8p = ffi.cast("uint8_t *", addr)
+        sum = sum + u8p[0]
+    end
+
+    sum = bit.rshift(sum, 16) + bit.band(sum, 0xFFFF)
+    sum = sum + bit.rshift(sum, 16)
+
+    sum = bit.bnot(sum)
+    return ffi.cast("uint16_t", sum)
+end
+
+function Device:ping4(ip)
+    -- Try an unprivileged ICMP socket first
+    -- NOTE: This is disabled by default, barring custom distro setup during init, c.f., sysctl net.ipv4.ping_group_range
+    --       It also requires Linux 3.0+ (https://github.com/torvalds/linux/commit/c319b4d76b9e583a5d88d6bf190e079c4e43213d)
+    local socket, socket_type
+    -- NOTE: We deliberately do NOT call socket() with SOCK_NONBLOCK/SOCK_CLOEXEC:
+    --       that form requires Linux 2.6.27+ and fails with EINVAL on older versions.
+    --       We set both flags via fcntl() below instead, which works on every kernel.
+    socket = C.socket(C.AF_INET, C.SOCK_DGRAM, C.IPPROTO_ICMP)
+    if socket == -1 then
+        local errno = ffi.errno()
+        logger.dbg("Device:ping4: unprivileged ICMP socket:", ffi.string(C.strerror(errno)))
+
+        -- Try a raw socket
+        socket = C.socket(C.AF_INET, C.SOCK_RAW, C.IPPROTO_ICMP)
+        if socket == -1 then
+            errno = ffi.errno()
+            if errno == C.EPERM then
+                logger.dbg("Device:ping4: opening a RAW ICMP socket requires CAP_NET_RAW capabilities!")
+            else
+                logger.dbg("Device:ping4: raw ICMP socket:", ffi.string(C.strerror(errno)))
+            end
+            --- Fall-back to the ping CLI tool, in the hope that it's setuid...
+            -- NOTE: We can't rely on `ping -w`: it's not available in the old busybox build
+            --       used on Legacy Kindles (K4 included). Bound the runtime ourselves by
+            --       killing the ping after a timeout, which works with any ping implementation.
+            return os.execute(string.format([[ping -q -c1 %s >/dev/null &
+                                              pid=$!
+                                              (sleep 2; kill $pid 2>/dev/null) &
+                                              wait $pid 2>/dev/null
+                                              ]], ip)) == 0
+        else
+            socket_type = C.SOCK_RAW
+        end
+    else
+        socket_type = C.SOCK_DGRAM
+    end
+
+    -- Apply FD_CLOEXEC + O_NONBLOCK now (see the socket() note above).
+    C.fcntl(socket, C.F_SETFD, C.FD_CLOEXEC)
+    C.fcntl(socket, C.F_SETFL, bit.bor(C.fcntl(socket, C.F_GETFL, 0), C.O_NONBLOCK))
+
+    -- c.f., busybox's networking/ping.c
+    local DEFDATALEN = 56 -- 64 - 8
+    local MAXIPLEN   = 60
+    local MAXICMPLEN = 76
+
+    -- Base the id on our PID (like busybox)
+    local myid = ffi.cast("uint16_t", C.getpid())
+    myid = C.htons(myid)
+
+    -- Setup the packet
+    local packet = ffi.new("char[?]", DEFDATALEN + MAXIPLEN + MAXICMPLEN)
+    local pkt = ffi.cast("struct icmp_echo *", packet)
+    pkt.type = C.ICMP_ECHO
+    pkt.id = myid
+    pkt.sequence = C.htons(1)
+    pkt.checksum = inet_cksum(ffi.cast("const void *", pkt), ffi.sizeof(packet))
+
+    -- Set the destination address
+    local addr = ffi.new("struct sockaddr_in")
+    addr.sin_family = C.AF_INET
+    local in_addr = ffi.new("struct in_addr")
+    if C.inet_aton(ip, in_addr) == 0 then
+        logger.err("Device:ping4: Invalid address:", ip)
+        C.close(socket)
+        return false
+    end
+    addr.sin_addr = in_addr
+    addr.sin_port = 0
+
+    -- Send the ping
+    local start_time = time.now()
+    if C.sendto(socket, packet, DEFDATALEN + C.ICMP_MINLEN, 0, ffi.cast("struct sockaddr*", addr), ffi.sizeof(addr)) == - 1 then
+        local errno = ffi.errno()
+        logger.err("Device:ping4: sendto:", ffi.string(C.strerror(errno)))
+        C.close(socket)
+        return false
+    end
+
+    -- We'll poll to make timing out easier on us (busybox uses a SIGALRM :s)
+    local pfd = ffi.new("struct pollfd")
+    pfd.fd = socket
+    pfd.events = C.POLLIN
+    local timeout = 2000
+
+    -- Wait for a response
+    while true do
+        local poll_num = C.poll(pfd, 1, timeout)
+        -- Slice the timeout in two on every retry, ensuring we'll bail definitively after 4s...
+        timeout = bit.rshift(timeout, 1)
+        if poll_num == -1 then
+            local errno = ffi.errno()
+            if errno ~= C.EINTR then
+                logger.err("Device:ping4: poll:", ffi.string(C.strerror(errno)))
+                C.close(socket)
+                return false
+            end
+        elseif poll_num > 0 then
+            local c = C.recv(socket, packet, ffi.sizeof(packet), 0)
+            if c == -1 then
+                local errno = ffi.errno()
+                if errno ~= C.EINTR then
+                    logger.err("Device:ping4: recv:", ffi.string(C.strerror(errno)))
+                    C.close(socket)
+                    return false
+                end
+            else
+                -- Do some minimal verification of the reply's validity.
+                -- This is mostly based on busybox's ping,
+                -- with some extra inspiration from iputils's ping, especially as far as SOCK_DGRAM is concerned.
+                local iphdr = ffi.cast("struct ip_header *", packet) -- ip + icmp
+                local hlen
+                if socket_type == C.SOCK_RAW then
+                    hlen = bit.lshift(iphdr.ihl, 2)
+                    if c < (hlen + 8) or iphdr.ihl < 5 then
+                        -- Packet too short (we don't use recvfrom, so we can't log where it's from ;o))
+                        logger.dbg("Device:ping4: received a short packet")
+                        goto continue
+                    end
+                else
+                    hlen = 0
+                end
+                -- Skip ip hdr to get at the ICMP part
+                local icp = ffi.cast("struct icmp_echo *", packet + hlen)
+                -- Check that we got a *reply* to *our* ping
+                -- NOTE: The reply's ident is defined by the kernel for SOCK_DGRAM, so we can't do anything with it!
+                if icp.type == C.ICMP_ECHOREPLY and
+                   (socket_type == C.SOCK_DGRAM or icp.id == myid) then
+                    break
+                end
+            end
+        else
+            local end_time = time.now()
+            logger.info("Device:ping4: timed out waiting for a response from", ip)
+            C.close(socket)
+            return false, end_time - start_time
+        end
+        ::continue::
+    end
+    local end_time = time.now()
+
+    -- If we got this far, we've got a reply to our ping in time!
+    C.close(socket)
+    return true, end_time - start_time
+end
+
+function Device:getDefaultRoute(interface)
+    local fd = io.open("/proc/net/route", "re")
+    if not fd then
+        return
+    end
+
+    local gateway
+    local l = 1
+    for line in fd:lines() do
+        -- Skip the first line (header)
+        if l > 1 then
+            local fields = {}
+            for field in line:gmatch("%S+") do
+                table.insert(fields, field)
+            end
+            -- Check the requested interface or anything that isn't lo
+            if (interface and fields[1] == interface) or (not interface and fields[1] ~= "lo") then
+                -- We're looking for something that's up & a gateway
+                if bit.band(fields[4], C.RTF_UP) ~= 0 and bit.band(fields[4], C.RTF_GATEWAY) ~= 0 then
+                    -- Handle the conversion from network endianness hex string into a human-readable numeric form
+                    local sockaddr_in = ffi.new("struct sockaddr_in")
+                    sockaddr_in.sin_family = C.AF_INET
+                    sockaddr_in.sin_addr.s_addr = tonumber(fields[3], 16)
+                    local host = ffi.new("char[?]", C.NI_MAXHOST)
+                    local s = C.getnameinfo(ffi.cast("struct sockaddr *", sockaddr_in),
+                                            ffi.sizeof("struct sockaddr_in"),
+                                            host, C.NI_MAXHOST,
+                                            nil, 0,
+                                            C.NI_NUMERICHOST)
+                    if s ~= 0 then
+                        logger.err("Device:getDefaultRoute: getnameinfo:", ffi.string(C.gai_strerror(s)))
+                        break
+                    else
+                        gateway = ffi.string(host)
+                        -- If we specified an interface, we're done.
+                        -- If we didn't, we'll just keep the last gateway in the routing table...
+                        if interface then
+                            break
+                        end
+                    end
+                end
+            end
+        end
+        l = l + 1
+    end
+    fd:close()
+
+    return gateway
 end
 
 function Device:retrieveNetworkInfo()
-    local std_out = io.popen("ifconfig | " ..
-                             "sed -n " ..
-                             "-e 's/ \\+$//g' " ..
-                             "-e 's/ \\+/ /g' " ..
-                             "-e 's/ \\?inet6\\? addr: \\?\\([^ ]\\+\\) .*$/IP: \\1/p' " ..
-                             "-e 's/Link encap:Ethernet\\(.*\\)/\\1/p'",
-                             "r")
-    if std_out then
-        local result = std_out:read("*all")
-        std_out:close()
-        std_out = io.popen('2>/dev/null iwconfig | grep ESSID | cut -d\\" -f2')
-        if std_out then
-            local ssid = std_out:read("*all")
-            result = result .. "SSID: " .. util.trim(ssid) .. "\n"
-            std_out:close()
-        end
-        if os.execute("ip r | grep -q default") == 0 then
-            -- NOTE: No -w flag available in the old busybox build used on Legacy Kindles...
-            local pingok
-            if self:isKindle() and self:hasKeyboard() then
-                pingok = os.execute("ping -q -c 2 `ip r | grep default | tail -n 1 | cut -d ' ' -f 3` > /dev/null")
+
+    -- Build a string rope to format the results
+    local results = {}
+    local default_gw
+
+    local ni = NetInfo:new()
+    for __, iface in ipairs(ni:retrieve()) do
+        table.insert(results, T(_("Interface: %1"), iface.name))
+        table.insert(results, T(_("MAC: %1"), iface.mac))
+        if iface.wireless then
+            if iface.ssid then
+                table.insert(results, T(_("SSID: \"%1\""), iface.ssid))
             else
-                pingok = os.execute("ping -q -w 3 -c 2 `ip r | grep default | tail -n 1 | cut -d ' ' -f 3` > /dev/null")
+                table.insert(results, _("SSID: off/any"))
             end
-            if pingok == 0 then
-                result = result .. "Gateway ping successful"
-            else
-                result = result .. "Gateway ping FAILED"
+        end
+        if iface.ipv4 then
+            table.insert(results, T(_("IPv4: %1"), iface.ipv4))
+            local gw = self:getDefaultRoute(iface.name)
+            if gw then
+                table.insert(results, T(_("Default gateway: %1"), gw))
+                -- If that's a wireless interface, use *that* one for the ping test
+                if iface.wireless == "wireless" then
+                    default_gw = gw
+                end
+            end
+        end
+        if iface.ipv6 then
+            table.insert(results, T(_("IPv6: %1"), iface.ipv6))
+            --- @todo: Build an IPv6 variant of getDefaultRoute that parses /proc/net/ipv6_route
+        end
+        -- Add a linebreak between interfaces
+        table.insert(results, "")
+    end
+    ni:free()
+
+    -- Only ping a single gateway (if we found a wireless interface earlier, we've kept its gateway address around)
+    if not default_gw then
+        -- If not, we'll simply use the last one in the list...
+        default_gw = self:getDefaultRoute()
+    end
+    if default_gw then
+        local ok, rtt = self:ping4(default_gw)
+        if ok then
+            table.insert(results, _("Gateway ping successful"))
+            if rtt then
+                rtt = string.format("%.3f", rtt * 1/1000) -- i.e., time.to_ms w/o flooring
+                table.insert(results, T(_("RTT: %1 ms"), rtt))
             end
         else
-            result = result .. "No default gateway to ping"
+            table.insert(results, _("Gateway ping FAILED"))
+            if rtt then
+                rtt = string.format("%.1f", time.to_s(rtt))
+                table.insert(results, T(_("Timed out after %1 s"), rtt))
+            end
         end
-        return result
+    else
+        table.insert(results, _("No default gateway to ping"))
     end
+
+    return table.concat(results, "\n")
 end
 
 function Device:setTime(hour, min)
@@ -508,29 +1019,139 @@ function Device:getDefaultCoverPath()
     return DataStorage:getDataDir() .. "/cover.jpg"
 end
 
---- Unpack an archive.
--- Extract the contents of an archive, detecting its format by
--- filename extension. Inspired by luarocks archive_unpack()
--- @param archive string: Filename of archive.
--- @param extract_to string: Destination directory.
--- @return boolean or (boolean, string): true on success, false and an error message on failure.
-function Device:unpackArchive(archive, extract_to)
-    require("dbg").dassert(type(archive) == "string")
-    local BD = require("ui/bidi")
-    local ok
-    if archive:match("%.tar%.bz2$") or archive:match("%.tar%.gz$") or archive:match("%.tar%.lz$") or archive:match("%.tgz$") then
-        ok = self:untar(archive, extract_to)
+-- Update our UIManager reference once it's ready
+function Device:_UIManagerReady(uimgr)
+    -- Our own ref
+    UIManager = uimgr
+    -- Let implementations do the same thing
+    self:UIManagerReady(uimgr)
+
+    -- Forward that to PowerD
+    self.powerd:UIManagerReady(uimgr)
+
+    -- And to Input
+    self.input:UIManagerReady(uimgr)
+
+    -- Setup PM event handlers
+    -- NOTE: We keep forwarding the uimgr reference because some implementations don't actually have a module-local UIManager ref to update
+    self:_setEventHandlers(uimgr)
+
+    -- Returns a self-debouncing scheduling call (~4s to give some leeway to the kernel, and debounce to deal with potential chattering)
+    self._updateChargingLED = UIManager:debounce(4, false, function() self:setupChargingLED() end)
+end
+-- In case implementations *also* need a reference to UIManager, *this* is the one to implement!
+function Device:UIManagerReady(uimgr) end
+
+-- Set device event handlers common to all devices
+function Device:_setEventHandlers(uimgr)
+    if self:canReboot() then
+        UIManager.event_handlers.Reboot = function(message_text)
+            local ConfirmBox = require("ui/widget/confirmbox")
+            UIManager:show(ConfirmBox:new{
+                text = message_text or _("Are you sure you want to reboot the device?"),
+                ok_text = _("Reboot"),
+                ok_callback = function()
+                    UIManager:nextTick(UIManager.reboot_action)
+                end,
+            })
+        end
     else
-        return false, T(_("Couldn't extract archive:\n\n%1\n\nUnrecognized filename extension."), BD.filepath(archive))
+        UIManager.event_handlers.Reboot = function() end
     end
-    if not ok then
-        return false, T(_("Extracting archive failed:\n\n%1"), BD.filepath(archive))
+
+    if self:canPowerOff() then
+        UIManager.event_handlers.PowerOff = function(message_text)
+            local ConfirmBox = require("ui/widget/confirmbox")
+            UIManager:show(ConfirmBox:new{
+                text = message_text or _("Are you sure you want to power off the device?"),
+                ok_text = _("Power off"),
+                ok_callback = function()
+                    UIManager:nextTick(UIManager.poweroff_action)
+                end,
+            })
+        end
+    else
+        UIManager.event_handlers.PowerOff = function() end
     end
-    return true
+
+    if self:canRestart() then
+        UIManager.event_handlers.Restart = function(message_text)
+            local ConfirmBox = require("ui/widget/confirmbox")
+            UIManager:show(ConfirmBox:new{
+                text = message_text or _("This will take effect on next restart."),
+                ok_text = _("Restart now"),
+                ok_callback = function()
+                    UIManager:broadcastEvent(Event:new("Restart"))
+                end,
+                cancel_text = _("Restart later"),
+            })
+        end
+    else
+        UIManager.event_handlers.Restart = function(message_text)
+            local InfoMessage = require("ui/widget/infomessage")
+            UIManager:show(InfoMessage:new{
+                text = message_text or _("This will take effect on next restart."),
+            })
+        end
+    end
+
+    -- Let implementations expand on that
+    self:setEventHandlers(uimgr)
 end
 
-function Device:untar(archive, extract_to)
-    return os.execute(("./tar xf %q -C %q"):format(archive, extract_to))
+-- Devices can add additional event handlers by implementing this method.
+function Device:setEventHandlers(uimgr)
+    -- These will most probably be overwritten by device-specific `setEventHandlers` implementations
+    UIManager.event_handlers.Suspend = function()
+        self.powerd:beforeSuspend()
+    end
+    UIManager.event_handlers.Resume = function()
+        self.powerd:afterResume()
+    end
+end
+
+-- The common operations that should be performed before suspending the device.
+function Device:_beforeSuspend(inhibit)
+    UIManager:flushSettings()
+    UIManager:broadcastEvent(Event:new("Suspend"))
+
+    if inhibit ~= false then
+        -- Block input events unrelated to power management
+        self.input:inhibitInput(true)
+
+        -- Disable key repeat to avoid useless chatter (especially where Sleep Covers are concerned...)
+        self:disableKeyRepeat()
+    end
+end
+
+-- The common operations that should be performed after resuming the device.
+function Device:_afterResume(inhibit)
+    if inhibit ~= false then
+        -- Restore key repeat if it's not disabled
+        if G_reader_settings:nilOrFalse("input_no_key_repeat") then
+            self:restoreKeyRepeat()
+        end
+
+        -- Restore full input handling
+        self.input:inhibitInput(false)
+    end
+
+    UIManager:broadcastEvent(Event:new("Resume"))
+end
+
+-- The common operations that should be performed when the device is plugged to a power source.
+function Device:_beforeCharging()
+    -- Invalidate the capacity cache to make sure we poll up-to-date values for the LED check
+    self.powerd:invalidateCapacityCache()
+    self:_updateChargingLED()
+    UIManager:broadcastEvent(Event:new("Charging"))
+end
+
+-- The common operations that should be performed when the device is unplugged from a power source.
+function Device:_afterNotCharging()
+    self.powerd:invalidateCapacityCache()
+    self:_updateChargingLED()
+    UIManager:broadcastEvent(Event:new("NotCharging"))
 end
 
 return Device

@@ -4,8 +4,8 @@ local FT = require("ffi/freetype")
 local HB = require("ffi/harfbuzz")
 local Persist = require("persist")
 local util = require("util")
+local lfs = require("libs/libkoreader-lfs")
 local logger = require("logger")
-local dbg = require("dbg")
 
 local FontList = {
     fontdir = "./fonts",
@@ -40,8 +40,8 @@ local kindle_fonts_blacklist = {
     ["NotoNaskhArabicUI-Regular.ttf"] = true,
     ["NotoNaskh-Bold.ttf"] = true,
     ["NotoNaskh-Regular.ttf"] = true,
-    ["NotoSansBengali-Regular.ttf"] = true,
     ["NotoSansDevanagari-Regular.ttf"] = true,
+    ["NotoSansBengali-Regular.ttf"] = true,
     ["NotoSansGujarati-Regular.ttf"] = true,
     ["NotoSansKannada-Regular.ttf"] = true,
     ["NotoSansMalayalam-Regular.ttf"] = true,
@@ -73,29 +73,53 @@ local kindle_fonts_blacklist = {
     ["AmazonEmberBold-Italic.ttf"] = true,
     ["AmazonEmberBold-Regular.ttf"] = true,
     ["Caecilia_LT_65_Medium.ttf"] = false,
-    ["Caecilia_LT_66_Medium_Italic.ttf"] = false,
+    ["Caecilia_LT_66_Medium_Italic.ttf"] = true,
     ["Caecilia_LT_75_Bold.ttf"] = false,
-    ["Caecilia_LT_76_Bold_Italic.ttf"] = false,
+    ["Caecilia_LT_76_Bold_Italic.ttf"] = true,
     ["Caecilia_LT_67_Cond_Medium.ttf"] = true,
     ["Caecilia_LT_68_Cond_Medium_Italic.ttf"] = true,
     ["Caecilia_LT_77_Cond_Bold.ttf"] = true,
     ["Caecilia_LT_78_Cond_Bold_Italic.ttf"] = true,
     ["Futura-Bold.ttf"] = true,
     ["Futura-BoldOblique.ttf"] = true,
-    ["Helvetica_LT_65_Medium.ttf"] = true,
+    ["Helvetica_LT_65_Medium.ttf"] = false,
     ["Helvetica_LT_66_Medium_Italic.ttf"] = true,
     ["Helvetica_LT_75_Bold.ttf"] = true,
     ["Helvetica_LT_76_Bold_Italic.ttf"] = true,
+    -- All these fonts seemed to have been added not long before October 2026 as they were not available
+    -- in FW 5.17.1 but are in 5.19.6, not used in stock reader, so must be fallback.
+    ["Ankle-Biter-Mono-B.ttf"] = true,
+    ["Ankle-Biter-Single-B.ttf"] = true,
+    ["Cadia-Mono.ttf"] = true,
+    ["Cadia-Single.ttf"] = true,
+    ["Florio-Mono.ttf"] = true,
+    ["Florio-Single.ttf"] = true,
+    ["Intruding-Cat-Mono-A.ttf"] = true,
+    ["Intruding-Cat-Single-A.ttf"] = true,
+    ["Juicy-Gossip-MonoA.ttf"] = true,
+    ["Juicy-Gossip-Single-A.ttf"] = true,
+    ["Kadigan-Mono-D.ttf"] = true,
+    ["Kadigan-Single-D.ttf"] = true,
+    ["Notewright-Mono.ttf"] = true,
+    ["Notewright-Single.ttf"] = true,
+    ["Rainy-Winter-Mono-D.ttf"] = true,
+    ["Rainy-Winter-Single-D.ttf"] = true,
+    ["Salty-Dish-Mono-A.ttf"] = true,
+    ["Salty-Dish-Single-A.ttf"] = true,
+    ["Sunroom-Mono.ttf"] = true,
+    ["Sunroom-Single.ttf"] = true,
+    ["Tragic-Marker-Mono-A.ttf"] = true,
+    ["Tragic-Marker-Single-A.ttf"] = true,
 }
 
 local function isInFontsBlacklist(f)
     -- write test for this
-    return CanvasContext.isKindle() and kindle_fonts_blacklist[f]
+    return CanvasContext:isKindle() and kindle_fonts_blacklist[f]
 end
 
 local function getExternalFontDir()
-    if CanvasContext.hasSystemFonts() then
-        return require("frontend/ui/elements/font_settings"):getPath()
+    if CanvasContext:hasSystemFonts() then
+        return require("ui/elements/font_settings"):getPath()
     else
         return os.getenv("EXT_FONT_DIR")
     end
@@ -109,15 +133,15 @@ local function collectFaceInfo(path)
         return
     end
     for i=0, n-1 do
-        local ok, face = pcall(FT.newFace, path, nil, i)
+        local ok, ftsize = pcall(FT.newFaceSize, path, nil, i)
         if not ok then
             return nil
         end
 
         -- If family_name is missing, it's probably too broken to be useful
-        if face.family_name ~= nil then
-            local fres = face:getInfo()
-            local hbface = HB.hb_ft_face_create_referenced(face)
+        if ftsize.face.family_name ~= nil then
+            local fres = ftsize:getInfo()
+            local hbface = HB.hb_ft_face_create_referenced(ftsize.face)
             fres.names = hbface:getNames()
             fres.scripts, fres.langs = hbface:getCoverage()
             fres.path = path
@@ -125,7 +149,7 @@ local function collectFaceInfo(path)
             table.insert(res, fres)
             hbface:destroy()
         end
-        face:done()
+        ftsize:done()
     end
     return res
 end
@@ -135,19 +159,20 @@ local font_exts = {
     ["ttc"] = true,
     ["cff"] = true,
     ["otf"] = true,
+    ["otc"] = true,
+    ["woff"] = true,
+    ["woff2"] = true,
 }
 
 function FontList:_readList(dir, mark)
     util.findFiles(dir, function(path, file, attr)
         -- See if we're interested
-        if file:sub(1,1) == "." then return end
+        if file:sub(1, 1) == "." then return end
         local file_type = file:lower():match(".+%.([^.]+)") or ""
-        if not font_exts[file_type] then return end
+        if not font_exts[file_type] or isInFontsBlacklist(file) then return end
 
         -- Add it to the list
-        if not isInFontsBlacklist(file) then
-            table.insert(self.fontlist, path)
-        end
+        table.insert(self.fontlist, path)
 
         -- And into cached info table
         mark[path] = true
@@ -155,7 +180,7 @@ function FontList:_readList(dir, mark)
             return
         end
         local fi = collectFaceInfo(path)
-        if not fi then return end
+        if not fi or not next(fi) then return end
         fi.change = attr.change
         self.fontinfo[path] = fi
         mark.cache_dirty = true
@@ -163,15 +188,16 @@ function FontList:_readList(dir, mark)
 end
 
 function FontList:getFontList()
-    if #self.fontlist > 0 then return self.fontlist end
+    if self.fontlist[1] then return self.fontlist end
 
     local cache = Persist:new{
-        path = self.cachedir .. "/fontinfo.dat"
+        path = self.cachedir .. "/fontinfo.dat",
+        codec = "zstd",
     }
 
     local t, err = cache:load()
     if not t then
-        logger.info(cache.path, err, "initializing it")
+        logger.info(cache.path, err, "-> initializing it")
 
         -- Create new subdirectory
         lfs.mkdir(self.cachedir)
@@ -183,7 +209,7 @@ function FontList:getFontList()
 
     self:_readList(self.fontdir, mark)
     -- multiple paths should be joined with semicolon
-    for dir in string.gmatch(getExternalFontDir() or "", "([^;]+)") do
+    for dir in string.gmatch(getExternalFontDir() or "", "[^;]+") do
         self:_readList(dir, mark)
     end
 
@@ -195,21 +221,18 @@ function FontList:getFontList()
         end
     end
 
-    if dbg.is_verbose then
-        -- when verbose debug is on, always dump the cache in plain text (to inspect the db output)
+    -- Update the on-disk cache if necessary
+    if mark.cache_dirty then
         cache:save(self.fontinfo)
-    elseif mark.cache_dirty then
-        -- otherwise dump the db in binary (more compact), and only if something has changed
-        cache:save(self.fontinfo, true)
     end
 
     local names = self.fontnames
-    for _,coll in pairs(self.fontinfo) do
-        for _,v in ipairs(coll) do
+    for _, coll in pairs(self.fontinfo) do
+        for _, v in ipairs(coll) do
             local nlist = names[v.name] or {}
             assert(v.name)
             if #nlist == 0 then
-                logger.dbg("FONTNAMES ADD: ", v.name)
+                logger.dbg("FontList registered:", v.name)
             end
             names[v.name] = nlist
             table.insert(nlist, v)
@@ -218,6 +241,38 @@ function FontList:getFontList()
 
     table.sort(self.fontlist)
     return self.fontlist
+end
+
+function FontList:dumpFontList()
+    local serpent = require("ffi/serpent")
+
+    -- FontInfo
+    local path = self.cachedir .. "/fontinfo_dump.lua"
+    local f = io.open(path, "w")
+    if f ~= nil then
+        f:write(serpent.block(self.fontinfo, { indent = "  ", comment = false, nocode = true }))
+        f:close()
+    else
+        return
+    end
+
+    -- FontList
+    path = self.cachedir .. "/fontlist_dump.lua"
+    f = io.open(path, "w")
+    if f ~= nil then
+        f:write(serpent.block(self.fontlist, { indent = "  ", comment = false, nocode = true }))
+        f:close()
+    else
+        return
+    end
+
+    local InfoMessage = require("ui/widget/infomessage")
+    local UIManager = require("ui/uimanager")
+    local _ = require("gettext")
+    local T = require("ffi/util").template
+    UIManager:show(InfoMessage:new{
+        text = T(_("Fontlist data has been dumped in:\n%1"), self.cachedir)
+    })
 end
 
 -- Try to determine the localized font name
@@ -231,6 +286,16 @@ function FontList:getLocalizedFontName(file, index)
     altname = altname and (altname[tonumber(HB.HB_OT_NAME_ID_FULL_NAME)] or altname[tonumber(HB.HB_OT_NAME_ID_FONT_FAMILY)])
     if not altname then return end -- ensure nil
     return altname
+end
+
+function FontList:getFontArgFunc()
+    local cre = require("document/credocument"):engineInit()
+    local toggle = {}
+    local face_list = cre.getFontFaces()
+    for _, v in ipairs(face_list) do
+        table.insert(toggle, FontList:getLocalizedFontName(cre.getFontFaceFilenameAndFaceIndex(v)) or v)
+    end
+    return face_list, toggle
 end
 
 return FontList

@@ -5,31 +5,35 @@ This module manages widgets.
 local Device = require("device")
 local Event = require("ui/event")
 local Geom = require("ui/geometry")
-local TimeVal = require("ui/timeval")
 local dbg = require("dbg")
 local logger = require("logger")
 local ffiUtil = require("ffi/util")
 local util = require("util")
+local time = require("ui/time")
 local _ = require("gettext")
 local Input = Device.input
 local Screen = Device.screen
 
 local DEFAULT_FULL_REFRESH_COUNT = 6
 
--- there is only one instance of this
+-- used to temporarily stop screen refreshes and repaint during fast unwinding events
+local NOP = function() return end
+local SUSPEND_REPAINTS_FUNCTIONS_TO_NOP = { "setDirty", "_refresh", "_repaint" }
+
+-- This is a singleton
 local UIManager = {
     -- trigger a full refresh when counter reaches FULL_REFRESH_COUNT
     FULL_REFRESH_COUNT =
         G_reader_settings:isTrue("night_mode") and G_reader_settings:readSetting("night_full_refresh_count") or G_reader_settings:readSetting("full_refresh_count") or DEFAULT_FULL_REFRESH_COUNT,
     refresh_count = 0,
+    currently_scrolling = false,
 
     -- How long to wait between ZMQ wakeups: 50ms.
     ZMQ_TIMEOUT = 50 * 1000,
 
     event_handlers = nil,
 
-    _running = true,
-    _now = TimeVal:now(),
+    _now = time.now(),
     _window_stack = {},
     _task_queue = {},
     _task_queue_dirty = false,
@@ -39,9 +43,12 @@ local UIManager = {
     _refresh_func_stack = {},
     _entered_poweroff_stage = false,
     _exit_code = nil,
+    _gated_quit = nil,
     _prevent_standby_count = 0,
     _prev_prevent_standby_count = 0,
-    _discard_events_till = nil,
+    _input_gestures_disabled = false,
+
+    _repaint_watchdog_func = nil,
 
     event_hook = require("ui/hook_container"):new()
 }
@@ -57,332 +64,145 @@ function UIManager:init()
         Power = function(input_event)
             Device:onPowerEvent(input_event)
         end,
+        -- This is for hotpluggable evdev input devices (e.g., USB OTG)
+        UsbDevicePlugIn = function(input_event)
+            -- Retrieve the argument set by Input:handleKeyBoardEv
+            local evdev = table.remove(Input.fake_event_args[input_event])
+            local path = "/dev/input/event" .. tostring(evdev)
+
+            self:broadcastEvent(Event:new("EvdevInputInsert", path))
+        end,
+        UsbDevicePlugOut = function(input_event)
+            local evdev = table.remove(Input.fake_event_args[input_event])
+            local path = "/dev/input/event" .. tostring(evdev)
+
+            self:broadcastEvent(Event:new("EvdevInputRemove", path))
+        end,
     }
     self.poweroff_action = function()
-        self._entered_poweroff_stage = true
-        Device.orig_rotation_mode = Device.screen:getRotationMode()
-        Screen:setRotationMode(Screen.ORIENTATION_PORTRAIT)
         local Screensaver = require("ui/screensaver")
         Screensaver:setup("poweroff", _("Powered off"))
-        if Device:hasEinkScreen() and Screensaver:modeIsImage() then
-            if Screensaver:withBackground() then
-                Screen:clear()
-            end
-            Screen:refreshFull()
-        end
         Screensaver:show()
-        if Device:needsScreenRefreshAfterResume() then
-            Screen:refreshFull()
-        end
-        UIManager:nextTick(function()
+        self._entered_poweroff_stage = true
+        logger.info("Powering off the device...")
+        self:broadcastEvent(Event:new("PowerOff"))
+        self:broadcastEvent(Event:new("Close", { keep_screensaver = true }))
+        local function doQuit()
             Device:saveSettings()
-            if Device:isKobo() then
-                self._exit_code = 88
-            end
-            self:broadcastEvent(Event:new("Close"))
             Device:powerOff()
-        end)
+            if Device:isKobo() then
+                self:quit(88)
+            else
+                self:quit()
+            end
+        end
+        if not self._window_stack[1] then
+            -- Leave screen as-is
+            doQuit()
+        else
+            -- Allow screensaver to be painted
+            self:nextTick(doQuit)
+        end
     end
     self.reboot_action = function()
-        self._entered_poweroff_stage = true
-        Device.orig_rotation_mode = Device.screen:getRotationMode()
-        Screen:setRotationMode(Screen.ORIENTATION_PORTRAIT)
         local Screensaver = require("ui/screensaver")
         Screensaver:setup("reboot", _("Rebooting…"))
-        if Device:hasEinkScreen() and Screensaver:modeIsImage() then
-            if Screensaver:withBackground() then
-                Screen:clear()
-            end
-            Screen:refreshFull()
-        end
         Screensaver:show()
-        if Device:needsScreenRefreshAfterResume() then
-            Screen:refreshFull()
-        end
-        UIManager:nextTick(function()
+        self._entered_poweroff_stage = true
+        logger.info("Rebooting the device...")
+        self:broadcastEvent(Event:new("Reboot"))
+        self:broadcastEvent(Event:new("Close", { keep_screensaver = true }))
+        local function doQuit()
             Device:saveSettings()
-            if Device:isKobo() then
-                self._exit_code = 88
-            end
-            self:broadcastEvent(Event:new("Close"))
             Device:reboot()
-        end)
-    end
-    if Device:isPocketBook() then
-        -- Only fg/bg state plugin notifiers, not real power event.
-        self.event_handlers["Suspend"] = function()
-            self:_beforeSuspend()
-        end
-        self.event_handlers["Resume"] = function()
-            self:_afterResume()
-        end
-    end
-    if Device:isKobo() then
-        -- We do not want auto suspend procedure to waste battery during
-        -- suspend. So let's unschedule it when suspending, and restart it after
-        -- resume. Done via the plugin's onSuspend/onResume handlers.
-        self.event_handlers["Suspend"] = function()
-            -- Ignore the accelerometer (if that's not already the case) while we're alseep
-            if G_reader_settings:nilOrFalse("input_ignore_gsensor") then
-                Device:toggleGSensor(false)
-            end
-            self:_beforeSuspend()
-            Device:onPowerEvent("Suspend")
-        end
-        self.event_handlers["Resume"] = function()
-            Device:onPowerEvent("Resume")
-            self:_afterResume()
-            -- Stop ignoring the accelerometer (unless requested) when we wakeup
-            if G_reader_settings:nilOrFalse("input_ignore_gsensor") then
-                Device:toggleGSensor(true)
+            if Device:isKobo() then
+                self:quit(88)
+            else
+                self:quit()
             end
         end
-        self.event_handlers["PowerPress"] = function()
-            -- Always schedule power off.
-            -- Press the power button for 2+ seconds to shutdown directly from suspend.
-            UIManager:scheduleIn(2, self.poweroff_action)
-        end
-        self.event_handlers["PowerRelease"] = function()
-            if not self._entered_poweroff_stage then
-                UIManager:unschedule(self.poweroff_action)
-                -- resume if we were suspended
-                if Device.screen_saver_mode then
-                    self:resume()
-                else
-                    self:suspend()
-                end
-            end
-        end
-        -- Sleep Cover handling
-        if G_reader_settings:isTrue("ignore_power_sleepcover") then
-            -- NOTE: The hardware event itself will wake the kernel up if it's in suspend (:/).
-            --       Let the unexpected wakeup guard handle that.
-            self.event_handlers["SleepCoverClosed"] = nil
-            self.event_handlers["SleepCoverOpened"] = nil
-        elseif G_reader_settings:isTrue("ignore_open_sleepcover") then
-            -- Just ignore wakeup events, and do NOT set is_cover_closed,
-            -- so device/generic/device will let us use the power button to wake ;).
-            self.event_handlers["SleepCoverClosed"] = function()
-                self:suspend()
-            end
-            self.event_handlers["SleepCoverOpened"] = function()
-                Device.is_cover_closed = false
-            end
+        if not self._window_stack[1] then
+            -- Leave screen as-is
+            doQuit()
         else
-            self.event_handlers["SleepCoverClosed"] = function()
-                Device.is_cover_closed = true
-                self:suspend()
-            end
-            self.event_handlers["SleepCoverOpened"] = function()
-                Device.is_cover_closed = false
-                self:resume()
-            end
-        end
-        self.event_handlers["Light"] = function()
-            Device:getPowerDevice():toggleFrontlight()
-        end
-        self.event_handlers["Charging"] = function()
-            self:_beforeCharging()
-            -- NOTE: Plug/unplug events will wake the device up, which is why we put it back to sleep.
-            if Device.screen_saver_mode then
-                self:suspend()
-            end
-        end
-        self.event_handlers["NotCharging"] = function()
-            -- We need to put the device into suspension, other things need to be done before it.
-            self:_afterNotCharging()
-            if Device.screen_saver_mode then
-                self:suspend()
-            end
-        end
-        self.event_handlers["UsbPlugIn"] = function()
-            self:_beforeCharging()
-            -- NOTE: Plug/unplug events will wake the device up, which is why we put it back to sleep.
-            if Device.screen_saver_mode then
-                self:suspend()
-            else
-                -- Potentially start an USBMS session
-                local MassStorage = require("ui/elements/mass_storage")
-                MassStorage:start()
-            end
-        end
-        self.event_handlers["UsbPlugOut"] = function()
-            -- We need to put the device into suspension, other things need to be done before it.
-            self:_afterNotCharging()
-            if Device.screen_saver_mode then
-                self:suspend()
-            end
-        end
-        self.event_handlers["__default__"] = function(input_event)
-            -- Suspension in Kobo can be interrupted by screen updates. We ignore user touch input
-            -- in screen_saver_mode so screen updates won't be triggered in suspend mode.
-            -- We should not call self:suspend() in screen_saver_mode lest we stay on forever
-            -- trying to reschedule suspend. Other systems take care of unintended wake-up.
-            if not Device.screen_saver_mode then
-                self:sendEvent(input_event)
-            end
-        end
-    elseif Device:isKindle() then
-        self.event_handlers["IntoSS"] = function()
-            self:_beforeSuspend()
-            Device:intoScreenSaver()
-        end
-        self.event_handlers["OutOfSS"] = function()
-            Device:outofScreenSaver()
-            self:_afterResume();
-        end
-        self.event_handlers["Charging"] = function()
-            self:_beforeCharging()
-            Device:usbPlugIn()
-        end
-        self.event_handlers["NotCharging"] = function()
-            Device:usbPlugOut()
-            self:_afterNotCharging()
-        end
-    elseif Device:isRemarkable() then
-        self.event_handlers["Suspend"] = function()
-            self:_beforeSuspend()
-            Device:onPowerEvent("Suspend")
-        end
-        self.event_handlers["Resume"] = function()
-            Device:onPowerEvent("Resume")
-            self:_afterResume()
-        end
-        self.event_handlers["PowerPress"] = function()
-            UIManager:scheduleIn(2, self.poweroff_action)
-        end
-        self.event_handlers["PowerRelease"] = function()
-            if not self._entered_poweroff_stage then
-                UIManager:unschedule(self.poweroff_action)
-                -- resume if we were suspended
-                if Device.screen_saver_mode then
-                    self:resume()
-                else
-                    self:suspend()
-                end
-            end
-        end
-        self.event_handlers["__default__"] = function(input_event)
-            -- Same as in Kobo: we want to ignore keys during suspension
-            if not Device.screen_saver_mode then
-                self:sendEvent(input_event)
-            end
-        end
-    elseif Device:isSonyPRSTUX() then
-        self.event_handlers["PowerPress"] = function()
-            UIManager:scheduleIn(2, self.poweroff_action)
-        end
-        self.event_handlers["PowerRelease"] = function()
-            if not self._entered_poweroff_stage then
-                UIManager:unschedule(self.poweroff_action)
-                -- resume if we were suspended
-                if Device.screen_saver_mode then
-                    self:resume()
-                else
-                    self:suspend()
-                end
-            end
-        end
-        self.event_handlers["Suspend"] = function()
-            self:_beforeSuspend()
-            Device:intoScreenSaver()
-            Device:suspend()
-        end
-        self.event_handlers["Resume"] = function()
-            Device:resume()
-            Device:outofScreenSaver()
-            self:_afterResume()
-        end
-        self.event_handlers["Charging"] = function()
-            self:_beforeCharging()
-        end
-        self.event_handlers["NotCharging"] = function()
-            self:_afterNotCharging()
-        end
-        self.event_handlers["UsbPlugIn"] = function()
-            if Device.screen_saver_mode then
-                Device:resume()
-                Device:outofScreenSaver()
-                self:_afterResume()
-            end
-            Device:usbPlugIn()
-        end
-        self.event_handlers["UsbPlugOut"] = function()
-            Device:usbPlugOut()
-        end
-        self.event_handlers["__default__"] = function(input_event)
-            -- Same as in Kobo: we want to ignore keys during suspension
-            if not Device.screen_saver_mode then
-                self:sendEvent(input_event)
-            end
-        end
-    elseif Device:isCervantes() then
-        self.event_handlers["Suspend"] = function()
-            self:_beforeSuspend()
-            Device:onPowerEvent("Suspend")
-        end
-        self.event_handlers["Resume"] = function()
-            Device:onPowerEvent("Resume")
-            self:_afterResume()
-        end
-        self.event_handlers["PowerPress"] = function()
-            UIManager:scheduleIn(2, self.poweroff_action)
-        end
-        self.event_handlers["PowerRelease"] = function()
-            if not self._entered_poweroff_stage then
-                UIManager:unschedule(self.poweroff_action)
-                -- resume if we were suspended
-                if Device.screen_saver_mode then
-                    self:resume()
-                else
-                    self:suspend()
-                end
-            end
-        end
-        self.event_handlers["Charging"] = function()
-            self:_beforeCharging()
-            if Device.screen_saver_mode then
-                self:suspend()
-            end
-        end
-        self.event_handlers["NotCharging"] = function()
-            self:_afterNotCharging()
-            if Device.screen_saver_mode then
-                self:suspend()
-            end
-        end
-        self.event_handlers["UsbPlugIn"] = function()
-            self:_beforeCharging()
-            if Device.screen_saver_mode then
-                self:suspend()
-            else
-                -- Potentially start an USBMS session
-                local MassStorage = require("ui/elements/mass_storage")
-                MassStorage:start()
-            end
-        end
-        self.event_handlers["UsbPlugOut"] = function()
-            self:_afterNotCharging()
-            if Device.screen_saver_mode then
-                self:suspend()
-            end
-        end
-        self.event_handlers["__default__"] = function(input_event)
-            -- Same as in Kobo: we want to ignore keys during suspension
-            if not Device.screen_saver_mode then
-                self:sendEvent(input_event)
-            end
-        end
-    elseif Device:isSDL() then
-        self.event_handlers["Suspend"] = function()
-            self:_beforeSuspend()
-            Device:simulateSuspend()
-        end
-        self.event_handlers["Resume"] = function()
-            Device:simulateResume()
-            self:_afterResume()
+            -- Allow screensaver to be painted
+            self:nextTick(doQuit)
         end
     end
+
+    -- Tell Device that we're now available, so that it can setup PM event handlers
+    Device:_UIManagerReady(self)
+
+    -- A simple wrapper for UIManager:quit()
+    -- This may be overwritten by setRunForeverMode(); for testing purposes
+    self:unsetRunForeverMode()
+end
+
+-- Crappy wrapper because of circular dependencies
+function UIManager:setIgnoreTouchInput(state)
+    local InputContainer = require("ui/widget/container/inputcontainer")
+    InputContainer:setIgnoreTouchInput(state)
+end
+
+local function restore_functions(self, func_list)
+    for _, name in ipairs(func_list) do
+        self[name] = self._orig_funcs[name]
+    end
+    self._orig_funcs = nil
+end
+
+--[[--
+Suspends repaints and refreshes
+
+-- Note: The watchdog enforces a strict global deadline for the UI suspension.
+-- If a watchdog is already armed, subsequent requests to suspend repaints will
+-- deliberately not reset the timer. This ensures the timeout ticks down from the
+-- initial caller's request, preventing a chain of events from compounding the
+-- delay and freezing the screen indefinitely.
+
+@boolean `state`: `true` to suspend repaints, `false` to resume them
+@number `timeout`: optional suspension duration in seconds (default: 2) before repaints are resumed automatically
+]]
+function UIManager:setSuspendRepaints(state, timeout)
+    if not state and not self._repaint_watchdog_func then return end
+    if state and self._repaint_watchdog_func then return end
+    -- Suspending repaints can be incredibly dangerous, we must
+    -- ensure we don't get stuck in this state forever, otherwise
+    -- we might end up with a frozen screen and no way out.
+    if not state then
+        -- The chain completed or halted legitimately. Disarm the watchdog.
+        self:unschedule(self._repaint_watchdog_func)
+        self._repaint_watchdog_func = nil
+        restore_functions(self, SUSPEND_REPAINTS_FUNCTIONS_TO_NOP)
+    else
+        -- The chain has just started. Arm the watchdog for a strict timeout (or 2 sec) deadline.
+        self._repaint_watchdog_func = function()
+            logger.warn("UIManager: Repaint suspension watchdog expired; forcing UI recovery.")
+            self._repaint_watchdog_func = nil
+            restore_functions(self, SUSPEND_REPAINTS_FUNCTIONS_TO_NOP)
+            self:setDirty(nil, "full")
+        end
+        self._orig_funcs = {}
+        for _, name in ipairs(SUSPEND_REPAINTS_FUNCTIONS_TO_NOP) do
+            self._orig_funcs[name] = self[name]
+            self[name] = NOP
+        end
+        timeout = math.max(0, math.min(timeout or 2, 10))
+        self:scheduleIn(timeout, self._repaint_watchdog_func)
+    end
+    logger.dbg("UIManager: Repaints and refreshes suspended:", state)
+end
+
+function UIManager:getSuspendRepaints()
+    return self._repaint_watchdog_func
+end
+
+function UIManager:setSilentMode(toggle)
+    self.silent_mode = toggle or nil
+end
+
+function UIManager:isInSilentMode()
+    return self.silent_mode or false
 end
 
 --[[--
@@ -399,7 +219,7 @@ For more details about refreshtype, refreshregion & refreshdither see the descri
 If refreshtype is omitted, no refresh will be enqueued at this time.
 
 @param widget a @{ui.widget.widget|widget} object
-@string refreshtype `"full"`, `"flashpartial"`, `"flashui"`, `"partial"`, `"ui"`, `"fast"` (optional)
+@string refreshtype `"full"`, `"flashpartial"`, `"flashui"`, `"[partial]"`, `"[ui]"`, `"partial"`, `"ui"`, `"fast"`, `"a2"` (optional)
 @param refreshregion a rectangle @{ui.geometry.Geom|Geom} object (optional, requires refreshtype to be set)
 @int x horizontal screen offset (optional, `0` if omitted)
 @int y vertical screen offset (optional, `0` if omitted)
@@ -408,12 +228,15 @@ If refreshtype is omitted, no refresh will be enqueued at this time.
 ]]
 function UIManager:show(widget, refreshtype, refreshregion, x, y, refreshdither)
     if not widget then
-        logger.dbg("widget not exist to be shown")
+        logger.dbg("attempted to show a nil widget")
+        return
+    end
+    if self.silent_mode and widget.honor_silent_mode then
+        logger.dbg("widget show disabled:", widget.id or widget.name or tostring(widget))
         return
     end
     logger.dbg("show widget:", widget.id or widget.name or tostring(widget))
 
-    self._running = true
     local window = {x = x or 0, y = y or 0, widget = widget}
     -- put this window on top of the topmost non-modal window
     for i = #self._window_stack, 0, -1 do
@@ -435,13 +258,18 @@ function UIManager:show(widget, refreshtype, refreshregion, x, y, refreshdither)
     -- tell the widget that it is shown now
     widget:handleEvent(Event:new("Show"))
     -- check if this widget disables double tap gesture
-    if widget.disable_double_tap == false then
-        Input.disable_double_tap = false
-    else
-        Input.disable_double_tap = true
-    end
+    Input.disable_double_tap = widget.disable_double_tap ~= false
+    -- a widget may handle concurrent contacts as independent taps
+    Input.allow_concurrent_taps = widget.allow_concurrent_taps == true
     -- a widget may override tap interval (when it doesn't, nil restores the default)
     Input.tap_interval_override = widget.tap_interval_override
+    -- If input was disabled, re-enable it while this widget is shown so we can actually interact with it.
+    -- The only thing that could actually call show in this state is something automatic, so we need to be able to deal with it.
+    if UIManager._input_gestures_disabled then
+        logger.dbg("Gestures were disabled, temporarily re-enabling them to allow interaction with widget")
+        self:setIgnoreTouchInput(false)
+        widget._restored_input_gestures = true
+    end
 end
 
 --[[--
@@ -454,63 +282,69 @@ For more details about refreshtype, refreshregion & refreshdither see the descri
 If refreshtype is omitted, no extra refresh will be enqueued at this time, leaving only those from the uncovered widgets.
 
 @param widget a @{ui.widget.widget|widget} object
-@string refreshtype `"full"`, `"flashpartial"`, `"flashui"`, `"partial"`, `"ui"`, `"fast"` (optional)
+@string refreshtype `"full"`, `"flashpartial"`, `"flashui"`, `"[partial]"`, `"[ui]"`, `"partial"`, `"ui"`, `"fast"`, `"a2"` (optional)
 @param refreshregion a rectangle @{ui.geometry.Geom|Geom} object (optional, requires refreshtype to be set)
 @bool refreshdither `true` if the refresh requires dithering (optional, requires refreshtype to be set)
 @see setDirty
 ]]
 function UIManager:close(widget, refreshtype, refreshregion, refreshdither)
     if not widget then
-        logger.dbg("widget to be closed does not exist")
+        logger.dbg("attempted to close a nil widget")
         return
     end
     logger.dbg("close widget:", widget.name or widget.id or tostring(widget))
     local dirty = false
-    -- Ensure all the widgets can get onFlushSettings event.
+    -- First notify the closed widget to save its settings...
     widget:handleEvent(Event:new("FlushSettings"))
-    -- first send close event to widget
+    -- ...and notify it that it ought to be gone now.
     widget:handleEvent(Event:new("CloseWidget"))
-    -- make it disabled by default and check if any widget wants it disabled or enabled
+    -- Make sure it's disabled by default and check if there are any widgets that want it disabled or enabled.
     Input.disable_double_tap = true
+    Input.allow_concurrent_taps = false
     local requested_disable_double_tap = nil
     local is_covered = false
     local start_idx = 1
-    -- then remove all references to that widget on stack and refresh
+    -- Then remove all references to that widget on stack and refresh.
     for i = #self._window_stack, 1, -1 do
-        if self._window_stack[i].widget == widget then
-            self._dirty[self._window_stack[i].widget] = nil
+        local w = self._window_stack[i].widget
+        if w == widget then
+            self._dirty[w] = nil
             table.remove(self._window_stack, i)
             dirty = true
         else
-            -- If anything else on the stack not already hidden by (i.e., below) a fullscreen widget was dithered, honor the hint
-            if self._window_stack[i].widget.dithered and not is_covered then
-                refreshdither = true
-                logger.dbg("Lower widget", self._window_stack[i].widget.name or self._window_stack[i].widget.id or tostring(self._window_stack[i].widget), "was dithered, honoring the dithering hint")
-            end
+            if not is_covered then
+                -- If anything else on the stack not already hidden by (i.e., below) a fullscreen widget was dithered, honor the hint
+                if w.dithered then
+                    refreshdither = true
+                    logger.dbg("Lower widget", w.name or w.id or tostring(w), "was dithered, honoring the dithering hint")
+                end
 
-            -- Remember the uppermost widget that covers the full screen, so we don't bother calling setDirty on hidden (i.e., lower) widgets in the following dirty loop.
-            -- _repaint already does that later on to skip the actual paintTo calls, so this ensures we limit the refresh queue to stuff that will actually get painted.
-            if not is_covered and self._window_stack[i].widget.covers_fullscreen then
-                is_covered = true
-                start_idx = i
-                logger.dbg("Lower widget", self._window_stack[i].widget.name or self._window_stack[i].widget.id or tostring(self._window_stack[i].widget), "covers the full screen")
-                if i > 1 then
-                    logger.dbg("not refreshing", i-1, "covered widget(s)")
+                -- Remember the uppermost widget that covers the full screen, so we don't bother calling setDirty on hidden (i.e., lower) widgets in the following dirty loop.
+                -- _repaint already does that later on to skip the actual paintTo calls, so this ensures we limit the refresh queue to stuff that will actually get painted.
+                if w.covers_fullscreen then
+                    is_covered = true
+                    start_idx = i
+                    logger.dbg("Lower widget", w.name or w.id or tostring(w), "covers the full screen")
+                    if i > 1 then
+                        logger.dbg("not refreshing", i-1, "covered widget(s)")
+                   end
                 end
             end
 
-            -- Set double tap to how the topmost specifying widget wants it
-            if requested_disable_double_tap == nil and self._window_stack[i].widget.disable_double_tap ~= nil then
-                requested_disable_double_tap = self._window_stack[i].widget.disable_double_tap
+            -- Set double tap to how the topmost widget with that flag wants it
+            if requested_disable_double_tap == nil and w.disable_double_tap ~= nil then
+                requested_disable_double_tap = w.disable_double_tap
             end
         end
     end
     if requested_disable_double_tap ~= nil then
         Input.disable_double_tap = requested_disable_double_tap
     end
-    if #self._window_stack > 0 then
-        -- set tap interval override to what the topmost widget specifies (when it doesn't, nil restores the default)
-        Input.tap_interval_override = self._window_stack[#self._window_stack].widget.tap_interval_override
+    if self._window_stack[1] then
+        local top_widget = self._window_stack[#self._window_stack].widget
+        -- set input overrides to what the topmost widget specifies
+        Input.allow_concurrent_taps = top_widget.allow_concurrent_taps == true
+        Input.tap_interval_override = top_widget.tap_interval_override
     end
     if dirty and not widget.invisible then
         -- schedule the remaining visible (i.e., uncovered) widgets to be painted
@@ -519,49 +353,52 @@ function UIManager:close(widget, refreshtype, refreshregion, refreshdither)
         end
         self:_refresh(refreshtype, refreshregion, refreshdither)
     end
+    if widget._restored_input_gestures then
+        logger.dbg("Widget is gone, disabling gesture handling again")
+        self:setIgnoreTouchInput(true)
+    end
 end
 
--- schedule an execution task, task queue is in ascendant order
-function UIManager:schedule(time, action, ...)
-    local p, s, e = 1, 1, #self._task_queue
-    if e ~= 0 then
-        -- do a binary insert
-        repeat
-            p = math.floor(s + (e - s) / 2)
-            local p_time = self._task_queue[p].time
-            if time > p_time then
-                if s == e then
-                    p = e + 1
-                    break
-                elseif s + 1 == e then
-                    s = e
-                else
-                    s = p
-                end
-            elseif time < p_time then
-                e = p
-                if s == e then
-                    break
-                end
-            else
-                -- for fairness, it's better to make p+1 is strictly less than
-                -- p might want to revisit here in the future
-                break
-            end
-        until e < s
+--- Shift the execution times of all scheduled tasks.
+-- UIManager uses CLOCK_MONOTONIC (which doesn't tick during standby), so shifting the execution
+-- time by a negative value will lead to an execution at the expected time.
+-- @param time if positive execute the tasks later, if negative they should be executed earlier
+function UIManager:shiftScheduledTasksBy(shift_time)
+    for i, v in ipairs(self._task_queue) do
+        v.time = v.time + shift_time
     end
-    table.insert(self._task_queue, p, {
-        time = time,
+end
+
+-- Schedule an execution task; task queue is in descending order
+function UIManager:schedule(sched_time, action, ...)
+    local lo, hi = 1, #self._task_queue
+    -- Leftmost binary insertion
+    while lo <= hi do
+        -- NOTE: We should be (mostly) free from overflow here, thanks to LuaJIT's BitOp semantics.
+        --       For more fun details about this particular overflow,
+        --       c.f., https://ai.googleblog.com/2006/06/extra-extra-read-all-about-it-nearly.html
+        -- NOTE: For more fun reading about the binary search algo in general,
+        --       c.f., https://reprog.wordpress.com/2010/04/19/are-you-one-of-the-10-percent/
+        local mid = bit.rshift(lo + hi, 1)
+        local mid_time = self._task_queue[mid].time
+        if mid_time <= sched_time then
+            hi = mid - 1
+        else
+            lo = mid + 1
+        end
+    end
+
+    table.insert(self._task_queue, lo, {
+        time = sched_time,
         action = action,
-        argc = select('#', ...),
-        args = {...},
+        args = table.pack(...),
     })
     self._task_queue_dirty = true
 end
 dbg:guard(UIManager, 'schedule',
-    function(self, time, action)
-        assert(time.sec >= 0, "Only positive time allowed")
-        assert(action ~= nil)
+    function(self, sched_time, action)
+        assert(sched_time >= 0, "Only positive time allowed")
+        assert(action ~= nil, "No action")
     end)
 
 --[[--
@@ -576,7 +413,7 @@ Schedules a task to be run a certain amount of seconds from now.
 function UIManager:scheduleIn(seconds, action, ...)
     -- We might run significantly late inside an UI frame, so we can't use the cached value here.
     -- It would also cause some bad interactions with the way nextTick & co behave.
-    local when = TimeVal:now() + TimeVal:fromnumber(seconds)
+    local when = time.now() + time.s(seconds)
     self:schedule(when, action, ...)
 end
 dbg:guard(UIManager, 'scheduleIn',
@@ -602,14 +439,20 @@ Useful to run UI callbacks ASAP without skipping repaints.
 
 @func action reference to the task to be scheduled (may be anonymous)
 @param ... optional arguments passed to action
+
+@return A reference to the initial nextTick wrapper function,
+necessary if the caller wants to unschedule action *before* it actually gets inserted in the task queue by nextTick.
 @see nextTick
 ]]
 function UIManager:tickAfterNext(action, ...)
-    -- Storing varargs is a bit iffy as we don't build LuaJIT w/ 5.2 compat, so we don't have access to table.pack...
-    -- c.f., http://lua-users.org/wiki/VarargTheSecondClassCitizen
-    local n = select('#', ...)
-    local va = {...}
-    return self:nextTick(function() self:nextTick(action, unpack(va, 1, n)) end)
+    -- We need to keep a reference to this anonymous function, as it is *NOT* quite `action` yet,
+    -- and the caller might want to unschedule it early...
+    local action_wrapper = function(...)
+        self:nextTick(action, ...)
+    end
+    self:nextTick(action_wrapper, ...)
+
+    return action_wrapper
 end
 --[[
 -- NOTE: This appears to work *nearly* just as well, but does sometimes go too fast (might depend on kernel HZ & NO_HZ settings?)
@@ -617,6 +460,46 @@ function UIManager:tickAfterNext(action)
     return self:scheduleIn(0.001, action)
 end
 --]]
+
+function UIManager:debounce(seconds, immediate, action)
+    -- Ported from underscore.js
+    local args = nil
+    local previous_call_at = nil
+    local is_scheduled = false
+    local result = nil
+
+    local scheduled_action
+    scheduled_action = function()
+        local passed_from_last_call = time:now() - previous_call_at
+        if seconds > passed_from_last_call then
+            self:scheduleIn(seconds - passed_from_last_call, scheduled_action)
+            is_scheduled = true
+        else
+            is_scheduled = false
+            if not immediate then
+                result = action(unpack(args, 1, args.n))
+            end
+            if not is_scheduled then
+                -- This check is needed because action can recursively call debounced_action_wrapper
+                args = nil
+            end
+        end
+    end
+    local debounced_action_wrapper = function(...)
+        args = table.pack(...)
+        previous_call_at = time:now()
+        if not is_scheduled then
+            self:scheduleIn(seconds, scheduled_action)
+            is_scheduled = true
+            if immediate then
+                result = action(unpack(args, 1, args.n))
+            end
+        end
+        return result
+    end
+
+    return debounced_action_wrapper
+end
 
 --[[--
 Unschedules a previously scheduled task.
@@ -678,14 +561,20 @@ Here's a quick rundown of what each refreshtype should be used for:
              Can be promoted to flashing after `FULL_REFRESH_COUNT` refreshes.
              Don't abuse to avoid spurious flashes.
              In practice, this means this should mostly always be limited to ReaderUI.
+* `[partial]`: variant of partial that asks the driver not to merge this update with surrounding ones.
+               Equivalent to partial on platforms where this distinction is not implemented.
 * `ui`: medium fidelity refresh (e.g., mixed content).
         Should apply to most UI elements.
         When in doubt, use this.
-* `fast`: low fidelity refresh (e.g., monochrome content).
+* `[ui]`: variant of ui that asks the driver not to merge this update with surrounding ones.
+          Equivalent to ui on platforms where this distinction is not implemented.
+* `fast`: low fidelity refresh (e.g., monochrome content (technically, from any to B&W)).
           Should apply to most highlighting effects achieved through inversion.
           Note that if your highlighted element contains text,
           you might want to keep the unhighlight refresh as `"ui"` instead, for crisper text.
           (Or optimize that refresh away entirely, if you can get away with it).
+* `a2`:   low fidelity refresh (e.g., monochrome content (technically, from B&W to B&W only)).
+          Should be limited to very specific use-cases (e.g., keyboard)
 * `flashui`: like `ui`, but flashing.
              Can be used when showing a UI element for the first time, or when closing one, to avoid ghosting.
 * `flashpartial`: like `partial`, but flashing (and not counting towards flashing promotions).
@@ -763,18 +652,21 @@ UIManager:setDirty(self.widget, "partial", Geom:new{x=10,y=10,w=100,h=50})
 UIManager:setDirty(self.widget, function() return "ui", self.someelement.dimen end)
 
 @param widget a window-level widget object, `"all"`, or `nil`
-@param refreshtype `"full"`, `"flashpartial"`, `"flashui"`, `"partial"`, `"ui"`, `"fast"` (or a lambda, see description above)
+@param refreshtype `"full"`, `"flashpartial"`, `"flashui"`, `"[partial]"`, `"[ui]"`, `"partial"`, `"ui"`, `"fast"`, `"a2"` (or a lambda, see description above)
 @param refreshregion a rectangle @{ui.geometry.Geom|Geom} object (optional, omitting it means the region will cover the full screen)
 @bool refreshdither `true` if widget requires dithering (optional)
 ]]
 function UIManager:setDirty(widget, refreshtype, refreshregion, refreshdither)
+    local widget_name
     if widget then
+        widget_name = widget.name or widget.id or tostring(widget)
         if widget == "all" then
             -- special case: set all top-level widgets as being "dirty".
-            for i = 1, #self._window_stack do
-                self._dirty[self._window_stack[i].widget] = true
+            for _, window in ipairs(self._window_stack) do
+                local w = window.widget
+                self._dirty[w] = true
                 -- If any of 'em were dithered, honor their dithering hint
-                if self._window_stack[i].widget.dithered then
+                if w.dithered then
                     -- NOTE: That works when refreshtype is NOT a function,
                     --       which is why _repaint does another pass of this check ;).
                     logger.dbg("setDirty on all widgets: found a dithered widget, infecting the refresh queue")
@@ -790,16 +682,17 @@ function UIManager:setDirty(widget, refreshtype, refreshregion, refreshdither)
             -- NOTE: We only ever check the dirty flag on top-level widgets, so only set it there!
             --       Enable verbose debug to catch misbehaving widgets via our post-guard.
             for i = #self._window_stack, 1, -1 do
+                local w = self._window_stack[i].widget
                 if handle_alpha then
-                    self._dirty[self._window_stack[i].widget] = true
-                    logger.dbg("setDirty: Marking as dirty widget:", self._window_stack[i].widget.name or self._window_stack[i].widget.id or tostring(self._window_stack[i].widget), "because it's below translucent widget:", widget.name or widget.id or tostring(widget))
+                    self._dirty[w] = true
+                    logger.dbg("setDirty: Marking as dirty widget:", w.name or w.id or tostring(w), "because it's below translucent widget:", widget_name)
                     -- Stop flagging widgets at the uppermost one that covers the full screen
-                    if self._window_stack[i].widget.covers_fullscreen then
+                    if w.covers_fullscreen then
                         break
                     end
                 end
 
-                if self._window_stack[i].widget == widget then
+                if w == widget then
                     self._dirty[widget] = true
 
                     -- We've got a match, now check if it's translucent...
@@ -840,20 +733,25 @@ function UIManager:setDirty(widget, refreshtype, refreshregion, refreshdither)
             -- NOTE: It's too early to tell what the function will return (especially the region), because the widget hasn't been painted yet.
             --       Consuming the lambda now also appears have nasty side-effects that render it useless later, subtly breaking a whole lot of things...
             --       Thankfully, we can track them in _refresh()'s logging very soon after that...
-            logger.dbg("setDirty via a func from widget", widget and (widget.name or widget.id or tostring(widget)) or "nil")
+            logger.dbg("setDirty via a func from widget", widget_name)
         end
     else
         -- otherwise, enqueue refresh
         self:_refresh(refreshtype, refreshregion, refreshdither)
         if dbg.is_on then
             if refreshregion then
-                logger.dbg("setDirty", refreshtype and refreshtype or "nil", "from widget", widget and (widget.name or widget.id or tostring(widget)) or "nil", "w/ region", refreshregion.x, refreshregion.y, refreshregion.w, refreshregion.h, refreshdither and "AND w/ HW dithering" or "")
+                logger.dbg("setDirty", refreshtype, "from widget", widget_name, "w/ region", refreshregion.x, refreshregion.y, refreshregion.w, refreshregion.h, "dithering:", refreshdither)
             else
-                logger.dbg("setDirty", refreshtype and refreshtype or "nil", "from widget", widget and (widget.name or widget.id or tostring(widget)) or "nil", "w/ NO region", refreshdither and "AND w/ HW dithering" or "")
+                logger.dbg("setDirty", refreshtype, "from widget", widget_name, "w/ NO region; dithering:", refreshdither)
             end
         end
     end
 end
+--[[
+-- NOTE: While nice in theory, this is *extremely* verbose in practice,
+--       because most widgets will call setDirty at least once during their initialization,
+--       and that happens before they make it to the window stack...
+--       Plus, setDirty(nil, ...) is a completely valid use-case with documented semantics...
 dbg:guard(UIManager, 'setDirty',
     nil,
     function(self, widget, refreshtype, refreshregion, refreshdither)
@@ -871,21 +769,7 @@ dbg:guard(UIManager, 'setDirty',
             dbg:v("INFO: invalid widget for setDirty()", debug.traceback())
         end
     end)
-
---[[--
-Clear the full repaint & refresh queues.
-
-NOTE: Beware! This doesn't take any prisonners!
-You shouldn't have to resort to this unless in very specific circumstances!
-plugins/coverbrowser.koplugin/covermenu.lua building a franken-menu out of buttondialogtitle & buttondialog
-and wanting to avoid inheriting their original paint/refresh cycle being a prime example.
 --]]
-function UIManager:clearRenderStack()
-    logger.dbg("clearRenderStack: Clearing the full render stack!")
-    self._dirty = {}
-    self._refresh_func_stack = {}
-    self._refresh_stack = {}
-end
 
 function UIManager:insertZMQ(zeromq)
     table.insert(self._zeromqs, zeromq)
@@ -944,59 +828,50 @@ function UIManager:ToggleNightMode(night_mode)
     end
 end
 
---- Get top widget (name if possible, ref otherwise).
-function UIManager:getTopWidget()
-    local top = self._window_stack[#self._window_stack]
-    if not top or not top.widget then
+--- Get n.th topmost widget
+function UIManager:getNthTopWidget(n)
+    n = n and n-1 or 0
+    if #self._window_stack - n < 1 then
+        -- No or not enough widgets in the stack, bye!
         return nil
     end
-    if top.widget.name then
-        return top.widget.name
-    end
-    return top.widget
+
+    local widget = self._window_stack[#self._window_stack - n].widget
+    return widget
 end
 
---[[--
-Get the *second* topmost widget, if there is one (name if possible, ref otherwise).
-
-Useful when VirtualKeyboard is involved, as it *always* steals the top spot ;).
-
-NOTE: Will skip over VirtualKeyboard instances, plural, in case there are multiple (because, apparently, we can do that.. ugh).
---]]
-function UIManager:getSecondTopmostWidget()
-    if #self._window_stack <= 1 then
-        -- Not enough widgets in the stack, bye!
-        return nil
-    end
-
-    -- Because everything is terrible, you can actually instantiate multiple VirtualKeyboards,
-    -- and they'll stack at the top, so, loop until we get something that *isn't* VK...
-    for i = #self._window_stack - 1, 1, -1 do
-        local sec = self._window_stack[i]
-        if not sec or not sec.widget then
-            return nil
-        end
-
-        if sec.widget.name then
-            if sec.widget.name ~= "VirtualKeyboard" then
-                return sec.widget.name
-            end
-            -- Meaning if name is set, and is set to VK => continue, as we want the *next* widget.
-            -- I *really* miss the continue keyword, Lua :/.
-        else
-            return sec.widget
+--- Top-to-bottom widgets iterator
+--- NOTE: VirtualKeyboard can be instantiated multiple times, and is a modal,
+--        so don't be surprised if you find a couple of instances of it at the top ;).
+function UIManager:topdown_widgets_iter()
+    local n = #self._window_stack
+    local i = n + 1
+    return function()
+        i = i - 1
+        if i > 0 then
+            return self._window_stack[i].widget
         end
     end
+end
 
-    return nil
+--- Get the topmost visible widget
+function UIManager:getTopmostVisibleWidget()
+    for i = #self._window_stack, 1, -1 do
+        local widget = self._window_stack[i].widget
+        -- Skip invisible widgets (e.g., TrapWidget)
+        if not widget.invisible then
+            return widget
+        end
+    end
 end
 
 --- Check if a widget is still in the window stack, or is a subwidget of a widget still in the window stack.
 function UIManager:isSubwidgetShown(widget, max_depth)
     for i = #self._window_stack, 1, -1 do
-        local matched, depth = util.arrayReferences(self._window_stack[i].widget, widget, max_depth)
+        local w = self._window_stack[i].widget
+        local matched, depth = util.arrayReferences(w, widget, max_depth)
         if matched then
-            return matched, depth, self._window_stack[i].widget
+            return matched, depth, w
         end
     end
     return false
@@ -1012,127 +887,149 @@ function UIManager:isWidgetShown(widget)
     return false
 end
 
---[[--
-Returns the region of the previous refresh.
-
-@return a rectangle @{ui.geometry.Geom|Geom} object
-]]
-function UIManager:getPreviousRefreshRegion()
-   return self._last_refresh_region
-end
-
 --- Signals to quit.
-function UIManager:quit()
-    if not self._running then return end
-    logger.info("quitting uimanager")
+-- An exit_code of false is not allowed.
+function UIManager:quit(exit_code, implicit)
+    if exit_code == false then
+        logger.err("UIManager:quit() called with false")
+        return
+    end
+    -- Also honor older exit codes; default to 0
+    self._exit_code = exit_code or self._exit_code or 0
+    if not implicit then
+        -- Explicit call via UIManager:quit (as opposed to self:_gated_quit)
+        if exit_code then
+            logger.info("Preparing to quit UIManager with exit code:", exit_code)
+        else
+            logger.info("Preparing to quit UIManager")
+        end
+    end
     self._task_queue_dirty = false
-    self._running = false
-    self._run_forever = nil
-    for i = #self._window_stack, 1, -1 do
-        table.remove(self._window_stack, i)
-    end
-    for i = #self._task_queue, 1, -1 do
-        table.remove(self._task_queue, i)
-    end
+    self._window_stack = {}
+    self._task_queue = {}
     for i = #self._zeromqs, 1, -1 do
         self._zeromqs[i]:stop()
-        table.remove(self._zeromqs, i)
     end
+    self._zeromqs = {}
     if self.looper then
         self.looper:close()
         self.looper = nil
     end
+    return self._exit_code
+end
+dbg:guard(UIManager, 'quit',
+    function(self, exit_code)
+        assert(exit_code ~= false, "exit_code == false is not supported")
+    end)
+
+-- Disable automatic UIManager quit; for testing purposes
+function UIManager:setRunForeverMode()
+    self._gated_quit = function() return false end
+end
+
+-- Enable automatic UIManager quit; for testing purposes
+function UIManager:unsetRunForeverMode()
+    self._gated_quit = function() return self:quit(nil, true) end
+end
+
+-- We'll want to return from this without actually quitting, so this is
+-- a slightly mangled UIManager:run() call to coerce the main loop into
+-- submission to ignore an empty window stack *once*.
+function UIManager:runOnce()
+    -- We don't actually want to call self.quit, and we need to deal with a bit of trickery in there anyway...
+    self._gated_quit = function()
+        -- We need this set to break the loop in UIManager:run()
+        self._exit_code = 0
+        -- And this is to break the loop in UIManager:handleInput()
+        return true
+    end
+    -- The idea being that we want to *return* from this run call, but *without* quitting.
+    -- NOTE: This implies that calling run multiple times across a single session *needs* to be safe.
+    self:run()
+    -- Restore standard behavior
+    self:unsetRunForeverMode()
+    self._exit_code = nil
 end
 
 --[[--
-Request all @{ui.event.Event|Event}s to be ignored for some duration.
-
-@param set_or_seconds either `true`, in which case a platform-specific delay is chosen, or a duration in seconds (***int***).
-]]
-function UIManager:discardEvents(set_or_seconds)
-    if not set_or_seconds then -- remove any previously set
-        self._discard_events_till = nil
-        return
-    end
-    local delay
-    if set_or_seconds == true then
-        -- Use an adequate delay to account for device refresh duration
-        -- so any events happening in this delay (ie. before a widget
-        -- is really painted on screen) are discarded.
-        if Device:hasEinkScreen() then
-            -- A screen refresh can take a few 100ms,
-            -- sometimes > 500ms on some devices/temperatures.
-            -- So, block for 400ms (to have it displayed) + 400ms
-            -- for user reaction to it
-            delay = TimeVal:new{ sec = 0, usec = 800000 }
-        else
-            -- On non-eInk screen, display is usually instantaneous
-            delay = TimeVal:new{ sec = 0, usec = 400000 }
-        end
-    else -- we expect a number
-        delay = TimeVal:new{ sec = set_or_seconds, usec = 0 }
-    end
-    self._discard_events_till = self._now + delay
-end
-
---[[--
-Transmits an @{ui.event.Event|Event} to active widgets.
+Transmits an @{ui.event.Event|Event} to active widgets, top to bottom.
+Stops at the first handler that returns `true`.
+Note that most complex widgets are based on @{ui.widget.container.WidgetContainer|WidgetContainer},
+which itself will take care of propagating an event to its members.
 
 @param event an @{ui.event.Event|Event} object
 ]]
 function UIManager:sendEvent(event)
-    if #self._window_stack == 0 then return end
-
-    -- Ensure discardEvents
-    if self._discard_events_till then
-        if TimeVal:now() < self._discard_events_till then
-            return
+    local top_widget
+    local checked_widgets = {}
+    -- Toast widgets, which, by contract, must be at the top of the window stack, never stop event propagation.
+    for i = #self._window_stack, 1, -1 do
+        local widget = self._window_stack[i].widget
+        -- Whether it's a toast or not, we'll call handleEvent now,
+        -- so we'll want to skip it during the table walk later.
+        checked_widgets[widget] = true
+        if widget.toast then
+            -- We never stop event propagation on toasts, but we still want to send the event to them.
+            -- (In particular, because we want them to close on user input).
+            widget:handleEvent(event)
         else
-            self._discard_events_till = nil
+            -- The first widget to consume events as designed is the topmost non-toast one
+            top_widget = widget
+            break
         end
     end
 
-    -- The top widget gets to be the first to get the event
-    local top_widget = self._window_stack[#self._window_stack]
-
-    -- A toast widget gets closed by any event, and
-    -- lets the event be handled by a lower widget
-    -- (Notification is our single widget with toast=true)
-    while top_widget.widget.toast do -- close them all
-        self:close(top_widget.widget)
-        if #self._window_stack == 0 then return end
-        top_widget = self._window_stack[#self._window_stack]
-    end
-
-    if top_widget.widget:handleEvent(event) then
+    -- Extremely unlikely, but we can't exclude the possibility of *everything* being a toast ;).
+    -- In which case, the event has nowhere else to go, so, we're done.
+    if not top_widget then
         return
     end
-    if top_widget.widget.active_widgets then
-        for _, active_widget in ipairs(top_widget.widget.active_widgets) do
-            if active_widget:handleEvent(event) then return end
+
+    if top_widget:handleEvent(event) then
+        return
+    end
+    if top_widget.active_widgets then
+        for _, active_widget in ipairs(top_widget.active_widgets) do
+            if active_widget:handleEvent(event) then
+                return
+            end
         end
     end
 
-    -- if the event is not consumed, active widgets (from top to bottom) can access it.
-    -- NOTE: _window_stack can shrink when widgets are closed (CloseWidget & Close events).
-    local checked_widgets = {top_widget}
-    for i = #self._window_stack, 1, -1 do
-        local widget = self._window_stack[i]
-        if checked_widgets[widget] == nil then
-            -- active widgets has precedence to handle this event
-            -- NOTE: While FileManager only has a single (screenshotter), ReaderUI has many active_widgets (each ReaderUI module gets added to the list).
-            if widget.widget.active_widgets then
-                checked_widgets[widget] = true
-                for _, active_widget in ipairs(widget.widget.active_widgets) do
-                    if active_widget:handleEvent(event) then return end
+    -- If the event was not consumed (no handler returned true), active widgets (from top to bottom) can access it.
+    -- NOTE: _window_stack can shrink/grow when widgets are closed (CloseWidget & Close events) or opened.
+    --       Simply looping in reverse would only cover the list shrinking, and that only by a *single* element,
+    --       something we can't really guarantee, hence the more dogged iterator below,
+    --       which relies on a hash check of already processed widgets (LuaJIT actually hashes the table's GC reference),
+    --       rather than a simple loop counter, and will in fact iterate *at least* #items ^ 2 times.
+    --       Thankfully, that list should be very small, so the overhead should be minimal.
+    local i = #self._window_stack
+    while i > 0 do
+        local widget = self._window_stack[i].widget
+        if not checked_widgets[widget] then
+            checked_widgets[widget] = true
+            -- Widget's active widgets have precedence to handle this event
+            -- NOTE: ReaderUI & FileManager *may* optionally register their modules as such
+            --       (currently, they only do that for the Screenshot module).
+            if widget.active_widgets then
+                for _, active_widget in ipairs(widget.active_widgets) do
+                    if active_widget:handleEvent(event) then
+                        return
+                    end
                 end
             end
-            if widget.widget.is_always_active then
-                -- active widgets will handle this event
-                -- NOTE: is_always_active widgets currently are widgets that want to show a VirtualKeyboard or listen to Dispatcher events
-                checked_widgets[widget] = true
-                if widget.widget:handleEvent(event) then return end
+            if widget.is_always_active then
+                -- Widget itself is flagged always active, let it handle the event
+                -- NOTE: is_always_active widgets are currently widgets that want to show a VirtualKeyboard or listen to Dispatcher events
+                if widget:handleEvent(event) then
+                    return
+                end
             end
+            -- As mentioned above, event handlers might have shown/closed widgets,
+            -- so all bets are off on our old window tally being accurate, so let's take it from the top again ;).
+            i = #self._window_stack
+        else
+            i = i - 1
         end
     end
 end
@@ -1143,47 +1040,64 @@ Transmits an @{ui.event.Event|Event} to all registered widgets.
 @param event an @{ui.event.Event|Event} object
 ]]
 function UIManager:broadcastEvent(event)
-    -- the widget's event handler might close widgets in which case
-    -- a simple iterator like ipairs would skip over some entries
-    local i = 1
-    while i <= #self._window_stack do
-        local prev_widget = self._window_stack[i].widget
-        self._window_stack[i].widget:handleEvent(event)
-        local top_widget = self._window_stack[i]
-        if top_widget == nil then
-            -- top widget closed itself
-            break
-        elseif top_widget.widget == prev_widget then
-            i = i + 1
+    -- Unlike sendEvent, we send the event to *all* (window-level) widgets (i.e., we don't stop, even if a handler returns true).
+    -- NOTE: Same defensive approach to _window_stack changing from under our feet as above.
+    local checked_widgets = {}
+    local handled = false
+    local i = #self._window_stack
+    while i > 0 do
+        local widget = self._window_stack[i].widget
+        if not checked_widgets[widget] then
+            checked_widgets[widget] = true
+            if widget:handleEvent(event) then
+                handled = true
+            end
+            i = #self._window_stack
+        else
+            i = i - 1
         end
+    end
+    return handled
+end
+
+--[[
+function UIManager:getNextTaskTimes(count)
+    count = math.min(count or 1, #self._task_queue)
+    local times = {}
+    for i = 1, count do
+        times[i] = self._task_queue[i].time - time.now()
+    end
+    return times
+end
+--]]
+
+function UIManager:getNextTaskTime()
+    local next_task = self._task_queue[#self._task_queue]
+    if next_task then
+        return next_task.time - time:now()
     end
 end
 
 function UIManager:_checkTasks()
-    self._now = TimeVal:now()
+    self._now = time.now()
     local wait_until = nil
 
-    -- task.action may schedule other events
+    -- Tasks due for execution might themselves schedule more tasks (that might also be immediately due for execution ;)).
+    -- Flipping this switch ensures we'll consume all such tasks *before* yielding to input polling.
     self._task_queue_dirty = false
-    while true do
-        local nu_task = #self._task_queue
-        if nu_task == 0 then
-            -- all tasks checked
-            break
-        end
-        local task = self._task_queue[1]
-        local task_tv = task.time or TimeVal.zero
-        if task_tv <= self._now then
-            -- remove from table
-            table.remove(self._task_queue, 1)
-            -- task is pending to be executed right now. do it.
-            -- NOTE: be careful that task.action() might modify
-            -- _task_queue here. So need to avoid race condition
-            task.action(unpack(task.args, 1, task.argc))
+    while self._task_queue[1] do
+        local task_time = self._task_queue[#self._task_queue].time
+        if task_time <= self._now then
+            -- Remove the upcoming task, as it is due for execution...
+            local task =  table.remove(self._task_queue)
+            -- ...so do it now.
+            -- NOTE: Said task's action might modify _task_queue.
+            --       To avoid race conditions and catch new upcoming tasks during this call,
+            --       we repeatedly check the head of the queue (c.f., #1758).
+            task.action(unpack(task.args, 1, task.args.n))
         else
-            -- queue is sorted in ascendant order, safe to assume all items
-            -- are future tasks for now
-            wait_until = task.time
+            -- As the queue is sorted in descending order, it's safe to assume all items are currently future tasks.
+            wait_until = task_time
             break
         end
     end
@@ -1192,17 +1106,20 @@ function UIManager:_checkTasks()
 end
 
 --[[--
-Returns a TimeVal object corresponding to the last UI tick.
+Returns a time (fts) corresponding to the last tick.
 
-This is essentially a cached TimeVal:now(), computed at the top of every iteration of the main UI loop,
+This is essentially a cached time.now(), computed at the top of every iteration of the main UI loop,
 (right before checking/running scheduled tasks).
 This is mainly useful to compute/schedule stuff in the same time scale as the UI loop (i.e., MONOTONIC),
 without having to resort to a syscall.
-It should never be significantly stale (i.e., it should be precise enough),
-unless you're blocking the UI for a significant amount of time in the same UI tick.
+It should never be significantly stale, assuming the UI is in use (e.g., there are input events),
+unless you're blocking the UI for a significant amount of time in a single UI frame.
 
-Prefer the appropriate TimeVal method for your needs if you require perfect accuracy
-(e.g., when you're actually working on the event loop *itself* (UIManager, Input, GestureDetector)).
+That is to say, its granularity is an UI frame.
+
+Prefer the appropriate time function for your needs if you require perfect accuracy or better granularity
+(e.g., when you're actually working on the event loop *itself* (UIManager, Input, GestureDetector),
+or if you're dealing with intra-frame timers).
 
 This is *NOT* wall clock time (REALTIME).
 ]]
@@ -1210,18 +1127,28 @@ function UIManager:getTime()
     return self._now
 end
 
+--[[--
+Returns a time (fts) corresponding to the last UI tick plus the time in standby.
+]]
+function UIManager:getElapsedTimeSinceBoot()
+    return self:getTime() + Device.total_standby_time + Device.total_suspend_time
+end
+
 -- precedence of refresh modes:
-local refresh_modes = { fast = 1, ui = 2, partial = 3, flashui = 4, flashpartial = 5, full = 6 }
--- NOTE: We might want to introduce a "force_fast" that points to fast, but has the highest priority,
+local refresh_modes = { a2 = 1, fast = 2, ui = 3, partial = 4, ["[ui]"] = 5, ["[partial]"] = 6, flashui = 7, flashpartial = 8, full = 9 }
+-- NOTE: We might want to introduce a "force_a2" that points to fast, but has the highest priority,
 --       for the few cases where we might *really* want to enforce fast (for stuff like panning or skimming?).
 -- refresh methods in framebuffer implementation
 local refresh_methods = {
-    fast = "refreshFast",
-    ui = "refreshUI",
-    partial = "refreshPartial",
-    flashui = "refreshFlashUI",
-    flashpartial = "refreshFlashPartial",
-    full = "refreshFull",
+    a2 = Screen.refreshA2,
+    fast = Screen.refreshFast,
+    ui = Screen.refreshUI,
+    partial = Screen.refreshPartial,
+    ["[ui]"] = Screen.refreshNoMergeUI,
+    ["[partial]"] = Screen.refreshNoMergePartial,
+    flashui = Screen.refreshFlashUI,
+    flashpartial = Screen.refreshFlashPartial,
+    full = Screen.refreshFull,
 }
 
 --[[
@@ -1259,7 +1186,7 @@ Widgets call this in their `paintTo()` method in order to notify
 UIManager that a certain part of the screen is to be refreshed.
 
 @string mode
-    refresh mode (`"full"`, `"flashpartial"`, `"flashui"`, `"partial"`, `"ui"`, `"fast"`)
+    refresh mode (`"full"`, `"flashpartial"`, `"flashui"`, `"[partial]"`, `"[ui]"`, `"partial"`, `"ui"`, `"fast"`, `"a2"`)
 @param region
     A rectangle @{ui.geometry.Geom|Geom} object that specifies the region to be updated.
     Optional, update will affect whole screen if not specified.
@@ -1272,19 +1199,21 @@ UIManager that a certain part of the screen is to be refreshed.
 ]]
 function UIManager:_refresh(mode, region, dither)
     if not mode then
-        -- If we're trying to float a dither hint up from a lower widget after a close, mode might be nil...
-        -- So use the lowest priority refresh mode (short of fast, because that'd do half-toning).
-        if dither then
-            mode = "ui"
-        else
-            -- Otherwise, this is most likely from a `show` or `close` that wasn't passed specific refresh details,
-            -- (which is the vast majority of them), in which case we drop it to avoid enqueuing a useless full-screen refresh.
-            return
-        end
+        -- This is most likely from a `show` or `close` that wasn't passed specific refresh details,
+        -- (which is the vast majority of them), in which case we drop it to avoid enqueuing a useless full-screen refresh.
+        return
     end
+
+    -- Downgrade all refreshes to "fast" when ReaderPaging or ReaderScrolling have set this flag
+    if self.currently_scrolling then
+        mode = "fast"
+    end
+
+    -- Reset the refresh counter on any explicit full refresh
     if not region and mode == "full" then
-        self.refresh_count = 0 -- reset counter on explicit full refresh
+        self.refresh_count = 0
     end
+
     -- Handle downgrading flashing modes to non-flashing modes, according to user settings.
     -- NOTE: Do it before "full" promotion and collision checks/update_mode.
     if G_reader_settings:isTrue("avoid_flashing_ui") then
@@ -1301,7 +1230,7 @@ function UIManager:_refresh(mode, region, dither)
     end
     -- special case: "partial" refreshes
     -- will get promoted every self.FULL_REFRESH_COUNT refreshes
-    -- since _refresh can be called mutiple times via setDirty called in
+    -- since _refresh can be called multiple times via setDirty called in
     -- different widgets before a real screen repaint, we should make sure
     -- refresh_count is incremented by only once at most for each repaint
     -- NOTE: Ideally, we'd only check for "partial"" w/ no region set (that neatly narrows it down to just the reader).
@@ -1309,7 +1238,7 @@ function UIManager:_refresh(mode, region, dither)
     --       (Putting "ui" in that list is problematic with a number of UI elements, most notably, ReaderHighlight,
     --       because it is implemented as "ui" over the full viewport, since we can't devise a proper bounding box).
     --       So we settle for only "partial", but treating full-screen ones slightly differently.
-    if mode == "partial" and not self.refresh_counted then
+    if mode == "partial" and self.FULL_REFRESH_COUNT > 0 and not self.refresh_counted then
         self.refresh_count = (self.refresh_count + 1) % self.FULL_REFRESH_COUNT
         if self.refresh_count == self.FULL_REFRESH_COUNT - 1 then
             -- NOTE: Promote to "full" if no region (reader), to "flashui" otherwise (UI)
@@ -1324,7 +1253,7 @@ function UIManager:_refresh(mode, region, dither)
     end
 
     -- if no region is specified, use the screen's dimensions
-    region = region or Geom:new{w=Screen:getWidth(), h=Screen:getHeight()}
+    region = region or Geom:new{x = 0, y = 0, w = Screen:getWidth(), h = Screen:getHeight()}
 
     -- if no dithering hint was specified, don't request dithering
     dither = dither or false
@@ -1334,16 +1263,16 @@ function UIManager:_refresh(mode, region, dither)
     --       (e.g., multiple setDirty calls queued when showing/closing a widget because of update mechanisms),
     --       as well as a few actually effective merges
     --       (e.g., the disappearance of a selection HL with the following menu update).
-    for i = 1, #self._refresh_stack do
-        -- Check for collision with refreshes that are already enqueued
-        -- NOTE: intersect *means* intersect: we won't merge edge-to-edge regions (but the EPDC probably will).
-        if region:intersectWith(self._refresh_stack[i].region) then
+    for i, refresh in ipairs(self._refresh_stack) do
+        -- Check for collisions with refreshes that are already enqueued.
+        -- NOTE: We use the open range variant, as we want to combine rectangles that share an edge (like the EPDC).
+        if region:openIntersectWith(refresh.region) then
             -- combine both refreshes' regions
-            local combined = region:combine(self._refresh_stack[i].region)
+            local combined = region:combine(refresh.region)
             -- update the mode, if needed
-            mode = update_mode(mode, self._refresh_stack[i].mode)
+            mode = update_mode(mode, refresh.mode)
             -- dithering hints are viral, one is enough to infect the whole queue
-            dither = update_dither(dither, self._refresh_stack[i].dither)
+            dither = update_dither(dither, refresh.dither)
             -- remove colliding refresh
             table.remove(self._refresh_stack, i)
             -- and try again with combined data
@@ -1352,7 +1281,7 @@ function UIManager:_refresh(mode, region, dither)
     end
 
     -- if we've stopped hitting collisions, enqueue the refresh
-    logger.dbg("_refresh: Enqueued", mode, "update for region", region.x, region.y, region.w, region.h, dither and "w/ HW dithering" or "")
+    logger.dbg("_refresh: Enqueued", mode, "update for region", region.x, region.y, region.w, region.h, "dithering:", dither)
     table.insert(self._refresh_stack, {mode = mode, region = region, dither = dither})
 end
 
@@ -1390,33 +1319,34 @@ function UIManager:_repaint()
     --[[
     if start_idx > 1 then
         for i = 1, start_idx-1 do
-            local widget = self._window_stack[i]
-            logger.dbg("NOT painting widget:", widget.widget.name or widget.widget.id or tostring(widget))
+            local widget = self._window_stack[i].widget
+            logger.dbg("NOT painting widget:", widget.name or widget.id or tostring(widget))
         end
     end
     --]]
 
     for i = start_idx, #self._window_stack do
-        local widget = self._window_stack[i]
+        local window = self._window_stack[i]
+        local widget = window.widget
         -- paint if current widget or any widget underneath is dirty
-        if dirty or self._dirty[widget.widget] then
+        if dirty or self._dirty[widget] then
             -- pass hint to widget that we got when setting widget dirty
             -- the widget can use this to decide which parts should be refreshed
-            logger.dbg("painting widget:", widget.widget.name or widget.widget.id or tostring(widget))
+            logger.dbg("painting widget:", widget.name or widget.id or tostring(widget))
             Screen:beforePaint()
             -- NOTE: Nothing actually seems to use the final argument?
             --       Could be used by widgets to know whether they're being repainted because they're actually dirty (it's true),
             --       or because something below them was (it's nil).
-            widget.widget:paintTo(Screen.bb, widget.x, widget.y, self._dirty[widget.widget])
+            widget:paintTo(Screen.bb, window.x, window.y, self._dirty[widget])
 
             -- and remove from list after painting
-            self._dirty[widget.widget] = nil
+            self._dirty[widget] = nil
 
             -- trigger a repaint for every widget above us, too
             dirty = true
 
             -- if any of 'em were dithered, we'll want to dither the final refresh
-            if widget.widget.dithered then
+            if widget.dithered then
                 logger.dbg("_repaint: it was dithered, infecting the refresh queue")
                 dithered = true
             end
@@ -1428,13 +1358,15 @@ function UIManager:_repaint()
         local refreshtype, region, dither = refreshfunc()
         -- honor dithering hints from *anywhere* in the dirty stack
         dither = update_dither(dither, dithered)
-        if refreshtype then self:_refresh(refreshtype, region, dither) end
+        if refreshtype then
+            self:_refresh(refreshtype, region, dither)
+        end
     end
     self._refresh_func_stack = {}
 
-    -- we should have at least one refresh if we did repaint.  If we don't, we
-    -- add one now and log a warning if we are debugging
-    if dirty and #self._refresh_stack == 0 then
+    -- We should have at least one refresh if we did repaint.
+    -- If we don't, add one now and log a warning if we are debugging.
+    if dirty and not self._refresh_stack[1] then
         logger.dbg("no refresh got enqueued. Will do a partial full screen refresh, which might be inefficient")
         self:_refresh("partial")
     end
@@ -1448,9 +1380,12 @@ function UIManager:_repaint()
             refresh.dither = nil
         end
         dbg:v("triggering refresh", refresh)
+
+        --[[
         -- Remember the refresh region
-        self._last_refresh_region = refresh.region
-        Screen[refresh_methods[refresh.mode]](Screen,
+        self._last_refresh_region = refresh.region:copy()
+        --]]
+        refresh_methods[refresh.mode](Screen,
             refresh.region.x, refresh.region.y,
             refresh.region.w, refresh.region.h,
             refresh.dither)
@@ -1468,6 +1403,11 @@ end
 --- Explicitly drain the paint & refresh queues *now*, instead of waiting for the next UI tick.
 function UIManager:forceRePaint()
     self:_repaint()
+end
+
+function UIManager:avoidFlashOnNextRepaint()
+    -- Avoid going through the "partial" to "full" refresh promotion: pretend we already checked that.
+    self.refresh_counted = true
 end
 
 --[[--
@@ -1517,7 +1457,17 @@ This is an explicit repaint *now*: it bypasses and ignores the paint queue (unli
 function UIManager:widgetRepaint(widget, x, y)
     if not widget then return end
 
-    logger.dbg("Explicit widgetRepaint:", widget.name or widget.id or tostring(widget), "@ (", x, ",", y, ")")
+    logger.dbg("Explicit widgetRepaint:", widget.name or widget.id or tostring(widget), "@", x, y)
+    if widget.show_parent and widget.show_parent.cropping_widget then
+        -- The main widget parent of this subwidget has a cropping container: see if
+        -- this widget is a child of this cropping container
+        local cropping_widget = widget.show_parent.cropping_widget
+        if util.arrayReferences(cropping_widget, widget) then
+            -- Delegate the painting of this subwidget to its cropping widget container
+            cropping_widget:paintTo(Screen.bb, cropping_widget.dimen.x, cropping_widget.dimen.y)
+            return
+        end
+    end
     widget:paintTo(Screen.bb, x, y)
 end
 
@@ -1534,34 +1484,51 @@ Same idea as `widgetRepaint`, but does a simple `bb:invertRect` on the Screen bu
 function UIManager:widgetInvert(widget, x, y, w, h)
     if not widget then return end
 
-    logger.dbg("Explicit widgetInvert:", widget.name or widget.id or tostring(widget), "@ (", x, ",", y, ")")
+    logger.dbg("Explicit widgetInvert:", widget.name or widget.id or tostring(widget), "@", x, y)
+    if widget.show_parent and widget.show_parent.cropping_widget then
+        -- The main widget parent of this subwidget has a cropping container: see if
+        -- this widget is a child of this cropping container
+        local cropping_widget = widget.show_parent.cropping_widget
+        if util.arrayReferences(cropping_widget, widget) then
+            -- Invert only what intersects with the cropping container
+            local widget_region = Geom:new{x=x, y=y, w=w or widget.dimen.w, h=h or widget.dimen.h}
+            local crop_region = cropping_widget:getCropRegion()
+            local invert_region = crop_region:intersect(widget_region)
+            Screen.bb:invertRect(invert_region.x, invert_region.y, invert_region.w, invert_region.h)
+            return
+        end
+    end
     Screen.bb:invertRect(x, y, w or widget.dimen.w, h or widget.dimen.h)
 end
 
 function UIManager:setInputTimeout(timeout)
-    self.INPUT_TIMEOUT = timeout or 200*1000
+    self.INPUT_TIMEOUT = timeout or (200*1000)
 end
 
 function UIManager:resetInputTimeout()
     self.INPUT_TIMEOUT = nil
 end
 
+-- NOTE: The Event hook mechanism used to dispatch for *every* event, and would actually pass the event along.
+--       We've simplified that to once per input frame, and without passing anything (as we, in fact, have never made use of it).
 function UIManager:handleInputEvent(input_event)
-    if input_event.handler ~= "onInputError" then
-        self.event_hook:execute("InputEvent", input_event)
-    end
     local handler = self.event_handlers[input_event]
     if handler then
         handler(input_event)
     else
-        self.event_handlers["__default__"](input_event)
+        self.event_handlers.__default__(input_event)
     end
 end
 
 -- Process all pending events on all registered ZMQs.
 function UIManager:processZMQs()
+    local sent_InputEvent = false
     for _, zeromq in ipairs(self._zeromqs) do
         for input_event in zeromq.waitEvent, zeromq do
+            if not sent_InputEvent then
+                self.event_hook:execute("InputEvent")
+                sent_InputEvent = true
+            end
             self:handleInputEvent(input_event)
         end
     end
@@ -1574,19 +1541,23 @@ function UIManager:handleInput()
     -- for input events:
     repeat
         wait_until, now = self:_checkTasks()
-        --dbg("---------------------------------------------------")
-        --dbg("wait_until", wait_until)
-        --dbg("now", now)
-        --dbg("exec stack", self._task_queue)
-        --dbg("window stack", self._window_stack)
-        --dbg("dirty stack", self._dirty)
-        --dbg("---------------------------------------------------")
+        --[[
+        dbg("---------------------------------------------------")
+        dbg("wait_until", wait_until)
+        dbg("now       ", now)
+        dbg("#exec stack  ", #self._task_queue)
+        dbg("#window stack", #self._window_stack)
+        dbg("#dirty stack ", util.tableSize(self._dirty))
+        dbg("dirty?", self._task_queue_dirty)
+        dbg("---------------------------------------------------")
+        --]]
 
         -- stop when we have no window to show
-        if #self._window_stack == 0 and not self._run_forever then
-            logger.info("no dialog left to show")
-            self:quit()
-            return nil
+        if not self._window_stack[1] then
+            logger.info("UIManager: No dialogs left to show")
+            if self:_gated_quit() ~= false then
+                return
+            end
         end
 
         self:_repaint()
@@ -1603,13 +1574,13 @@ function UIManager:handleInput()
     local wait_us = self.INPUT_TIMEOUT
 
     -- If we have any ZMQs registered, ZMQ_TIMEOUT is another upper bound.
-    if #self._zeromqs > 0 then
+    if self._zeromqs[1] then
         wait_us = math.min(wait_us or math.huge, self.ZMQ_TIMEOUT)
     end
 
     -- We pass that on as an absolute deadline, not a relative wait time.
     if wait_us then
-        deadline = now + TimeVal:new{ usec = wait_us }
+        deadline = now + time.us(wait_us)
     end
 
     -- If there's a scheduled task pending, that puts an upper bound on how long to wait.
@@ -1626,12 +1597,23 @@ function UIManager:handleInput()
     -- this function emits (plugin), or within waitEvent() right after (hardware).
     -- Anywhere else breaks preventStandby/allowStandby invariants used by background jobs while UI is left running.
     self:_standbyTransition()
+    if self._pm_consume_input_early then
+        -- If the PM state transition requires an early return from input polling, honor that.
+        -- c.f., UIManager:setPMInputTimeout (and AutoSuspend:AllowStandbyHandler).
+        deadline = now
+        self._pm_consume_input_early = false
+    end
 
     -- wait for next batch of events
     local input_events = Input:waitEvent(now, deadline)
 
     -- delegate each input event to handler
     if input_events then
+        -- Dispatch event hooks first, as some plugins (*cough* AutoSuspend *cough*)
+        -- rely on it to react properly to the actual event...
+        if input_events[1] then
+            self.event_hook:execute("InputEvent")
+        end
         -- Handle the full batch of events
         for __, ev in ipairs(input_events) do
             self:handleInputEvent(ev)
@@ -1646,7 +1628,6 @@ function UIManager:handleInput()
             xpcall(function() self:handleInput() end, function(err)
                 io.stderr:write(err .. "\n")
                 io.stderr:write(debug.traceback() .. "\n")
-                io.stderr:flush()
                 self.looper:close()
                 os.exit(1, true)
             end)
@@ -1654,14 +1635,13 @@ function UIManager:handleInput()
     end
 end
 
-
 function UIManager:onRotation()
     self:setDirty("all", "full")
     self:forceRePaint()
 end
 
 function UIManager:initLooper()
-    if DUSE_TURBO_LIB and not self.looper then
+    if G_defaults:readSetting("DUSE_TURBO_LIB") and not self.looper then
         TURBO_SSL = true -- luacheck: ignore
         __TURBO_USE_LUASOCKET__ = true -- luacheck: ignore
         local turbo = require("turbo")
@@ -1675,56 +1655,20 @@ This is the main loop of the UI controller.
 It is intended to manage input events and delegate them to dialogs.
 --]]
 function UIManager:run()
-    self._running = true
     self:initLooper()
     -- currently there is no Turbo support for Windows
     -- use our own main loop
     if not self.looper then
-        while self._running do
+        repeat
             self:handleInput()
-        end
+        until self._exit_code
     else
         self.looper:add_callback(function() self:handleInput() end)
         self.looper:start()
     end
 
+    logger.info("Tearing down UIManager with exit code:", self._exit_code)
     return self._exit_code
-end
-
--- run uimanager forever for testing purpose
-function UIManager:runForever()
-    self._run_forever = true
-    return self:run()
-end
-
--- The common operations that should be performed before suspending the device.
-function UIManager:_beforeSuspend()
-    self:flushSettings()
-    self:broadcastEvent(Event:new("Suspend"))
-
-    -- Reset gesture detection state to a blank slate (anything power-management related emits KEY events, which don't need gesture detection).
-    Input:resetState()
-end
-
--- The common operations that should be performed after resuming the device.
-function UIManager:_afterResume()
-    self:broadcastEvent(Event:new("Resume"))
-end
-
--- The common operations that should be performed when the device is plugged to a power source.
-function UIManager:_beforeCharging()
-    if G_reader_settings:nilOrTrue("enable_charging_led") then
-        Device:toggleChargingLED(true)
-    end
-    self:broadcastEvent(Event:new("Charging"))
-end
-
--- The common operations that should be performed when the device is unplugged from a power source.
-function UIManager:_afterNotCharging()
-    if G_reader_settings:nilOrTrue("enable_charging_led") then
-        Device:toggleChargingLED(false)
-    end
-    self:broadcastEvent(Event:new("NotCharging"))
 end
 
 --[[--
@@ -1733,25 +1677,38 @@ Executes all the operations of a suspension (i.e., sleep) request.
 This function usually puts the device into suspension.
 ]]
 function UIManager:suspend()
-    if Device:isCervantes() or Device:isKobo() or Device:isSDL() or Device:isRemarkable() or Device:isSonyPRSTUX() then
-        self.event_handlers["Suspend"]()
-    elseif Device:isKindle() then
-        Device.powerd:toggleSuspend()
-    elseif Device.isPocketBook() and Device.canSuspend() then
-        Device:suspend()
+    -- Should always exist, as defined in `generic/device` or overwritten with `setEventHandlers`
+    if self.event_handlers.Suspend then
+        -- Give the other event handlers a chance to be executed.
+        -- `Suspend` and `Resume` events will be sent by the handler
+        UIManager:nextTick(self.event_handlers.Suspend)
     end
 end
 
---[[--
-Executes all the operations of a resume (i.e., wakeup) request.
+function UIManager:askForReboot(message_text)
+    -- Should always exist, as defined in `generic/device` or overwritten with `setEventHandlers`
+    if self.event_handlers.Reboot then
+        -- Give the other event handlers a chance to be executed.
+        -- 'Reboot' event will be sent by the handler
+        UIManager:nextTick(self.event_handlers.Reboot, message_text)
+    end
+end
 
-This function usually wakes up the device.
-]]
-function UIManager:resume()
-    if Device:isCervantes() or Device:isKobo() or Device:isSDL() or Device:isRemarkable() or Device:isSonyPRSTUX() then
-        self.event_handlers["Resume"]()
-    elseif Device:isKindle() then
-        self.event_handlers["OutOfSS"]()
+function UIManager:askForPowerOff(message_text)
+    -- Should always exist, as defined in `generic/device` or overwritten with `setEventHandlers`
+    if self.event_handlers.PowerOff then
+        -- Give the other event handlers a chance to be executed.
+        -- 'PowerOff' event will be sent by the handler
+        UIManager:nextTick(self.event_handlers.PowerOff, message_text)
+    end
+end
+
+function UIManager:askForRestart(message_text)
+    -- Should always exist, as defined in `generic/device` or overwritten with `setEventHandlers`
+    if self.event_handlers.PowerOff then
+        -- Give the other event handlers a chance to be executed.
+        -- 'Restart' event will be sent by the handler
+        UIManager:nextTick(self.event_handlers.Restart, message_text)
     end
 end
 
@@ -1764,6 +1721,7 @@ Standby is re-enabled only after all issued prevents are paired with allowStandb
 function UIManager:allowStandby()
     assert(self._prevent_standby_count > 0, "allowing standby that isn't prevented; you have an allow/prevent mismatch somewhere")
     self._prevent_standby_count = self._prevent_standby_count - 1
+    logger.dbg("UIManager:allowStandby, counter decreased to", self._prevent_standby_count)
 end
 
 --[[--
@@ -1773,6 +1731,7 @@ i.e., something is happening in background, yet UI may tick.
 ]]
 function UIManager:preventStandby()
     self._prevent_standby_count = self._prevent_standby_count + 1
+    logger.dbg("UIManager:preventStandby, counter increased to", self._prevent_standby_count)
 end
 
 -- The allow/prevent calls above can interminently allow standbys, but we're not interested until
@@ -1780,16 +1739,22 @@ end
 function UIManager:_standbyTransition()
     if self._prevent_standby_count == 0 and self._prev_prevent_standby_count > 0 then
         -- edge prevent->allow
-        logger.dbg("allow standby")
+        logger.dbg("UIManager:_standbyTransition -> AllowStandby")
         Device:setAutoStandby(true)
         self:broadcastEvent(Event:new("AllowStandby"))
     elseif self._prevent_standby_count > 0 and self._prev_prevent_standby_count == 0 then
         -- edge allow->prevent
-        logger.dbg("prevent standby")
+        logger.dbg("UIManager:_standbyTransition -> PreventStandby")
         Device:setAutoStandby(false)
         self:broadcastEvent(Event:new("PreventStandby"))
     end
     self._prev_prevent_standby_count = self._prevent_standby_count
+end
+
+-- Used by a PM transition event handler to request an early return from input polling.
+-- NOTE: We can't reuse setInputTimeout to avoid interactions with ZMQ...
+function UIManager:consumeInputEarlyAfterPM(toggle)
+    self._pm_consume_input_early = toggle
 end
 
 --- Broadcasts a `FlushSettings` Event to *all* widgets.
@@ -1799,15 +1764,13 @@ end
 
 --- Sanely restart KOReader (on supported platforms).
 function UIManager:restartKOReader()
-    self:quit()
     -- This is just a magic number to indicate the restart request for shell scripts.
-    self._exit_code = 85
+    self:quit(85)
 end
 
 --- Sanely abort KOReader (e.g., exit sanely, but with a non-zero return code).
 function UIManager:abort()
-    self:quit()
-    self._exit_code = 1
+    self:quit(1)
 end
 
 UIManager:init()

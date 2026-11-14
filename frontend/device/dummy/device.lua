@@ -4,7 +4,7 @@ local logger = require("logger")
 local function yes() return true end
 local function no() return false end
 
-local Device = Generic:new{
+local Device = Generic:extend{
     model = "dummy",
     hasKeyboard = no,
     hasKeys = no,
@@ -15,7 +15,7 @@ local Device = Generic:new{
 }
 
 function Device:init()
-    self.screen = require("ffi/framebuffer_SDL2_0"):new{
+    self.screen = require("ffi/framebuffer_SDL3"):new{
         dummy = true,
         device = self,
         debug = logger.dbg,

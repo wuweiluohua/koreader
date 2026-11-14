@@ -2,11 +2,14 @@ local bitser = require("ffi/bitser")
 local buffer = require("string.buffer")
 local dump = require("dump")
 local ffi = require("ffi")
+local ffiUtil = require("ffi/util")
 local lfs = require("libs/libkoreader-lfs")
 local logger = require("logger")
+local serpent = require("ffi/serpent")
 local zstd = require("ffi/zstd")
 
 local C = ffi.C
+require("ffi/posix_h")
 
 local function readFile(file, bytes)
     local f, str, err
@@ -82,8 +85,15 @@ local codecs = {
 
             local cbuff, clen = zstd.zstd_compress(str, #str)
 
+            if not path then
+                local result = ffi.string(cbuff, clen)
+                C.free(cbuff)
+                return result, clen
+            end
+
             local f = C.fopen(path, "wb")
             if f == nil then
+                C.free(cbuff)
                 return nil, "fopen: " .. ffi.string(C.strerror(ffi.errno()))
             end
             if C.fwrite(cbuff, 1, clen, f) < clen then
@@ -91,13 +101,30 @@ local codecs = {
                 C.free(cbuff)
                 return nil, "failed to write file"
             end
+            C.fflush(f)
+            C.fsync(C.fileno(f))
             C.fclose(f)
             C.free(cbuff)
-
-            return true
+            --- @note: Slight API extension for TileCacheItem, which needs to know the on-disk size, and saves us a :size() call
+            return true, clen
         end,
 
-        deserialize = function(path)
+        deserialize = function(str, path)
+            if (not str) == (not path) then
+                return nil, "invalid arguments"
+            end
+            if str then
+                local buff, ulen = zstd.zstd_uncompress(str, #str)
+                if not buff then
+                    return nil, "failed to decompress string"
+                end
+                local ok, t = pcall(buffer.decode, ffi.string(buff, ulen))
+                C.free(buff)
+                if not ok then
+                    return nil, "malformed serialized data (" .. t .. ")"
+                end
+                return t
+            end
             local f = C.fopen(path, "rb")
             if f == nil then
                 return nil, "fopen: " .. ffi.string(C.strerror(ffi.errno()))
@@ -121,9 +148,8 @@ local codecs = {
             local buff, ulen = zstd.zstd_uncompress(data, size)
             C.free(data)
 
-            local str = ffi.string(buff, ulen)
+            str = ffi.string(buff, ulen)
             C.free(buff)
-
             local ok, t = pcall(buffer.decode, str)
             if not ok then
                 return nil, "malformed serialized data (" .. t .. ")"
@@ -153,8 +179,11 @@ local codecs = {
             return content
         end,
 
-        deserialize = function(str)
-            local t, err = loadfile(str)
+        deserialize = function(str, path)
+            local t, err
+            if path then
+                t, err = loadfile(path)
+            end
             if not t then
                 t, err = loadstring(str)
             end
@@ -162,6 +191,29 @@ local codecs = {
                 return nil, err
             end
             return t()
+        end,
+    },
+    -- serpent: human readable (-ish), more thorough than dump (in particular, supports serializing functions)
+    -- NOTE: if you want pretty printing, pass { sortkeys = true, compact = false, indent = "  " } to serpent's second arg.
+    serpent = {
+        id = "serpent",
+        reads_from_file = false,
+        writes_to_file = false,
+
+        serialize = function(t)
+            local ok, str = pcall(serpent.dump, t)
+            if not ok then
+                return nil, "cannot serialize " .. tostring(t) .. " (" .. str .. ")"
+            end
+            return str
+        end,
+
+        deserialize = function(str)
+            local ok, t = serpent.load(str)
+            if not ok then
+                return nil, "malformed serialized data (" .. t .. ")"
+            end
+            return t
         end,
     }
 }
@@ -171,7 +223,7 @@ local Persist = {}
 function Persist:new(o)
     o = o or {}
     assert(type(o.path) == "string", "path is required")
-    o.codec = o.codec or "dump"
+    o.codec = o.codec or "serpent"
     setmetatable(o, self)
     self.__index = self
     return o
@@ -195,7 +247,7 @@ end
 function Persist:load()
     local t, err
     if codecs[self.codec].reads_from_file then
-        t, err = codecs[self.codec].deserialize(self.path)
+        t, err = codecs[self.codec].deserialize(nil, self.path)
     else
         local str
         str, err = readFile(self.path)
@@ -207,18 +259,21 @@ function Persist:load()
     if not t then
         return nil, err
     end
+
+    self.loaded = true
     return t
 end
 
 function Persist:save(t, as_bytecode)
+    local ok, err
     if codecs[self.codec].writes_to_file then
-        local ok, err = codecs[self.codec].serialize(t, as_bytecode, self.path)
+        ok, err = codecs[self.codec].serialize(t, as_bytecode, self.path)
         if not ok then
             return nil, err
         end
     else
-        local str, err = codecs[self.codec].serialize(t, as_bytecode)
-        if not str then
+        ok, err = codecs[self.codec].serialize(t, as_bytecode)
+        if not ok then
             return nil, err
         end
         local file
@@ -226,10 +281,19 @@ function Persist:save(t, as_bytecode)
         if not file then
             return nil, err
         end
-        file:write(str)
+        file:write(ok)
+        ffiUtil.fsyncOpenedFile(file)
         file:close()
     end
-    return true
+
+    -- If we've just created the file, fsync the directory, too
+    if not self.loaded then
+        ffiUtil.fsyncDirectory(self.path)
+        self.loaded = true
+    end
+
+    -- c.f., note above, err is the on-disk size when writes_to_file is supported
+    return true, err
 end
 
 function Persist:delete()
@@ -238,13 +302,12 @@ function Persist:delete()
 end
 
 function Persist.getCodec(name)
-    local fallback = codecs["dump"]
     for key, codec in pairs(codecs) do
-        if type(key) == "string" and key == name then
+        if key == name then
             return codec
         end
     end
-    return fallback
+    return codecs["serpent"]
 end
 
 return Persist

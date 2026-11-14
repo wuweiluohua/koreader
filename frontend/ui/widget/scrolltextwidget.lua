@@ -17,12 +17,13 @@ local UIManager = require("ui/uimanager")
 local Input = Device.input
 local Screen = Device.screen
 
-local ScrollTextWidget = InputContainer:new{
+local ScrollTextWidget = InputContainer:extend{
     text = nil,
     charlist = nil,
     charpos = nil,
     top_line_num = nil,
     editable = false,
+    select_mode = nil, -- select mode in InputText
     scroll_callback = nil, -- called with (low, high) when view is scrolled
     scroll_by_pan = false, -- allow scrolling by lines with Pan
     face = nil,
@@ -40,6 +41,8 @@ local ScrollTextWidget = InputContainer:new{
     para_direction_rtl = nil,
     auto_para_direction = false,
     alignment_strict = false,
+    highlight_text_selection = false,
+    on_clear_search = nil,
 
     -- for internal use
     for_measurement_only = nil, -- When the widget is a one-off used to compute text height
@@ -53,6 +56,7 @@ function ScrollTextWidget:init()
         top_line_num = self.top_line_num,
         dialog = self.dialog,
         editable = self.editable,
+        select_mode = self.select_mode,
         face = self.face,
         image_alt_face = self.image_alt_face,
         fgcolor = self.fgcolor,
@@ -66,6 +70,8 @@ function ScrollTextWidget:init()
         auto_para_direction = self.auto_para_direction,
         alignment_strict = self.alignment_strict,
         for_measurement_only = self.for_measurement_only,
+        highlight_text_selection = self.highlight_text_selection,
+        on_clear_search = self.on_clear_search,
     }
     local visible_line_count = self.text_widget:getVisLineCount()
     local total_line_count = self.text_widget:getAllLineCount()
@@ -118,8 +124,8 @@ function ScrollTextWidget:init()
     end
     if Device:hasKeys() then
         self.key_events = {
-            ScrollDown = {{Input.group.PgFwd}, doc = "scroll down"},
-            ScrollUp = {{Input.group.PgBack}, doc = "scroll up"},
+            ScrollDown = { { Input.group.PgFwd } },
+            ScrollUp = { { Input.group.PgBack } },
         }
     end
 end
@@ -142,6 +148,15 @@ end
 
 function ScrollTextWidget:getCharPos()
     return self.text_widget:getCharPos()
+end
+
+function ScrollTextWidget:getCharPosAtXY(x, y)
+    return self.text_widget:getCharPosAtXY(x, y)
+end
+
+function ScrollTextWidget:getCharPosLineNum(charpos)
+    local _, _, line_num = self.text_widget:_getXYForCharPos(charpos)
+    return line_num -- screen line number
 end
 
 function ScrollTextWidget:updateScrollBar(is_partial)
@@ -181,14 +196,20 @@ end
 function ScrollTextWidget:resetScroll()
     local low, high = self.text_widget:getVisibleHeightRatios()
     self.v_scroll_bar:set(low, high)
+    self.prev_low = nil
+    self.prev_high = nil
 
     local visible_line_count = self.text_widget:getVisLineCount()
     local total_line_count = self.text_widget:getAllLineCount()
     self.v_scroll_bar.enable = visible_line_count < total_line_count
 end
 
-function ScrollTextWidget:moveCursorToCharPos(charpos)
-    self.text_widget:moveCursorToCharPos(charpos)
+function ScrollTextWidget:moveCursorToCharPos(charpos, centered_lines_count)
+    if centered_lines_count then
+        self.text_widget:moveCursorToCharPosKeepingViewCentered(charpos, centered_lines_count)
+    else
+        self.text_widget:moveCursorToCharPos(charpos)
+    end
     self:updateScrollBar()
 end
 
@@ -217,6 +238,16 @@ end
 
 function ScrollTextWidget:moveCursorDown()
     self.text_widget:moveCursorDown()
+    self:updateScrollBar()
+end
+
+function ScrollTextWidget:moveCursorHome()
+    self.text_widget:moveCursorHome()
+    self:updateScrollBar()
+end
+
+function ScrollTextWidget:moveCursorEnd()
+    self.text_widget:moveCursorEnd()
     self:updateScrollBar()
 end
 
@@ -274,6 +305,7 @@ function ScrollTextWidget:onScrollText(arg, ges)
 end
 
 function ScrollTextWidget:onTapScrollText(arg, ges)
+    if self.ignore_taps then return false end
     if self.editable then
         -- Tap is used to position cursor
         return false
@@ -284,6 +316,10 @@ function ScrollTextWidget:onTapScrollText(arg, ges)
     else
         return self:onScrollDown()
     end
+end
+
+function ScrollTextWidget:setTapScrollEnabled(enabled)
+    self.ignore_taps = not enabled
 end
 
 function ScrollTextWidget:onScrollUp()

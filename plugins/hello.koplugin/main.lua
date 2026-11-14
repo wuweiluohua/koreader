@@ -15,13 +15,13 @@ local UIManager = require("ui/uimanager")
 local WidgetContainer = require("ui/widget/container/widgetcontainer")
 local _ = require("gettext")
 
-local Hello = WidgetContainer:new{
+local Hello = WidgetContainer:extend{
     name = "hello",
     is_doc_only = false,
 }
 
 function Hello:onDispatcherRegisterActions()
-    Dispatcher:registerAction("helloworld_action", {category="none", event="HelloWorld", title=_("Hello World"), filemanager=true,})
+    Dispatcher:registerAction("helloworld_action", {category="none", event="HelloWorld", title=_("Hello World"), general=true,})
 end
 
 function Hello:init()

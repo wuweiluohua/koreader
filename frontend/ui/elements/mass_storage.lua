@@ -1,5 +1,7 @@
 local Device = require("device")
+local Event = require("ui/event")
 local UIManager = require("ui/uimanager")
+local logger = require("logger")
 local _ = require("gettext")
 
 local MassStorage = {}
@@ -41,35 +43,59 @@ function MassStorage:getActionsMenuTable()
         text = _("Start USB storage"),
         enabled_func = function() return self:isEnabled() end,
         callback = function()
-            self:start(true)
+            self:start(false)
         end,
     }
 end
 
 -- exit KOReader and start mass storage mode.
-function MassStorage:start(never_ask)
+function MassStorage:start(with_confirmation)
     if not Device:canToggleMassStorage() or not self:isEnabled() then
         return
     end
 
-    if not never_ask and self:requireConfirmation() then
+    local ask
+    if with_confirmation ~= nil then
+        ask = with_confirmation
+    else
+        ask = self:requireConfirmation()
+    end
+
+    if ask then
         local ConfirmBox = require("ui/widget/confirmbox")
-        UIManager:show(ConfirmBox:new{
+        self.usbms_widget = ConfirmBox:new{
             text = _("Share storage via USB?"),
             ok_text = _("Share"),
             ok_callback = function()
                 -- save settings before activating USBMS:
                 UIManager:flushSettings()
-                UIManager:quit()
-                UIManager._exit_code = 86
+                logger.info("Exiting KOReader to enter USBMS mode...")
+                UIManager:broadcastEvent(Event:new("Close"))
+                UIManager:quit(86)
             end,
-        })
+            cancel_callback = function()
+                self:dismiss()
+            end,
+        }
+
+        UIManager:show(self.usbms_widget)
     else
         -- save settings before activating USBMS:
         UIManager:flushSettings()
-        UIManager:quit()
-        UIManager._exit_code = 86
+        logger.info("Exiting KOReader to enter USBMS mode...")
+        UIManager:broadcastEvent(Event:new("Close"))
+        UIManager:quit(86)
     end
+end
+
+-- Dismiss the ConfirmBox
+function MassStorage:dismiss()
+    if not self.usbms_widget then
+        return
+    end
+
+    UIManager:close(self.usbms_widget)
+    self.usbms_widget = nil
 end
 
 return MassStorage

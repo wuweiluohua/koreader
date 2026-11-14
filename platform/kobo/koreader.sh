@@ -1,47 +1,57 @@
 #!/bin/sh
+
 export LC_ALL="en_US.UTF-8"
 
 # Compute our working directory in an extremely defensive manner
 SCRIPT_DIR="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd -P)"
 # NOTE: We need to remember the *actual* KOREADER_DIR, not the relocalized version in /tmp...
 export KOREADER_DIR="${KOREADER_DIR:-${SCRIPT_DIR}}"
+UNPACK_DIR="${KOREADER_DIR%/*}"
 
 # We rely on starting from our working directory, and it needs to be set, sane and absolute.
 cd "${KOREADER_DIR:-/dev/null}" || exit
 
-# To make USBMS behave, relocalize ourselves outside of onboard
-if [ "${SCRIPT_DIR}" != "/tmp" ]; then
+# To make USBMS behave, relocalize ourselves outside of onboard. Additionally,
+# this is used by KOReader to detect if the original script has changed after
+# an update (requiring a complete restart from the parent launcher).
+if [ "${SCRIPT_DIR}" != "/tmp" ] && [ "${SCRIPT_DIR}" != "/var/volatile/tmp" ]; then
     cp -pf "${0}" "/tmp/koreader.sh"
     chmod 777 "/tmp/koreader.sh"
     exec "/tmp/koreader.sh" "$@"
 fi
 
 # Attempt to switch to a sensible CPUFreq governor when that's not already the case...
-IFS= read -r current_cpufreq_gov <"/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor"
+# Swap every CPU at once if available
+if [ -d "/sys/devices/system/cpu/cpufreq/policy0" ]; then
+    CPUFREQ_SYSFS_PATH="/sys/devices/system/cpu/cpufreq/policy0"
+else
+    CPUFREQ_SYSFS_PATH="/sys/devices/system/cpu/cpu0/cpufreq"
+fi
+IFS= read -r current_cpufreq_gov <"${CPUFREQ_SYSFS_PATH}/scaling_governor"
 # NOTE: What's available depends on the HW, so, we'll have to take it step by step...
 #       Roughly follow Nickel's behavior (which prefers interactive), and prefer interactive, then ondemand, and finally conservative/dvfs.
 if [ "${current_cpufreq_gov}" != "interactive" ]; then
-    if grep -q "interactive" "/sys/devices/system/cpu/cpu0/cpufreq/scaling_available_governors"; then
+    if grep -q "interactive" "${CPUFREQ_SYSFS_PATH}/scaling_available_governors"; then
         ORIG_CPUFREQ_GOV="${current_cpufreq_gov}"
-        echo "interactive" >"/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor"
+        echo "interactive" >"${CPUFREQ_SYSFS_PATH}/scaling_governor"
     elif [ "${current_cpufreq_gov}" != "ondemand" ]; then
-        if grep -q "ondemand" "/sys/devices/system/cpu/cpu0/cpufreq/scaling_available_governors"; then
+        if grep -q "ondemand" "${CPUFREQ_SYSFS_PATH}/scaling_available_governors"; then
             # NOTE: This should never really happen: every kernel that supports ondemand already supports interactive ;).
             #       They were both introduced on Mk. 6
             ORIG_CPUFREQ_GOV="${current_cpufreq_gov}"
-            echo "ondemand" >"/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor"
+            echo "ondemand" >"${CPUFREQ_SYSFS_PATH}/scaling_governor"
         elif [ -e "/sys/devices/platform/mxc_dvfs_core.0/enable" ]; then
             # The rest of this block assumes userspace is available...
-            if grep -q "userspace" "/sys/devices/system/cpu/cpu0/cpufreq/scaling_available_governors"; then
+            if grep -q "userspace" "${CPUFREQ_SYSFS_PATH}/scaling_available_governors"; then
                 ORIG_CPUFREQ_GOV="${current_cpufreq_gov}"
                 export CPUFREQ_DVFS="true"
 
                 # If we can use conservative, do so, but we'll tweak it a bit to make it somewhat useful given our load patterns...
                 # We unfortunately don't have any better choices on those kernels,
                 # the only other governors available are powersave & performance (c.f., #4114)...
-                if grep -q "conservative" "/sys/devices/system/cpu/cpu0/cpufreq/scaling_available_governors"; then
+                if grep -q "conservative" "${CPUFREQ_SYSFS_PATH}/scaling_available_governors"; then
                     export CPUFREQ_CONSERVATIVE="true"
-                    echo "conservative" >"/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor"
+                    echo "conservative" >"${CPUFREQ_SYSFS_PATH}/scaling_governor"
                     # NOTE: The knobs survive a governor switch, which is why we do this now ;).
                     echo "2" >"/sys/devices/system/cpu/cpufreq/conservative/sampling_down_factor"
                     echo "50" >"/sys/devices/system/cpu/cpufreq/conservative/freq_step"
@@ -58,9 +68,9 @@ if [ "${current_cpufreq_gov}" != "interactive" ]; then
                 #       but the code in the published H2O kernel sources actually does the reverse, and is commented out ;).
                 #       It is now entirely handled by Nickel, right *before* loading/unloading that module.
                 #       (There's also a bug(?) where that behavior is inverted for the *first* Wi-Fi session after a cold boot...)
-                if grep -q "sdio_wifi_pwr" "/proc/modules"; then
+                if grep -q "^sdio_wifi_pwr " "/proc/modules"; then
                     # Wi-Fi is enabled, make sure DVFS is on
-                    echo "userspace" >"/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor"
+                    echo "userspace" >"${CPUFREQ_SYSFS_PATH}/scaling_governor"
                     echo "1" >"/sys/devices/platform/mxc_dvfs_core.0/enable"
                 else
                     # Wi-Fi is disabled, make sure DVFS is off
@@ -68,12 +78,12 @@ if [ "${current_cpufreq_gov}" != "interactive" ]; then
 
                     # Switch to conservative to avoid being stuck at max clock if we can...
                     if [ -n "${CPUFREQ_CONSERVATIVE}" ]; then
-                        echo "conservative" >"/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor"
+                        echo "conservative" >"${CPUFREQ_SYSFS_PATH}/scaling_governor"
                     else
                         # Otherwise, we'll be pegged at max clock...
-                        echo "userspace" >"/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor"
+                        echo "userspace" >"${CPUFREQ_SYSFS_PATH}/scaling_governor"
                         # The kernel should already be taking care of that...
-                        cat "/sys/devices/system/cpu/cpu0/cpufreq/scaling_max_freq" >"/sys/devices/system/cpu/cpu0/cpufreq/scaling_setspeed"
+                        cat "${CPUFREQ_SYSFS_PATH}/scaling_max_freq" >"${CPUFREQ_SYSFS_PATH}/scaling_setspeed"
                     fi
                 fi
             fi
@@ -83,21 +93,36 @@ fi
 
 # update to new version from OTA directory
 ko_update_check() {
-    NEWUPDATE="${KOREADER_DIR}/ota/koreader.updated.tar"
-    INSTALLED="${KOREADER_DIR}/ota/koreader.installed.tar"
+    NEWUPDATE="${KOREADER_DIR}/ota/update.tar.xz"
     if [ -f "${NEWUPDATE}" ]; then
+        # Clear screen to delete UI leftovers
+        ./fbink --cls
         ./fbink -q -y -7 -pmh "Updating KOReader"
-        # NOTE: See frontend/ui/otamanager.lua for a few more details on how we squeeze a percentage out of tar's checkpoint feature
-        # NOTE: %B should always be 512 in our case, so let stat do part of the maths for us instead of using %s ;).
-        FILESIZE="$(stat -c %b "${NEWUPDATE}")"
-        BLOCKS="$((FILESIZE / 20))"
-        export CPOINTS="$((BLOCKS / 100))"
-        # shellcheck disable=SC2016
-        ./tar xf "${NEWUPDATE}" --strip-components=1 --no-same-permissions --no-same-owner --checkpoint="${CPOINTS}" --checkpoint-action=exec='./fbink -q -y -6 -P $(($TAR_CHECKPOINT/$CPOINTS))'
+        # Keep a copy of the old manifest for cleaning leftovers later.
+        cp "${KOREADER_DIR}/ota/package.index" /tmp/
+        # Setup the FBInk daemon
+        export FBINK_NAMED_PIPE="/tmp/koreader.fbink"
+        rm -f "${FBINK_NAMED_PIPE}"
+        # We'll want to use REAGL on sunxi, because AUTO is slow, and fast merges are extremely broken outside of REAGL...
+        eval "$(./fbink -e | tr ';' '\n' | grep -e isSunxi | tr '\n' ';')"
+        # shellcheck disable=SC2154
+        if [ "${isSunxi}" = "1" ]; then
+            PBAR_WFM="REAGL"
+        else
+            PBAR_WFM="AUTO"
+        fi
+        FBINK_PID="$(./fbink --daemon 1 %KOREADER% -q -y -6 -P 0 -W ${PBAR_WFM})"
+        # Open a handle to the fifo ourselves too: this prevent writes to the
+        # fifo from hanging if fbink crashed (even with no one reading, its
+        # buffer should still be big enough to never be full either).
+        exec 3<>"${FBINK_NAMED_PIPE}"
+        (cd "${UNPACK_DIR}" && "${KOREADER_DIR}/unpack" -X "${NEWUPDATE}" >&3)
         fail=$?
+        kill -TERM "${FBINK_PID}"
         # Cleanup behind us...
         if [ "${fail}" -eq 0 ]; then
-            mv "${NEWUPDATE}" "${INSTALLED}"
+            # Cleanup leftovers from previous install.
+            (cd "${UNPACK_DIR}" && grep -xvFf "${KOREADER_DIR}/ota/package.index" /tmp/package.index | xargs -r rm -vf)
             ./fbink -q -y -6 -pm "Update successful :)"
             ./fbink -q -y -5 -pm "KOReader will start momentarily . . ."
 
@@ -110,8 +135,11 @@ ko_update_check() {
             ./fbink -q -y -6 -pmh "Update failed :("
             ./fbink -q -y -5 -pm "KOReader may fail to function properly!"
         fi
-        rm -f "${NEWUPDATE}" # always purge newupdate in all cases to prevent update loop
-        unset BLOCKS CPOINTS
+        rm -f /tmp/package.index "${NEWUPDATE}" # always purge newupdate to prevent update loops
+        # Fifo cleanup: close our handle, and unlink the path too (in case fbink crashed).
+        exec 3>&-
+        rm -f "${FBINK_NAMED_PIPE}"
+        unset FBINK_NAMED_PIPE FBINK_PID
         # Ensure everything is flushed to disk before we restart. This *will* stall for a while on slow storage!
         sync
     fi
@@ -123,12 +151,6 @@ if [ -n "${fail}" ] && [ "${fail}" -eq 0 ]; then
     # By now, we know we're in the right directory, and our script name is pretty much set in stone, so we can forgo using $0
     exec ./koreader.sh "${@}"
 fi
-
-# load our own shared libraries if possible
-export LD_LIBRARY_PATH="${KOREADER_DIR}/libs:${LD_LIBRARY_PATH}"
-
-# export trained OCR data directory
-export TESSDATA_PREFIX="data"
 
 # export dict directory
 export STARDICT_DATA_DIR="data/dict"
@@ -169,6 +191,22 @@ if [ "${VIA_NICKEL}" = "true" ]; then
         #eval "$(awk -v 'RS="\0"' '/^(DBUS_SESSION_BUS_ADDRESS|NICKEL_HOME|WIFI_MODULE|LANG|INTERFACE)=/{gsub("\047", "\047\\\047\047"); print "export \047" $0 "\047"}' "/proc/$(pidof -s nickel)/environ")"
     fi
 
+    # If bluetooth is enabled, kill it.
+    if [ -e "/sys/devices/platform/bt/rfkill/rfkill0/state" ]; then
+        # That's on sunxi, at least
+        IFS= read -r bt_state <"/sys/devices/platform/bt/rfkill/rfkill0/state"
+        if [ "${bt_state}" = "1" ]; then
+            echo "0" >"/sys/devices/platform/bt/rfkill/rfkill0/state"
+
+            # Power the chip down
+            ./luajit frontend/device/kobo/ntx_io.lua 126 0
+        fi
+    fi
+    if grep -q "^sdio_bt_pwr " "/proc/modules"; then
+        # And that's on NXP SoCs
+        rmmod sdio_bt_pwr
+    fi
+
     # Flush disks, might help avoid trashing nickel's DB...
     sync
     # And we can now stop the full Kobo software stack
@@ -177,7 +215,7 @@ if [ "${VIA_NICKEL}" = "true" ]; then
     #       as we want to be able to use our own per-if processes w/ custom args later on.
     #       A SIGTERM does not break anything, it'll just prevent automatic lease renewal until the time
     #       KOReader actually sets the if up itself (i.e., it'll do)...
-    killall -q -TERM nickel hindenburg sickel fickel adobehost dhcpcd-dbus dhcpcd fmon
+    killall -q -TERM nickel hindenburg sickel fickel strickel fontickel adobehost foxitpdf iink dhcpcd-dbus dhcpcd bluealsa bluetoothd fmon nanoclock.lua memorylogger QtWebEngineProcess
 
     # Wait for Nickel to die... (oh, procps with killall -w, how I miss you...)
     kill_timeout=0
@@ -209,6 +247,20 @@ if [ -z "${PRODUCT}" ]; then
     export PRODUCT
 fi
 
+if [ -z "${PRODUCT}" ]; then
+    # FW >= 5.18 uses a binary hwdetect instead of the hwdetect.sh script. If hwdetect is available, we can use
+    # utils.sh for convenience.
+    if [ -e "/usr/bin/hwdetect" ]; then
+        # shellcheck disable=SC1091
+        . /usr/libexec/platform/utils.sh
+        PRODUCT="$(get_product_name)"
+    else
+        PRODUCT="$(/usr/bin/hwdetect.sh 2>/dev/null)"
+    fi
+
+    export PRODUCT
+fi
+
 # PLATFORM is used in koreader for the path to the Wi-Fi drivers (as well as when restarting nickel)
 if [ -z "${PLATFORM}" ]; then
     # shellcheck disable=SC2046
@@ -233,6 +285,30 @@ if [ -z "${INTERFACE}" ]; then
     # That's what we used to hardcode anyway
     INTERFACE="eth0"
     export INTERFACE
+fi
+
+# We'll enforce UR in ko_do_fbdepth, so make sure further FBInk usage (USBMS)
+# will also enforce UR... (Only actually meaningful on sunxi).
+if [ "${PLATFORM}" = "b300-ntx" ]; then
+    export FBINK_FORCE_ROTA=0
+    # On sunxi, non-REAGL waveform modes suffer from weird merging quirks...
+    FBINK_WFM="REAGL"
+    # And we also cannot use batched updates for the crash screen, as buffers are private,
+    # so each invocation essentially draws in a different buffer...
+    FBINK_BATCH_FLAG=""
+    # Same idea for backgroundless...
+    FBINK_BGLESS_FLAG="-B GRAY9"
+    # It also means we need explicit background padding in the OT codepath...
+    FBINK_OT_PADDING=",padding=BOTH"
+
+    # Make sure we poke the right input device
+    KOBO_TS_INPUT="/dev/input/by-path/platform-0-0010-event"
+else
+    FBINK_WFM="GL16"
+    FBINK_BATCH_FLAG="-b"
+    FBINK_BGLESS_FLAG="-O"
+    FBINK_OT_PADDING=""
+    KOBO_TS_INPUT="/dev/input/event1"
 fi
 
 # We'll want to ensure Portrait rotation to allow us to use faster blitting codepaths @ 8bpp,
@@ -263,6 +339,34 @@ esac
 
 # The actual swap is done in a function, because we can disable it in the Developer settings, and we want to honor it on restart.
 ko_do_fbdepth() {
+    # On sunxi, the fb state is meaningless, and the minimal disp fb doesn't actually support 8bpp anyway...
+    if [ "${PLATFORM}" = "b300-ntx" ]; then
+        # NOTE: The fb state is *completely* meaningless on this platform.
+        #       This is effectively a noop, we're just keeping it for logging purposes...
+        echo "Making sure that rotation is set to Portrait" >>crash.log 2>&1
+        ./fbdepth -R UR >>crash.log 2>&1
+        # We haven't actually done anything, so don't do anything on exit either ;).
+        unset ORIG_FB_BPP
+
+        return
+    fi
+
+    # On color panels, we target 32bpp for, well, color, and sane addressing (it also happens to be their default) ;o).
+    eval "$(./fbink -e | tr ';' '\n' | grep -e hasColorPanel | tr '\n' ';')"
+    # shellcheck disable=SC2154
+    if [ "${hasColorPanel}" = "1" ]; then
+        # If color rendering has been disabled by the user, switch to 8bpp to completely skip CFA processing
+        if grep -q '\["color_rendering"\] = false' 'settings.reader.lua' 2>/dev/null; then
+            echo "Switching fb bitdepth to 8bpp (to disable CFA) & rotation to Portrait" >>crash.log 2>&1
+            ./fbdepth -d 8 -R UR >>crash.log 2>&1
+        else
+            echo "Switching fb bitdepth to 32bpp & rotation to Portrait" >>crash.log 2>&1
+            ./fbdepth -d 32 -R UR >>crash.log 2>&1
+        fi
+
+        return
+    fi
+
     # Check if the swap has been disabled...
     if grep -q '\["dev_startup_no_fbdepth"\] = true' 'settings.reader.lua' 2>/dev/null; then
         # Swap back to the original bitdepth (in case this was a restart)
@@ -274,14 +378,14 @@ ko_do_fbdepth() {
                 ./fbdepth -d "${ORIG_FB_BPP}" -r "${ORIG_FB_ROTA}" >>crash.log 2>&1
             else
                 echo "Making sure we're using the original fb bitdepth @ ${ORIG_FB_BPP}bpp, and that rotation is set to Portrait" >>crash.log 2>&1
-                ./fbdepth -d "${ORIG_FB_BPP}" -r -1 >>crash.log 2>&1
+                ./fbdepth -d "${ORIG_FB_BPP}" -R UR >>crash.log 2>&1
             fi
         fi
     else
         # Swap to 8bpp if things looke sane
         if [ -n "${ORIG_FB_BPP}" ]; then
             echo "Switching fb bitdepth to 8bpp & rotation to Portrait" >>crash.log 2>&1
-            ./fbdepth -d 8 -r -1 >>crash.log 2>&1
+            ./fbdepth -d 8 -R UR >>crash.log 2>&1
         fi
     fi
 }
@@ -357,21 +461,27 @@ while [ ${RETURN_VALUE} -ne 0 ]; do
         # Height @ ~56.7%, w/ a margin worth 1.5 lines
         bombHeight=$((viewHeight / 2 + viewHeight / 15))
         bombMargin=$((FONTH + FONTH / 2))
+        # Start with a big gray screen of death, and our friendly old school crash icon ;)
+        # U+1F4A3, the hard way, because we can't use \u or \U escape sequences...
+        # shellcheck disable=SC2039,SC3003,SC2086
+        ./fbink -q ${FBINK_BATCH_FLAG} -c -B GRAY9 -m -t regular=./fonts/freefont/FreeSerif.ttf,px=${bombHeight},top=${bombMargin} -W ${FBINK_WFM} -- $'\xf0\x9f\x92\xa3'
         # With a little notice at the top of the screen, on a big gray screen of death ;).
-        ./fbink -q -b -c -B GRAY9 -m -y 1 "Don't Panic! (Crash n°${CRASH_COUNT} -> ${RETURN_VALUE})"
+        # shellcheck disable=SC2086
+        ./fbink -q ${FBINK_BATCH_FLAG} ${FBINK_BGLESS_FLAG} -m -y 1 -W ${FBINK_WFM} -- "Don't Panic! (Crash n°${CRASH_COUNT} -> ${RETURN_VALUE})"
         if [ ${CRASH_COUNT} -eq 1 ]; then
             # Warn that we're waiting on a tap to continue...
-            ./fbink -q -b -O -m -y 2 "Tap the screen to continue."
+            # shellcheck disable=SC2086
+            ./fbink -q ${FBINK_BATCH_FLAG} ${FBINK_BGLESS_FLAG} -m -y 2 -W ${FBINK_WFM} -- "Tap the screen to continue."
         fi
-        # U+1F4A3, the hard way, because we can't use \u or \U escape sequences...
-        # shellcheck disable=SC2039
-        ./fbink -q -b -O -m -t regular=./fonts/freefont/FreeSerif.ttf,px=${bombHeight},top=${bombMargin} -- $'\xf0\x9f\x92\xa3'
         # And then print the tail end of the log on the bottom of the screen...
         crashLog="$(tail -n 25 crash.log | sed -e 's/\t/    /g')"
         # The idea for the margins being to leave enough room for an fbink -Z bar, small horizontal margins, and a font size based on what 6pt looked like @ 265dpi
-        ./fbink -q -b -O -t regular=./fonts/droid/DroidSansMono.ttf,top=$((viewHeight / 2 + FONTH * 2 + FONTH / 2)),left=$((viewWidth / 60)),right=$((viewWidth / 60)),px=$((viewHeight / 64)) -- "${crashLog}"
-        # So far, we hadn't triggered an actual screen refresh, do that now, to make sure everything is bundled in a single flashing refresh.
-        ./fbink -q -f -s
+        # shellcheck disable=SC2086
+        ./fbink -q ${FBINK_BATCH_FLAG} ${FBINK_BGLESS_FLAG} -t regular=./fonts/droid/DroidSansMono.ttf,top=$((viewHeight / 2 + FONTH * 2 + FONTH / 2)),left=$((viewWidth / 60)),right=$((viewWidth / 60)),px=$((viewHeight / 64))${FBINK_OT_PADDING} -W ${FBINK_WFM} -- "${crashLog}"
+        if [ "${PLATFORM}" != "b300-ntx" ]; then
+            # So far, we hadn't triggered an actual screen refresh, do that now, to make sure everything is bundled in a single flashing refresh.
+            ./fbink -q -f -s
+        fi
         # Cue a lemming's faceplant sound effect!
 
         {
@@ -388,8 +498,8 @@ while [ ${RETURN_VALUE} -ne 0 ]; do
         if [ ${CRASH_COUNT} -eq 1 ]; then
             # NOTE: We don't actually care about what read read, we're just using it as a fancy sleep ;).
             #       i.e., we pause either until the 15s timeout, or until the user touches the screen.
-            # shellcheck disable=SC2039
-            read -r -t 15 </dev/input/event1
+            # shellcheck disable=SC2039,SC3045
+            read -r -t 15 <"${KOBO_TS_INPUT}"
         fi
         # Cycle the last crash timestamp
         CRASH_PREV_TS=${CRASH_TS}
@@ -423,7 +533,7 @@ while [ ${RETURN_VALUE} -ne 0 ]; do
             continue
         fi
 
-        if ! ./tar xzf "./data/KoboUSBMS.tar.gz" -C "${USBMS_HOME}"; then
+        if ! (cd "${USBMS_HOME}" && "${KOREADER_DIR}/unpack" -x "${KOREADER_DIR}/data/KoboUSBMS.tar.gz"); then
             echo "Couldn't unpack KoboUSBMS, restarting KOReader . . ." >>crash.log 2>&1
             if ! umount "${USBMS_HOME}"; then
                 echo "Couldn't unmount the USBMS tmpfs, shutting down in 30 sec!" >>crash.log 2>&1
@@ -496,25 +606,25 @@ while [ ${RETURN_VALUE} -ne 0 ]; do
     fi
 done
 
-# Restore original fb bitdepth if need be...
-# Since we also (almost) always enforce Portrait, we also have to restore the original rotation no matter what ;).
-if [ -n "${ORIG_FB_BPP}" ]; then
-    echo "Restoring original fb bitdepth @ ${ORIG_FB_BPP}bpp & rotation @ ${ORIG_FB_ROTA}" >>crash.log 2>&1
-    ./fbdepth -d "${ORIG_FB_BPP}" -r "${ORIG_FB_ROTA}" >>crash.log 2>&1
-else
-    echo "Restoring original fb rotation @ ${ORIG_FB_ROTA}" >>crash.log 2>&1
-    ./fbdepth -r "${ORIG_FB_ROTA}" >>crash.log 2>&1
-fi
-
-# Restore original CPUFreq governor if need be...
-if [ -n "${ORIG_CPUFREQ_GOV}" ]; then
-    echo "${ORIG_CPUFREQ_GOV}" >"/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor"
-
-    # NOTE: Leave DVFS alone, it'll be handled by Nickel if necessary.
-fi
-
 # If we requested a reboot/shutdown, no need to bother with this...
 if [ ${RETURN_VALUE} -ne ${KO_RC_HALT} ]; then
+    # Restore original fb bitdepth if need be...
+    # Since we also (almost) always enforce Portrait, we also have to restore the original rotation no matter what ;).
+    if [ -n "${ORIG_FB_BPP}" ]; then
+        echo "Restoring original fb bitdepth @ ${ORIG_FB_BPP}bpp & rotation @ ${ORIG_FB_ROTA}" >>crash.log 2>&1
+        ./fbdepth -d "${ORIG_FB_BPP}" -r "${ORIG_FB_ROTA}" >>crash.log 2>&1
+    else
+        echo "Restoring original fb rotation @ ${ORIG_FB_ROTA}" >>crash.log 2>&1
+        ./fbdepth -r "${ORIG_FB_ROTA}" >>crash.log 2>&1
+    fi
+
+    # Restore original CPUFreq governor if need be...
+    if [ -n "${ORIG_CPUFREQ_GOV}" ]; then
+        echo "${ORIG_CPUFREQ_GOV}" >"${CPUFREQ_SYSFS_PATH}/scaling_governor"
+
+        # NOTE: Leave DVFS alone, it'll be handled by Nickel if necessary.
+    fi
+
     if [ "${VIA_NICKEL}" = "true" ]; then
         if [ "${FROM_KFMON}" = "true" ]; then
             # KFMon is the only launcher that has a toggle to either reboot or restart Nickel on exit
@@ -533,8 +643,18 @@ if [ ${RETURN_VALUE} -ne ${KO_RC_HALT} ]; then
         # if we were called from advboot then we must reboot to go to the menu
         # NOTE: This is actually achieved by checking if KSM or a KSM-related script is running:
         #       This might lead to false-positives if you use neither KSM nor advboot to launch KOReader *without nickel running*.
-        if ! pgrep -f kbmenu >/dev/null 2>&1; then
+        if ! pkill -0 -f kbmenu; then
             /sbin/reboot
+        fi
+    fi
+else
+    if [ "${VIA_NICKEL}" = "false" ]; then
+        if pkill -0 -f kbmenu; then
+            # If we were started by KSM and requested an exit, attempt to *NOT* exit the script,
+            # so as not to re-enter KSM at all, to make sure the device powers off with our own ScreenSaver displayed.
+            # NOTE: This might not be fool-proof, as a poweroff might take longer than that,
+            #       or we might be interrupted early by signals.
+            sleep 10
         fi
     fi
 fi

@@ -13,16 +13,14 @@ local _ = require("gettext")
 -- additionally handles a location stack for each visited page or
 -- page view change (when scrolling in a same page)
 
-local ReaderBack = EventListener:new{
-    location_stack = {},
+local ReaderBack = EventListener:extend{
+    location_stack = nil, -- array
     -- a limit not intended to be a practical limit but just a failsafe
     max_stack = 5000,
 }
 
 function ReaderBack:init()
-    if Device:hasKeys() then
-        self.ui.key_events.Back = { {"Back"}, doc = "Reader back" }
-    end
+    self:registerKeyEvents()
     -- Regular function wrapping our method, to avoid re-creating
     -- an anonymous function at each page turn
     self._addPreviousLocationToStackCallback = function()
@@ -30,18 +28,17 @@ function ReaderBack:init()
     end
 end
 
+function ReaderBack:registerKeyEvents()
+    if Device:hasKeys() then
+        self.ui.key_events.Back = { { Device.input.group.Back } }
+    end
+end
+
+ReaderBack.onPhysicalKeyboardConnected = ReaderBack.registerKeyEvents
+
 function ReaderBack:_getCurrentLocation()
     if self.ui.document.info.has_pages then
-        local current_location = self.ui.paging:getBookLocation()
-        if current_location then
-            -- We need a copy, as we're getting references to
-            -- objects ReaderPaging/ReaderView may still modify
-            local res = {}
-            for i=1, #current_location do
-                res[i] = util.tableDeepCopy(current_location[i])
-            end
-            return res
-        end
+        return self.ui.paging:getBookLocation()
     else
         return {
             xpointer = self.ui.rolling:getBookLocation(),
@@ -118,8 +115,14 @@ ReaderBack.onViewRecalculate = ReaderBack._onViewPossiblyUpdated
 ReaderBack.onPagePositionUpdated = ReaderBack._onViewPossiblyUpdated
 
 function ReaderBack:onBack()
-    local back_in_reader = G_reader_settings:readSetting("back_in_reader") or "previous_location"
-    local back_to_exit = G_reader_settings:readSetting("back_to_exit") or "prompt"
+    -- If a link is selected, clear it first
+    if self.ui.link:isPageLinkSelected() then
+        self.ui.link:clearSelectedPageLink(true)
+        return true
+    end
+
+    local back_in_reader = G_reader_settings:readSetting("back_in_reader", "previous_location")
+    local back_to_exit = G_reader_settings:readSetting("back_to_exit", "prompt")
 
     if back_in_reader == "previous_read_page" then
         if #self.location_stack > 0 then

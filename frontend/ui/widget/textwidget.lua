@@ -22,12 +22,13 @@ local Widget = require("ui/widget/widget")
 local Screen = require("device").screen
 local dbg = require("dbg")
 local util = require("util")
+local xtext -- Delayed (and optional) loading
 
-local TextWidget = Widget:new{
+local TextWidget = Widget:extend{
     text = nil,
     face = nil,
-    bold = false, -- use bold=true to use a real bold font (or synthetized if not available),
-                  -- or bold=Font.FORCE_SYNTHETIZED_BOLD to force using synthetized bold,
+    bold = false, -- use bold=true to use a real bold font (or synthesized if not available),
+                  -- or bold=Font.FORCE_SYNTHETIZED_BOLD to force using synthesized bold,
                   -- which, with XText, makes a bold string the same width as it non-bolded.
     fgcolor = Blitbuffer.COLOR_BLACK,
     padding = Size.padding.small, -- vertical padding (should it be function of face.size ?)
@@ -80,7 +81,7 @@ function TextWidget:getFontSizeToFitHeight(font_name, height_px, padding)
             break
         end
         local face = Font:getFace(font_name, font_size)
-        local face_height = face.ftface:getHeightAndAscender()
+        local face_height = face.ftsize:getHeightAndAscender()
         face_height = math.ceil(face_height) + 2*padding
     until face_height <= height_px
     return font_size
@@ -108,7 +109,7 @@ function TextWidget:updateSize()
     -- But better compute baseline alignment from freetype font metrics
     -- to get better vertical centering of text in box
     -- (Freetype doc on this at https://www.freetype.org/freetype2/docs/tutorial/step2.html)
-    local face_height, face_ascender = self.face.ftface:getHeightAndAscender()
+    local face_height, face_ascender = self.face.ftsize:getHeightAndAscender()
     self._height = math.ceil(face_height) + 2*self.padding
     self._baseline_h = Math.round(face_ascender) + self.padding
     -- With our UI fonts, this usually gives 0.72 to 0.74, so text is aligned
@@ -177,13 +178,13 @@ function TextWidget:updateSize()
 end
 dbg:guard(TextWidget, "updateSize",
     function(self)
-        assert(type(self.text) == "string",
-            "Wrong text type (expected string)")
+        assert(type(self.text) == "string" or type(self.text) == "number",
+            "Wrong self.text type (expected string or number)")
     end)
 
 function TextWidget:_measureWithXText()
     if not self._xtext_loaded then
-        require("libs/libkoreader-xtext")
+        xtext = require("libs/libkoreader-xtext")
         TextWidget._xtext_loaded = true
     end
     self._xtext = xtext.new(self.text, self.face, self.auto_para_direction,
@@ -211,9 +212,12 @@ function TextWidget:_measureWithXText()
             -- a TextWidget, with use_xtext, to have it compute the width of
             -- the ellipsis, and then cache this width in the font table.)
             reserved_width = RenderText:getEllipsisWidth(self.face)
-                -- no bold: xtext does synthetized bold with normal metrics
+                -- no bold: xtext does synthesized bold with normal metrics
         end
         local max_width = self.max_width - reserved_width
+        if max_width <= 0 then -- avoid _xtext:makeLine() crash
+            max_width = self.max_width
+        end
         if self.truncate_left then
             line_start = self._xtext:getSegmentFromEnd(max_width)
         end
@@ -288,6 +292,8 @@ end
 function TextWidget:getSize()
     self:updateSize()
     return Geom:new{
+        x = 0,
+        y = 0,
         w = self._length,
         h = self.forced_height or self._height,
     }
@@ -308,23 +314,49 @@ function TextWidget:getBaseline()
     return self._baseline_h
 end
 
+function TextWidget.getTextWidth(text, face, bold, padding)
+    local tmp = TextWidget:new{
+        text = text,
+        face = face,
+        bold = bold,
+        padding = padding,
+    }
+    tmp:updateSize()
+    local w = tmp._length
+    tmp:free()
+    return w
+end
+
+function TextWidget.getTextHeight(text, face, bold, padding)
+    local tmp = TextWidget:new{
+        text = text,
+        face = face,
+        bold = bold,
+        padding = padding,
+    }
+    tmp:updateSize()
+    local h = tmp._height
+    tmp:free()
+    return h
+end
+
 function TextWidget:setText(text)
-    if text ~= self.text then
-        self.text = text
-        self._updated = false
-        self:free()
+    if text == self.text then
+        return
     end
+
+    self.text = text
+    self:free()
 end
 dbg:guard(TextWidget, "setText",
     function(self, text)
-        assert(type(text) == "string",
-            "Wrong text type (expected string)")
+        assert(type(text) == "string" or type(text) == "number",
+            "Wrong text type (expected string or number)")
     end)
 
 function TextWidget:setMaxWidth(max_width)
     if max_width ~= self.max_width then
         self.max_width = max_width
-        self._updated = false
         self:free()
     end
 end
@@ -378,6 +410,7 @@ function TextWidget:free()
         self._xtext:free()
         self._xtext = nil
     end
+    self._updated = false
 end
 
 function TextWidget:onCloseWidget()

@@ -2,25 +2,24 @@
     This module implements calibre metadata searching.
 --]]
 
+local BookList = require("ui/widget/booklist")
 local CalibreMetadata = require("metadata")
-local CenterContainer = require("ui/widget/container/centercontainer")
 local ConfirmBox = require("ui/widget/confirmbox")
 local DataStorage = require("datastorage")
 local Device = require("device")
-local DocumentRegistry = require("document/documentregistry")
-local Font = require("ui/font")
+local FileManagerBookInfo = require("apps/filemanager/filemanagerbookinfo")
 local InputDialog = require("ui/widget/inputdialog")
 local InfoMessage = require("ui/widget/infomessage")
-local InputContainer = require("ui/widget/container/inputcontainer")
-local Menu = require("ui/widget/menu")
 local Persist = require("persist")
 local Screen = require("device").screen
-local Size = require("ui/size")
-local TimeVal = require("ui/timeval")
 local UIManager = require("ui/uimanager")
+local Utf8Proc = require("ffi/utf8proc")
+local WidgetContainer = require("ui/widget/container/widgetcontainer")
 local lfs = require("libs/libkoreader-lfs")
 local logger = require("logger")
 local rapidjson = require("rapidjson")
+local sort = require("sort")
+local time = require("ui/time")
 local util = require("util")
 local _ = require("gettext")
 local T = require("ffi/util").template
@@ -61,7 +60,7 @@ end
 -- check if a string matches a query
 local function match(str, query, case_insensitive)
     if query and case_insensitive then
-        return string.find(string.upper(str), string.upper(query))
+        return string.find(Utf8Proc.lowercase(util.fixUtf8(str, "?")), Utf8Proc.lowercase(util.fixUtf8(query, "?")))
     elseif query then
         return string.find(str, query)
     else
@@ -69,12 +68,26 @@ local function match(str, query, case_insensitive)
     end
 end
 
--- get books that exactly match the search tag
-local function getBooksByTag(t, tag)
+-- get books that exactly match the search in a specific flat field (series or title)
+local function getBooksByField(t, field, query)
     local result = {}
     for _, book in ipairs(t) do
-        for __, _tag in ipairs(book.tags) do
-            if tag == _tag then
+        local data = book[field]
+        -- We can compare nil & rapidjson.null (light userdata) to a string safely
+        if data == query then
+            table.insert(result, book)
+        end
+    end
+    return result
+end
+
+-- get books that exactly match the search in a specific array (tags or authors)
+local function getBooksByNestedField(t, field, query)
+    local result = {}
+    for _, book in ipairs(t) do
+        local array = book[field]
+        for __, data in ipairs(array) do
+            if data == query then
                 table.insert(result, book)
             end
         end
@@ -82,41 +95,29 @@ local function getBooksByTag(t, tag)
     return result
 end
 
--- get books that exactly match the search series
-local function getBooksBySeries(t, series)
-    local result = {}
-    for _, book in ipairs(t) do
-        if book.series and book.series ~= rapidjson.null then
-            if book.series == series then
-                table.insert(result, book)
-            end
-        end
-    end
-    return result
-end
-
--- get tags that match the search criteria and their frequency
-local function searchByTag(t, query, case_insensitive)
+-- generic search in a specific flat field (series or title), matching the search criteria and their frequency
+local function searchByField(t, field, query, case_insensitive)
     local freq = {}
     for _, book in ipairs(t) do
-        if type(book.tags) == "table" then
-            for __, tag in ipairs(book.tags) do
-                if match(tag, query, case_insensitive) then
-                    freq[tag] = (freq[tag] or 0) + 1
-                end
+        local data = book[field]
+        -- We have to make sure we only pass strings to match
+        if data and data ~= rapidjson.null then
+            if match(data, query, case_insensitive) then
+                freq[data] = (freq[data] or 0) + 1
             end
         end
     end
     return freq
 end
 
--- get series that match the search criteria and their frequency
-local function searchBySeries(t, query, case_insensitive)
+-- generic search in a specific array (tags or authors), matching the search criteria and their frequency
+local function searchByNestedField(t, field, query, case_insensitive)
     local freq = {}
     for _, book in ipairs(t) do
-        if book.series and book.series ~= rapidjson.null then
-            if match(book.series, query, case_insensitive) then
-                freq[book.series] = (freq[book.series] or 0) + 1
+        local array = book[field]
+        for __, data in ipairs(array) do
+            if match(data, query, case_insensitive) then
+                freq[data] = (freq[data] or 0) + 1
             end
         end
     end
@@ -140,10 +141,10 @@ local function getBookInfo(book)
         end
         return id
     end
-    -- all entries can be empty, except size, which is always filled by calibre.
-    local title = _("Title:") .. " " .. book.title or "-"
-    local authors = _("Author(s):") .. " " .. getEntries(book.authors) or "-"
-    local size = _("Size:") .. " " .. util.getFriendlySize(book.size) or _("Unknown")
+    -- All entries can be empty.
+    local title = _("Title:") .. " " .. (book.title or "-")
+    local authors = _("Author(s):") .. " " .. (getEntries(book.authors) or "-")
+    local size = _("Size:") .. " " .. (util.getFriendlySize(book.size) or _("Unknown"))
     local tags = getEntries(book.tags)
     if tags then
         tags = _("Tags:") .. " " .. tags
@@ -158,15 +159,23 @@ local function getBookInfo(book)
         size)
 end
 
-local CalibreSearch = InputContainer:new{
+-- This is a singleton
+local CalibreSearch = WidgetContainer:extend{
     books = {},
     libraries = {},
+    natsort_cache = {},
     last_scan = {},
-    search_options = {
+    -- These are enabled by default
+    default_search_options = {
         "cache_metadata",
         "case_insensitive",
         "find_by_title",
         "find_by_authors",
+    },
+    -- These aren't
+    extra_search_options = {
+        "find_by_series",
+        "find_by_tag",
         "find_by_path",
     },
 
@@ -207,7 +216,28 @@ function CalibreSearch:ShowSearch()
             },
             {
                 {
+                    text = _("Browse authors"),
+                    enabled = true,
+                    callback = function()
+                        self.search_value = self.search_dialog:getInputText()
+                        self.lastsearch = "authors"
+                        self:close()
+                    end,
+                },
+                {
+                    text = _("Browse titles"),
+                    enabled = true,
+                    callback = function()
+                        self.search_value = self.search_dialog:getInputText()
+                        self.lastsearch = "title"
+                        self:close()
+                    end,
+                },
+            },
+            {
+                {
                     text = _("Cancel"),
+                    id = "close",
                     enabled = true,
                     callback = function()
                         self.search_dialog:onClose()
@@ -226,8 +256,6 @@ function CalibreSearch:ShowSearch()
                 },
             },
         },
-        width = math.floor(Screen:getWidth() * 0.8),
-        height = math.floor(Screen:getHeight() * 0.2),
     }
     UIManager:show(self.search_dialog)
     self.search_dialog:onShowKeyboard()
@@ -245,18 +273,11 @@ end
 
 function CalibreSearch:onMenuHold(item)
     if not item.info or item.info:len() <= 0 then return end
-    local thumbnail
-    local doc = DocumentRegistry:openDocument(item.path)
-    if doc then
-        if doc.loadDocument then -- CreDocument
-            doc:loadDocument(false) -- load only metadata
-        end
-        thumbnail = doc:getCoverPageImage()
-        doc:close()
-    end
-    local thumbwidth = math.min(240, Screen:getWidth()/3)
+    local thumbnail = FileManagerBookInfo:getCoverImage(nil, item.path)
+    local thumbwidth = math.min(300, Screen:getWidth()/3)
+    local status_string = BookList.getBookStatusString(BookList.getBookStatus(item.path), true, true)
     UIManager:show(InfoMessage:new{
-        text = item.info,
+        text = item.info .. "\n" .. status_string,
         image = thumbnail,
         image_width = thumbwidth,
         image_height = thumbwidth/2*3
@@ -273,8 +294,8 @@ function CalibreSearch:bookCatalog(t, option)
         local entry = {}
         entry.info = getBookInfo(book)
         entry.path = book.rootpath .. "/" .. book.lpath
-        if series then
-            local major, minor = string.format("%05.2f", book.series_index):match("([^.]+).([^.]+)")
+        if series and book.series_index then
+            local major, minor = string.format("%05.2f", book.series_index):match("([^.]+)%.([^.]+)")
             if minor ~= "00" then
                 subseries = true
             end
@@ -283,24 +304,31 @@ function CalibreSearch:bookCatalog(t, option)
             entry.text = string.format("%s - %s", book.title, book.authors[1])
         end
         entry.callback = function()
+            local Event = require("ui/event")
+            UIManager:broadcastEvent(Event:new("SetupShowReader"))
+
+            self.search_menu:onClose()
+
             local ReaderUI = require("apps/reader/readerui")
             ReaderUI:showReader(book.rootpath .. "/" .. book.lpath)
-            self.search_menu:onClose()
         end
         table.insert(catalog, entry)
     end
     if series and not subseries then
         for index, entry in ipairs(catalog) do
-            catalog[index].text = entry.text:gsub(".00", "", 1)
+            catalog[index].text = entry.text:gsub("%.00", "", 1)
         end
     end
     return catalog
 end
 
--- find books, series or tags
+-- find books, series, tags, authors or titles
 function CalibreSearch:find(option)
-    for _, opt in ipairs(self.search_options) do
+    for _, opt in ipairs(self.default_search_options) do
         self[opt] = G_reader_settings:nilOrTrue("calibre_search_"..opt)
+    end
+    for _, opt in ipairs(self.extra_search_options) do
+        self[opt] = G_reader_settings:isTrue("calibre_search_"..opt)
     end
 
     if #self.libraries == 0 then
@@ -325,20 +353,16 @@ function CalibreSearch:find(option)
     end
 
     -- measure time elapsed searching
-    local start = TimeVal:now()
-    if option == "find" then
-        local books = self:findBooks(self.search_value)
-        local result = self:bookCatalog(books)
-        self:showresults(result)
-    else
-        self:browse(option, 1)
-    end
+    local start_time = time.now()
+        self:browse(option)
     logger.info(string.format("search done in %.3f milliseconds (%s, %s, %s, %s, %s)",
-        (TimeVal:now() - start):tomsecs(),
+        time.to_ms(time.since(start_time)),
         option == "find" and "books" or option,
         "case sensitive: " .. tostring(not self.case_insensitive),
         "title: " .. tostring(self.find_by_title),
         "authors: " .. tostring(self.find_by_authors),
+        "series: " .. tostring(self.find_by_series),
+        "tag: " .. tostring(self.find_by_tag),
         "path: " .. tostring(self.find_by_path)))
 end
 
@@ -348,7 +372,7 @@ function CalibreSearch:findBooks(query)
     local function bookMatch(s, p)
         if not s or not p then return false end
         if self.case_insensitive then
-            return string.match(string.upper(s), string.upper(p))
+            return string.find(Utf8Proc.lowercase(util.fixUtf8(s, "?")), Utf8Proc.lowercase(util.fixUtf8(p, "?")))
         else
             return string.match(s, p)
         end
@@ -361,6 +385,16 @@ function CalibreSearch:findBooks(query)
         if self.find_by_authors then
             for _, author in ipairs(book.authors) do
                 if bookMatch(author, pattern) then
+                    return true
+                end
+            end
+        end
+        if self.find_by_series and bookMatch(book.series, pattern) then
+            return true
+        end
+        if self.find_by_tag then
+            for _, tag in ipairs(book.tags) do
+                if bookMatch(tag, pattern) then
                     return true
                 end
             end
@@ -381,86 +415,92 @@ function CalibreSearch:findBooks(query)
 end
 
 -- browse tags or series
-function CalibreSearch:browse(option, run, chosen)
-    local menu_container = CenterContainer:new{
-        dimen = Screen:getSize(),
-    }
-    self.search_menu = Menu:new{
-        width = Screen:getWidth() - (Size.margin.fullscreen_popout * 2),
-        height = Screen:getHeight() - (Size.margin.fullscreen_popout * 2),
-        show_parent = menu_container,
-        onMenuHold = self.onMenuHold,
-        cface = Font:getFace("smallinfofont"),
-        _manager = self,
-    }
-    table.insert(menu_container, self.search_menu)
-    self.search_menu.close_callback = function()
-        UIManager:close(menu_container)
+function CalibreSearch:browse(option)
+    local search_value
+    if self.search_value ~= "" then
+        search_value = self.search_value
     end
-    if run == 1 then
-        local menu_entries = {}
-        local search_value
-        if self.search_value ~= "" then
-            search_value = self.search_value
-        end
-        local name, source
+    local name
+    local menu_entries = {}
+
+    if option == "find" then
+        name = _("Books")
+        menu_entries = self:bookCatalog(self:findBooks(self.search_value))
+    else
+        local source
         if option == "tags" then
             name = _("Browse by tags")
-            source = searchByTag(self.books, search_value, self.case_insensitive)
+            source = searchByNestedField(self.books, option, search_value, self.case_insensitive)
         elseif option == "series" then
             name = _("Browse by series")
-            source = searchBySeries(self.books, search_value, self.case_insensitive)
+            source = searchByField(self.books, option, search_value, self.case_insensitive)
+        elseif option == "authors" then
+            name = _("Browse by authors")
+            source = searchByNestedField(self.books, option, search_value, self.case_insensitive)
+        elseif option == "title" then
+            name = _("Browse by titles")
+            -- This is admittedly only midly useful in the face of the generic search above,
+            -- but makes finding duplicate titles easy, at least ;).
+            source = searchByField(self.books, option, search_value, self.case_insensitive)
         end
         for k, v in pairs(source) do
             local entry = {}
             entry.text = string.format("%s (%d)", k, v)
             entry.callback = function()
-                self:browse(option, 2, k)
+                self:expandSearchResults(option, k)
             end
             table.insert(menu_entries, entry)
         end
-        table.sort(menu_entries, function(v1,v2) return v1.text < v2.text end)
-        self.search_menu:switchItemTable(name, menu_entries)
-        UIManager:show(menu_container)
-    else
-        local results
-        if option == "tags" then
-            results = getBooksByTag(self.books, chosen)
-        elseif option == "series" then
-            results = getBooksBySeries(self.books, chosen)
-        end
-        if results then
-            local catalog = self:bookCatalog(results, option)
-            self:showresults(catalog, chosen)
+    end
+
+    self.search_menu = BookList:new{
+        parent = nil,
+        onMenuHold = self.onMenuHold,
+    }
+    self.search_menu.paths = {}
+    self.search_menu.onReturn = function ()
+        local path_entry = table.remove(self.search_menu.paths)
+        local page = path_entry and path_entry.page or 1
+        if #self.search_menu.paths < 1 then
+            -- If nothing is left in paths we switch to original items and title
+            self.search_menu.paths = {}
+            self:switchResults(menu_entries, name, false, page)
         end
     end
 
+    self:switchResults(menu_entries, name)
+    UIManager:show(self.search_menu)
 end
 
--- show search results
-function CalibreSearch:showresults(t, title)
+function CalibreSearch:expandSearchResults(option, chosen_item)
+    local results
+
+    if option == "tags" or option == "authors" then
+        results = getBooksByNestedField(self.books, option, chosen_item)
+    else
+        results = getBooksByField(self.books, option, chosen_item)
+    end
+    if results then
+        local catalog = self:bookCatalog(results, option)
+        self:switchResults(catalog, chosen_item, true)
+    end
+end
+
+-- update search results
+function CalibreSearch:switchResults(t, title, is_child, page)
     if not title then
         title = _("Search results")
     end
-    local menu_container = CenterContainer:new{
-        dimen = Screen:getSize(),
-    }
-    self.search_menu = Menu:new{
-        width = Screen:getWidth() - (Size.margin.fullscreen_popout * 2),
-        height = Screen:getHeight() - (Size.margin.fullscreen_popout * 2),
-        show_parent = menu_container,
-        onMenuHold = self.onMenuHold,
-        cface = Font:getFace("smallinfofont"),
-        _manager = self,
-    }
-    table.insert(menu_container, self.search_menu)
-    self.search_menu.close_callback = function()
-        UIManager:close(menu_container)
-    end
 
-    table.sort(t, function(v1,v2) return v1.text < v2.text end)
-    self.search_menu:switchItemTable(title, t)
-    UIManager:show(menu_container)
+    local natsort = sort.natsort_cmp(self.natsort_cache)
+    table.sort(t, function(a, b) return natsort(a.text, b.text) end)
+
+    if is_child then
+        local path_entry = {}
+        path_entry.page = (self.search_menu.perpage or 1) * (self.search_menu.page or 1)
+        table.insert(self.search_menu.paths, path_entry)
+    end
+    self.search_menu:switchItemTable(title, t, page or 1)
 end
 
 -- prompt the user for a library scan
@@ -504,7 +544,7 @@ function CalibreSearch:prompt(message)
             if count == 0 then
                 info_text = _("No calibre libraries were found")
             else
-                info_text = T(_("Found %1 calibre libraries with %2 books:%3"), count, #self.books, paths)
+                info_text = T(_("Found %1 calibre libraries with %2 books:\n%3"), count, #self.books, paths)
             end
             UIManager:show(InfoMessage:new{ text = info_text })
         end,
@@ -554,11 +594,12 @@ end
 function CalibreSearch:invalidateCache()
     self.cache_books:delete()
     self.books = {}
+    self.natsort_cache = {}
 end
 
 -- get metadata from cache or calibre files
 function CalibreSearch:getMetadata()
-    local start = TimeVal:now()
+    local start_time = time.now()
     local template = "metadata: %d books imported from %s in %.3f milliseconds"
 
     -- try to load metadata from cache
@@ -600,7 +641,7 @@ function CalibreSearch:getMetadata()
                 end
             end
             if is_newer then
-                logger.info(string.format(template, #cache, "cache", (TimeVal:now() - start):tomsecs()))
+                logger.info(string.format(template, #cache, "cache", time.to_ms(time.since(start_time))))
                 return cache
             else
                 logger.warn("cache is older than metadata, ignoring it")
@@ -629,7 +670,7 @@ function CalibreSearch:getMetadata()
             logger.info("Failed to serialize calibre metadata cache:", err)
         end
     end
-    logger.info(string.format(template, #books, "calibre", (TimeVal:now() - start):tomsecs()))
+    logger.info(string.format(template, #books, "calibre", time.to_ms(time.since(start_time))))
     return books
 end
 

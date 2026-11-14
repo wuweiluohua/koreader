@@ -1,11 +1,11 @@
 describe("Readerpaging module", function()
     local sample_pdf = "spec/front/unit/data/sample.pdf"
-    local readerui, UIManager, Event, DocumentRegistry, ReaderUI, Screen
+    local readerui, Event, DocumentRegistry, ReaderUI, Screen
     local paging
 
     setup(function()
         require("commonrequire")
-        UIManager = require("ui/uimanager")
+        disable_plugins()
         Event = require("ui/event")
         DocumentRegistry = require("document/documentregistry")
         ReaderUI = require("apps/reader/readerui")
@@ -26,10 +26,6 @@ describe("Readerpaging module", function()
         end)
 
         it("should emit EndOfBook event at the end", function()
-            UIManager:quit()
-            UIManager:show(readerui)
-            UIManager:nextTick(function() UIManager:close(readerui) end)
-            UIManager:run()
             readerui:handleEvent(Event:new("SetScrollMode", false))
             readerui.zooming:setZoomMode("pageheight")
             paging:onGotoPage(readerui.document:getPageCount())
@@ -40,7 +36,6 @@ describe("Readerpaging module", function()
             paging:onGotoViewRel(1)
             assert.is.truthy(called)
             readerui.onEndOfBook = nil
-            UIManager:quit()
         end)
     end)
 
@@ -63,10 +58,6 @@ describe("Readerpaging module", function()
         end)
 
         it("should emit EndOfBook event at the end", function()
-            UIManager:quit()
-            UIManager:show(readerui)
-            UIManager:nextTick(function() UIManager:close(readerui) end)
-            UIManager:run()
             paging.page_positions = {}
             readerui:handleEvent(Event:new("SetScrollMode", true))
             paging:onGotoPage(readerui.document:getPageCount())
@@ -79,33 +70,33 @@ describe("Readerpaging module", function()
             paging:onGotoViewRel(1)
             assert.is.truthy(called)
             readerui.onEndOfBook = nil
-            UIManager:quit()
+        end)
+    end)
+
+    describe("Scroll mode", function()
+
+        setup(function()
+            readerui = ReaderUI:new{
+                dimen = Screen:getSize(),
+                document = DocumentRegistry:openDocument("spec/front/unit/data/djvu3spec.djvu"),
+            }
+            paging = readerui.paging
+        end)
+
+        teardown(function()
+            readerui:closeDocument()
+            readerui:onClose()
         end)
 
         it("should scroll backward on the first page without crash", function()
-            local sample_djvu = "spec/front/unit/data/djvu3spec.djvu"
-            local tmp_readerui = ReaderUI:new{
-                dimen = Screen:getSize(),
-                document = DocumentRegistry:openDocument(sample_djvu),
-            }
-            tmp_readerui.paging:onScrollPanRel(-100)
-            tmp_readerui:closeDocument()
-            tmp_readerui:onClose()
+            paging:onScrollPanRel(-100)
         end)
 
         it("should scroll forward on the last page without crash", function()
-            local sample_djvu = "spec/front/unit/data/djvu3spec.djvu"
-            local tmp_readerui = ReaderUI:new{
-                dimen = Screen:getSize(),
-                document = DocumentRegistry:openDocument(sample_djvu),
-            }
-            paging = tmp_readerui.paging
-            paging:onGotoPage(tmp_readerui.document:getPageCount())
+            paging:onGotoPage(readerui.document:getPageCount())
             paging:onScrollPanRel(120)
             paging:onScrollPanRel(-1)
             paging:onScrollPanRel(120)
-            tmp_readerui:closeDocument()
-            tmp_readerui:onClose()
         end)
     end)
 end)

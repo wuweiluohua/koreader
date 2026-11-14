@@ -23,7 +23,14 @@ local function unescape(str)
         if unescape_map[s] then
             return unescape_map[s]
         elseif n == "#" then  -- unescape unicode
-            return util.unicodeCodepointToUtf8(tonumber(s))
+            local codepoint
+            -- Determine if the code point is written as a decimal or hexadecimal number
+            if string.sub(s, 1, 1) == "x" then
+                codepoint = tonumber(string.sub(s, 2), 16)
+            else
+                codepoint = tonumber(s)
+            end
+            return util.unicodeCodepointToUtf8(codepoint)
         else
             return orig
         end
@@ -47,7 +54,7 @@ function OPDSParser:createFlatXTable(xlex, curr_element)
                 -- if it does, if it's a table, add to it
                 -- if it doesn't, then add a table
                 local tab = self:createFlatXTable(xlex)
-                if txt == "entry" or txt == "link" or txt == "Url" then
+                if txt == "entry" or txt == "link" or txt == "Url" or txt == "author" then
                     if curr_element[txt] == nil then
                         curr_element[txt] = {}
                     end
@@ -72,20 +79,31 @@ function OPDSParser:createFlatXTable(xlex, curr_element)
 end
 
 function OPDSParser:parse(text)
-    -- Murder Calibre's whole "content" block, because luxl doesn't really deal well with various XHTML quirks,
-    -- as the list of crappy replacements below attests to...
-    -- There's also a high probability of finding orphaned tags or badly nested ones in there, which will screw everything up.
-    text = text:gsub('<content type="xhtml">.-</content>', '')
+    text = text:gsub("<%?xml%-stylesheet.-%?>", "")
     -- luxl doesn't handle XML comments, so strip them
     text = text:gsub("<!%-%-.-%-%->", "")
     -- luxl is also particular about the syntax for self-closing, empty & orphaned tags...
-    text = text:gsub("<(%l+)/>", "<%1 />")
+    text = text:gsub("<([%l:]+)/>", "<%1 />")
     -- We also need to handle the slash-less variants for br & hr...
     text = text:gsub("<([bh]r)>", "<%1 />")
     -- Some OPDS catalogs wrap text in a CDATA section, remove it as it causes parsing problems
     text = text:gsub("<!%[CDATA%[(.-)%]%]>", function (s)
-        return s:gsub( "%p", {["&"] = "&amp;", ["<"] = "&lt;", [">"] = "&gt;" } )
+        return s:gsub("%p", {["&"] = "&amp;", ["<"] = "&lt;", [">"] = "&gt;"})
     end )
+
+    -- NOTE: OPDS content tags are likely to contain a bunch of HTML or XHTML. We do *NOT* want to let luxl parse that,
+    --       because it doesn't really deal well with various XHTML quirks, as the list of crappy replacements above attests to...
+    --       There's also a high probability of finding orphaned tags or badly nested ones in there, which would screw everything up.
+    --       In any case, we just want to treat the whole thing as a single text node anyway, so, just mangle the markup to force luxl's hand.
+    -- A self-closing content tag (e.g. <content type="text"/>) has no text. Turn it
+    -- into an empty element first, otherwise the lazy ".-" in the rewrite below runs
+    -- past it to the next entry's content tag and swallows everything in between.
+    text = text:gsub("<content%s+[^<>]-/>", "<content />")
+    text = text:gsub('<content type=".-">', "<content>")
+    text = text:gsub("<content>(.-)</content>", function (s)
+        return '<content type="text">' .. s:gsub("%p", {["<"] = "&lt;", [">"] = "&gt;", ['"'] = "&quot;", ["'"] = "&apos;"}) .. "</content>"
+    end )
+
     local xlex = luxl.new(text, #text)
     return assert(self:createFlatXTable(xlex))
 end

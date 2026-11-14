@@ -1,14 +1,19 @@
 local Device = require("device")
+local Dispatcher = require("dispatcher")
 local KeyValuePage = require("ui/widget/keyvaluepage")
+local Math = require("optmath")
 local UIManager = require("ui/uimanager")
 local WidgetContainer = require("ui/widget/container/widgetcontainer")
+local datetime = require("datetime")
+local time = require("ui/time")
 local util = require("util")
 local _ = require("gettext")
 
 local SystemStat = {
-    start_sec = os.time(),
-    suspend_sec = nil,
-    resume_sec = nil,
+    start_time = time.realtime(),
+    start_monotonic_time = time.boottime_or_realtime_coarse(),
+    suspend_time = nil,
+    resume_time = nil,
     wakeup_count = 0,
     sleep_count = 0,
     charge_count = 0,
@@ -25,6 +30,18 @@ function SystemStat:init()
     elseif Device:isSDL() then
         self.storage_filter = "/dev/sd"
     end
+
+    -- Account for a start-up mid-charge
+    local powerd = Device:getPowerDevice()
+    if Device:hasAuxBattery() and powerd:isAuxBatteryConnected() then
+        if powerd:isAuxCharging() and not powerd:isAuxCharged() then
+            self.charge_count = self.charge_count + 1
+        end
+    else
+        if powerd:isCharging() and not powerd:isCharged() then
+            self.charge_count = self.charge_count + 1
+        end
+    end
 end
 
 function SystemStat:put(p)
@@ -36,15 +53,49 @@ function SystemStat:putSeparator()
 end
 
 function SystemStat:appendCounters()
-    self:put({_("KOReader started at"), os.date("%c", self.start_sec)})
-    if self.suspend_sec then
-       self:put({_("  Last suspend time"), os.date("%c", self.suspend_sec)})
+    self:put({
+        _("KOReader started at"),
+        datetime.secondsToDateTime(time.to_s(self.start_time), nil, true)
+    })
+    if self.suspend_time then
+       self:put({
+           "  " .. _("Last suspend time"),
+           datetime.secondsToDateTime(time.to_s(self.suspend_time), nil, true)
+        })
     end
-    if self.resume_sec then
-        self:put({_("  Last resume time"), os.date("%c", self.resume_sec)})
+    if self.resume_time then
+        self:put({
+            "  " .. _("Last resume time"),
+           datetime.secondsToDateTime(time.to_s(self.resume_time), nil, true)
+        })
     end
-    self:put({_("  Up hours"),
-             string.format("%.2f", os.difftime(os.time(), self.start_sec) / 60 / 60)})
+    local uptime = time.boottime_or_realtime_coarse() - self.start_monotonic_time
+    local suspend = 0
+    if Device:canSuspend() then
+        suspend = Device.total_suspend_time
+    end
+    local standby = 0
+    if Device:canStandby() then
+        standby = Device.total_standby_time
+    end
+    self:put({"  " .. _("Up time"),
+            datetime.secondsToClockDuration("", time.to_s(uptime), false, true)})
+    if Device:canSuspend() or Device:canStandby() then
+        local awake = uptime - suspend - standby
+        self:put({"  " .. _("Time spent awake"),
+            datetime.secondsToClockDuration("", time.to_s(awake), false, true)
+            .. " (" .. Math.round((awake / uptime) * 100) .. "%)"})
+    end
+    if Device:canSuspend() then
+        self:put({"  " .. _("Time in suspend"),
+            datetime.secondsToClockDuration("", time.to_s(suspend), false, true)
+            .. " (" .. Math.round((suspend / uptime) * 100) .. "%)"})
+    end
+    if Device:canStandby() then
+        self:put({"  " .. _("Time in standby"),
+            datetime.secondsToClockDuration("", time.to_s(standby), false, true)
+            .. " (" .. Math.round((standby / uptime) * 100) .. "%)"})
+    end
     self:put({_("Counters"), ""})
     self:put({_("  wake-ups"), self.wakeup_count})
     -- @translators The number of "sleeps", that is the number of times the device has entered standby. This could also be translated as a rendition of a phrase like "entered sleep".
@@ -119,10 +170,10 @@ function SystemStat:appendSystemInfo()
         self:put({_("System information"), ""})
         -- @translators Ticks is a highly technical term. See https://superuser.com/a/101202 The correct translation is likely to simply be "ticks".
         self:put({_("  Total ticks (million)"),
-                 string.format("%.2f", stat.cpu.total / 1000000)})
+                 string.format("%.2f", stat.cpu.total * (1/1000000))})
         -- @translators Ticks is a highly technical term. See https://superuser.com/a/101202 The correct translation is likely to simply be "ticks".
         self:put({_("  Idle ticks (million)"),
-                 string.format("%.2f", stat.cpu.idle / 1000000)})
+                 string.format("%.2f", stat.cpu.idle * (1/1000000))})
         self:put({_("  Processor usage %"),
                  string.format("%.2f", (1 - stat.cpu.idle / stat.cpu.total) * 100)})
     end
@@ -168,7 +219,7 @@ function SystemStat:appendProcessInfo()
             self:put({_("  Processor usage %"),
                      string.format("%.2f", n1 / sys_stat.cpu.total * 100)})
         else
-            self:put({_("  Processor usage ticks (million)"), n1 / 1000000})
+            self:put({_("  Processor usage ticks (million)"), n1 * (1/1000000)})
         end
     end
 
@@ -216,12 +267,12 @@ function SystemStat:appendStorageInfo()
 end
 
 function SystemStat:onSuspend()
-    self.suspend_sec = os.time()
+    self.suspend_time = time.realtime()
     self.sleep_count = self.sleep_count + 1
 end
 
 function SystemStat:onResume()
-    self.resume_sec = os.time()
+    self.resume_time = time.realtime()
     self.wakeup_count = self.wakeup_count + 1
 end
 
@@ -250,11 +301,16 @@ end
 
 SystemStat:init()
 
-local SystemStatWidget = WidgetContainer:new{
+local SystemStatWidget = WidgetContainer:extend{
     name = "systemstat",
 }
 
+function SystemStatWidget:onDispatcherRegisterActions()
+    Dispatcher:registerAction("system_statistics", {category="none", event="ShowSysStatistics", title=_("System statistics"), device=true, separator=true})
+end
+
 function SystemStatWidget:init()
+    self:onDispatcherRegisterActions()
     self.ui.menu:registerToMainMenu(self)
 end
 
@@ -266,6 +322,10 @@ function SystemStatWidget:addToMainMenu(menu_items)
             SystemStat:showStatistics()
         end,
     }
+end
+
+function SystemStatWidget:onShowSysStatistics()
+    SystemStat:showStatistics()
 end
 
 function SystemStatWidget:onSuspend()

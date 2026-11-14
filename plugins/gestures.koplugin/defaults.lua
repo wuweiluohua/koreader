@@ -8,7 +8,7 @@ return {
         tap_right_bottom_corner = nil,
         tap_left_bottom_corner = Device:hasFrontlight() and {toggle_frontlight = true,} or nil,
         hold_top_left_corner = nil,
-        hold_top_right_corner = nil,
+        hold_top_right_corner = {refresh_content = true,},
         hold_bottom_left_corner = nil,
         hold_bottom_right_corner = nil,
         one_finger_swipe_left_edge_down = Device:hasFrontlight() and {decrease_frontlight = 0,} or nil,
@@ -66,6 +66,8 @@ return {
         two_finger_swipe_southwest = nil,
         spread_gesture = nil,
         pinch_gesture = nil,
+        rotate_cw = nil,
+        rotate_ccw = nil,
     },
     gesture_reader = {
         tap_top_left_corner = {toggle_page_flipping = true,},
@@ -131,6 +133,8 @@ return {
         two_finger_swipe_southwest = nil,
         spread_gesture = {increase_font = 0,},
         pinch_gesture = {decrease_font = 0,},
+        rotate_cw = nil,
+        rotate_ccw = nil,
     },
     custom_multiswipes = {},
 }
